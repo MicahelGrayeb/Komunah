@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # --- BASE DE DATOS ---
+  db:
+    image: mariadb:10.6
+    container_name: comuna_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: comunah_replica_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./comunah_local.sql:/docker-entrypoint-initdb.d/init.sql
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  # --- API PRINCIPAL (PUERTO 8000) ---
+  web:
+    build: .
+    container_name: comuna_api
+    restart: always
+    ports:
+      - "8000:8080" # Tu PC entra por 8000 -> App usa 8080
+    env_file: .env   # Carga las claves SSH de ialabcon
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - APP_MODE=FULL
+      - DATABASE_URL=mysql+mysqlconnector://root:root@db:3306/comunah_replica_db
+
+  # --- MICROSERVICIO NOTIFICACIONES (PUERTO 8081) ---
+  notificaciones:
+    build: .
+    container_name: comuna_notificaciones
+    restart: always
+    ports:
+      - "8081:8080" # Tu PC entra por 8081 -> App usa 8080
+    env_file: .env   # Carga las claves SSH de ialabcon
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - APP_MODE=NOTIFICACIONES 
+      - DATABASE_URL=mysql+mysqlconnector://root:root@db:3306/comunah_replica_db
+    volumes:
+      - ./serviceAccountKey.json:/app/serviceAccountKey.json
+
+volumes:
+  db_data:
