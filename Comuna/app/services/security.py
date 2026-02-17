@@ -24,7 +24,8 @@ def get_current_user(res: HTTPAuthorizationCredentials = Security(security)):
         return user_data
     except HTTPException as http_exc:
         raise http_exc
-    except Exception:
+    except Exception as e:
+        print(f"DEBUG: Error real en auth: {str(e)}")
         raise HTTPException(status_code=401, detail="Sesión inválida")
 
 class RoleChecker:
