@@ -31,7 +31,8 @@ from .routers import (
     notificacionesMS,
     usuarios,
     reportes,
-    WebhookPrueba,
+    webhook,
+    DashboardKomunah,
     remitentes,
     admin,
     debug_config
@@ -205,7 +206,8 @@ else:
     app.include_router(notificaciones.router)
     app.include_router(notificaciones_estaticas.router)
     app.include_router(reportes.router)
-    app.include_router(WebhookPrueba.router)
+    app.include_router(webhook.router)
+    app.include_router(DashboardKomunah.router)
     app.include_router(admin.router)
    
 # --- ARRANQUE ---
