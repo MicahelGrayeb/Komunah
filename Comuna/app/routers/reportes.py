@@ -169,7 +169,7 @@ def get_complementos_pago(anio: Optional[int] = None, folio: Optional[str] = Non
             "lote": r["LOTE"],
             "varios": True if r["total_lotes"] > 1 else False,
             "total": r["total_lotes"],
-            "abono": float(r["monto_individual"]),
+            "abono": float(r["monto_individual"]) * -1 if r["metodo_real"] == "Nota de Crédito" else float(r["monto_individual"]),
             "saldo": None,
             "anio": int(str(r["fecha_pago_real"])[:4]) if r["fecha_pago_real"] else 0,
             "id_pago": r["id_pago"],

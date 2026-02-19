@@ -18,5 +18,5 @@ reporte_amortizaciones_completo.csv
 reporte_cartera_vencida_completo.csv
 reporte_pagos_completo.csv
 reporte_ventas_completo.csv
-serviceAccountKey.json
+# serviceAccountKey.json
 sesion_google.json

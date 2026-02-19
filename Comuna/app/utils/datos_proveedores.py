@@ -78,7 +78,7 @@ def get_komunah_data(folio_ref: str, db: Session):
     amortizaciones = db.query(Amortizacion).filter(Amortizacion.folder_id == folio_ref)\
                     .order_by(Amortizacion.date.asc()).all()
     
-    p_act = encontrar_pago_actual_mes(amortizaciones)
+    p_act = encontrar_pago_actual(amortizaciones)
     
     # --- CÁLCULO: Prefijo cl. ---
     monto_val = 0.0
