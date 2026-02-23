@@ -5,7 +5,8 @@ from sqlalchemy import func, and_, case, distinct, cast, Date
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from ..database import get_db
-from ..models import Venta, Pago, Amortizacion # Asumiendo que Amortizacion/Liquidado se liga aqui
+from ..models import Venta, Pago
+from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 import calendar
 
 # Configuración de logger
@@ -51,8 +52,9 @@ def get_dashboard_kpis(
     start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
     end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
     proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
-    db: Session = Depends(get_db)
-):
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_admin)
+    ):
     """
     Calcula las tarjetas de métricas principales incluyendo Notas de Crédito.
     """
@@ -159,8 +161,9 @@ def get_financial_charts(
     end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
     proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
     banco: Optional[str] = Query(None, description="Filtrar por nombre del banco"), 
-    db: Session = Depends(get_db)
-):
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_admin)
+    ):
     try:
         # Definir el valor de búsqueda para la DB (mapeo de "No aplica")
         db_banco = "No aplica" if banco == "Banco Mercantil del Norte, S.A." else banco
@@ -242,8 +245,9 @@ def get_clusters_chart(
     start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
     end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
     proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
-    db: Session = Depends(get_db)
-):
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_admin)
+    ):
     """
     Retorna la evolución de ventas agrupadas por Etapa.
     Optimizado para Stacked Bar Chart.
