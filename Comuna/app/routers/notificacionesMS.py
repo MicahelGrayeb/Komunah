@@ -2,8 +2,8 @@ import os
 import requests
 import re 
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, Body
-from ..schemas import EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate,EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, RecordatoriosUpdate
-from ..utils.datos_proveedores import get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, set_email_komunah_marketing, set_wa_komunah_marketing, get_folios_a_notificar_komunah, actualizar_switches_etapas, actualizar_switches_proyecto, get_estado_etapas_komunah, get_folios_deudores_komunah
+from ..schemas import EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate,EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse
+from ..utils.datos_proveedores import get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, set_email_komunah_marketing, set_wa_komunah_marketing, get_folios_a_notificar_komunah, actualizar_switches_etapas, actualizar_switches_proyecto, get_estado_etapas_komunah, get_folios_deudores_komunah, get_folios_dinamico_komunah
 from urllib.parse import quote
 from ..database import get_db
 from sqlalchemy.orm import Session
@@ -14,7 +14,9 @@ import base64, json
 from typing import List, Optional, Union, Any
 import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
- 
+from argparse import Namespace
+from ..models import Venta, Cliente
+from mailersend import MailerSendClient
  
 router = APIRouter(prefix="/v1/notificaciones", tags=["Motor Envios"])
 router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas"])
@@ -28,6 +30,7 @@ PROVIDERS = {
         "get": get_komunah_data,
         "get_pendientes": get_folios_a_notificar_komunah,
         "get_deudores": get_folios_deudores_komunah,
+        "get_folios_por_cluster": get_folios_dinamico_komunah,
         "set_email_lote": set_email_komunah_lote,
         "set_wa_lote": set_wa_komunah_lote,
         "set_etapas_bulk": actualizar_switches_etapas,
@@ -748,6 +751,91 @@ class StaticDualUseCase:
             self.repo.registrar_log_falla(empresa_id, f"Error en envío Dual: {str(e)}", "DUAL_SEND_ERROR")
             raise HTTPException(status_code=400, detail=f"Error en el proceso dual: {str(e)}")
 
+class StaticEmailClusterUseCase:
+    def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
+        self.repo = repo
+        self.gateway = gateway
+        # Inicializamos el cliente de MailerSend para el envío masivo
+        self.ms = MailerSendClient()
+
+    def ejecutar_proceso_cluster(self, empresa_id: str, datos: Any, db: Session):
+        pack_empresa = PROVIDERS.get(empresa_id, {})
+        buscador_dinamico = pack_empresa.get("get_folios_por_cluster")
+        
+        if not buscador_dinamico:
+            raise HTTPException(status_code=400, detail="Empresa no configurada.")
+
+        # 1. Obtener folios (Filtra por Cluster, Pipeline o Ambos)
+        folios_brutos = buscador_dinamico(datos.clusters, datos.pipeline_status, db)
+        
+        # Normalizar exclusiones
+        excluir_folios = {str(f).strip() for f in (datos.excluir_folios or [])}
+        excluir_emails = {str(e).lower().strip() for e in (datos.excluir_emails or [])}
+        excluir_nombres = {str(n).lower().strip() for n in (datos.excluir_clientes or [])}
+
+        reporte_global = []
+        conteo = {"exitosos": 0, "bloqueados_sys": 0, "omitidos_user": 0, "excluidos_manual": 0}
+        procesador = NotificationUseCase(self.repo, self.gateway)
+
+        # Preparar la cola para el envío masivo
+        cola_bulk_moderna = []
+
+        for f in folios_brutos:
+            f_str = str(f).strip()
+            if f_str in excluir_folios:
+                conteo["excluidos_manual"] += 1
+                continue
+
+            data_sql = get_komunah_data(f_str, db)
+            if data_sql.get("{sys.etapa_activa}") == "0":
+                conteo["bloqueados_sys"] += 1
+                continue
+
+            clientes_lote = []
+            for i in range(1, 7): # Mapeo dinámico c1 a c6
+                nombre = data_sql.get(f"{{c{i}.client_name}}")
+                email = data_sql.get(f"{{g{i}.email}}")
+                phone = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "")
+                permiso = str(data_sql.get(f"{{g{i}.permite_email_lote}}")) in ["1", "True"]
+
+                if not nombre or not email: continue
+                if nombre.lower().strip() in excluir_nombres or email.lower().strip() in excluir_emails:
+                    conteo["excluidos_manual"] += 1
+                    continue
+
+                # Limpieza con tus etiquetas {cliente}, {cl.monto}, etc.
+                asunto_final = procesador._limpiar(datos.asunto, data_sql, nombre, email, phone)
+                html_final = procesador._limpiar(datos.contenido_html, data_sql, nombre, email, phone)
+
+                # Si es envío REAL y tiene permiso, armamos el objeto para la cola
+                if not datos.simular and permiso:
+                    email_obj = {
+                        "from": {"email": datos.remitente, "name": f"Notificaciones {empresa_id.capitalize()}"},
+                        "to": [{"email": email, "name": nombre}],
+                        "subject": asunto_final,
+                        "html": html_final,
+                        "attachments": datos.adjuntos if datos.adjuntos else [],
+                        "reply_to": {"email": datos.reply_to} if datos.reply_to else None
+                    }
+                    cola_bulk_moderna.append(email_obj)
+                    conteo["exitosos"] += 1
+                elif datos.simular:
+                    conteo["exitosos"] += 1
+
+                clientes_lote.append({"cliente": nombre, "email": email, "status": "OK"})
+
+            if clientes_lote:
+                reporte_global.append({"folio": f_str, "clientes": clientes_lote})
+
+        
+        if not datos.simular and cola_bulk_moderna:
+            for i in range(0, len(cola_bulk_moderna), 500):
+                bloque = cola_bulk_moderna[i:i + 500]
+                self.ms.emails.send_bulk(bloque)
+                time.sleep(0.5)
+
+        return {"modo": "SIMULACION" if datos.simular else "REAL", "resumen": conteo, "detalles": reporte_global}
+
 @router_crud.get("/{empresa_id}/conteo/{categoria}")
 def api_contar_plantillas(empresa_id: str, categoria: str,user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
@@ -942,20 +1030,17 @@ def api_get_diccionario_maestro(
 
         catalogo = get_komunah_diccionario_maestro(data_real)
 
-        # 👇 AQUÍ METES TUS VARIABLES EXTRA QUE SIEMPRE QUIERES
-        extras = [
-            "{general.email}",
-            "{general.telefono}",
-            "{general.nombre_cliente}",
-            "{general.correo_cliente}"
-        ]
+        universales = ["{cliente}", "{email_cliente}", "{telefono_cliente}"]
 
-        catalogo.append({
+
+        bloque_fijas = {
             "categoria": "Variables Generales Fijas",
-            "variables": extras if not data_real else [
-                {"tag": tag, "valor": ""} for tag in extras
+            "variables": universales if not data_real else [
+                {"tag": tag, "valor": data_real.get(tag, "")} for tag in universales
             ]
-        })
+        }
+
+        catalogo.insert(0, bloque_fijas)
 
         return catalogo
     
@@ -1363,3 +1448,110 @@ def api_obtener_config_recordatorios(
     config = repo.obtener_config_recordatorios(empresa_id)
     
     return config
+
+# 1. Definimos el objeto de ejemplo
+EJEMPLO_FINAL = {
+    "clusters": ["Planta Baja", "Etapa 1"],
+    "pipeline_status": ["Contrato Firmado"], # <-- Nuevo filtro
+    "remitente": "finanzas@komunah.mx",
+    "asunto": "Aviso de Cobranza - Lote {v.numero}",
+    "contenido_html": "<h1>Hola {cl.cliente}</h1><p>Tu saldo es {cl.monto_a_pagar}</p>",
+    "reply_to": "pagos@komunah.mx",
+    "simular": True,
+    "excluir_folios": ["1975"],
+    "excluir_emails": ["test@test.com"],
+    "excluir_clientes": ["Nombre a Excluir"]
+}
+
+@router.post("/{empresa_id}/enviar-cluster")
+async def api_proceso_cluster(
+    empresa_id: str,
+    datos_json: str = Form(
+        default=json.dumps(EJEMPLO_FINAL, indent=2),
+        description="Pega el JSON con la configuración masiva"
+    ), 
+    archivos: Optional[List[UploadFile]] = File(None),
+    db: Session = Depends(get_db), 
+    user: dict = Depends(es_admin)
+):
+    try:
+        data_dict = json.loads(datos_json)
+        datos_validados = EmailClusterSchema(**data_dict)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error en formato JSON: {str(e)}")
+
+    adjuntos = []
+    if archivos:
+        for f in archivos:
+            if f.filename:
+                adjuntos.append({
+                    "content": base64.b64encode(await f.read()).decode(),
+                    "filename": f.filename
+                })
+
+    config_final = datos_validados.dict()
+    config_final['adjuntos'] = adjuntos
+
+    use_case = StaticEmailClusterUseCase(FirebaseRepository(), NotificationGateway())
+    return use_case.ejecutar_proceso_cluster(empresa_id, Namespace(**config_final), db)
+
+
+@router.get("/busqueda-expedientes", response_model=List[SearchboxExpedienteResponse])
+def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
+    # 1. Filtramos activos: Diferente a 'Expirado' y 'Cancelado'
+    # Usamos notin_ para que Carlitos solo vea lo que está "vivo"
+    expedientes = db.query(Venta).filter(
+        Venta.estado_expediente.notin_(['Expirado', 'Cancelado', 'EXPIRADO', 'CANCELADO'])
+    ).all()
+    
+    resultado = []
+
+    for v in expedientes:
+        coprops_nombres = []
+        ids_a_buscar = []
+        
+        # 2. Lógica de Integrantes (del 2 al 6)
+        # Revisamos si hay nombre y si hay ID para ir a buscar el correo
+        for i in range(2, 7):
+            nom_val = getattr(v, f"cliente_{i}")
+            id_val = getattr(v, f"id_cliente_{i}")
+
+            if nom_val and str(nom_val).strip() not in ["", "None", "NULL"]:
+                coprops_nombres.append(str(nom_val))
+                if id_val:
+                    try:
+                        # Limpiamos el ID por si viene como 1331.0
+                        ids_a_buscar.append(str(int(float(id_val))))
+                    except: pass
+
+        # 3. EL SALTO A LA TABLA CLIENTES: Traemos los correos reales
+        correos_list = []
+        if ids_a_buscar:
+            # Buscamos masivamente los correos de todos los IDs de este folio
+            clientes_query = db.query(Cliente.email).filter(Cliente.client_id.in_(ids_a_buscar)).all()
+            correos_list = [c.email for c in clientes_query if c.email]
+
+        # 4. Limpieza Canal de Ventas (Quitar la diagonal / y poner N/A)
+        canal = str(v.canal_ventas).strip() if v.canal_ventas else "N/A"
+        if canal in ["/", "NA", "", "None", "NULL"]:
+            canal = "N/A"
+
+        # 5. Armado del JSON para el Front
+        resultado.append({
+            "folio": str(v.folio),
+            "cliente_principal": str(v.cliente or "Sin Nombre"),
+            "conteo_copropietarios": len(coprops_nombres),
+            "nombres_copropietarios": coprops_nombres,
+            "correos_copropietarios": correos_list,
+            "proyecto": str(v.desarrollo or "N/A"),
+            "cluster": str(v.etapa or "N/A"),
+            "lote": str(v.numero or "N/A"),
+            "estatus_expediente": str(v.estado_expediente or "Activo"),
+            "m2": float(v.metros_cuadrados or 0.0),
+            "canal_ventas": canal,
+            "asesor": str(v.asesor or "N/A")
+        })
+
+    return resultado
+
+print("estoy biewwn")

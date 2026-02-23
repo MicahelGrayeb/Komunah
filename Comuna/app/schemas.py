@@ -365,3 +365,31 @@ class RecordatoriosUpdate(BaseModel):
     dias_2: Optional[int] = None
     hora: Optional[int] = None
     minuto: Optional[int] = None
+
+
+class EmailClusterSchema(BaseModel):
+    clusters: Optional[List[str]] = []
+    pipeline_status: Optional[List[str]] = [] 
+    remitente: EmailStr
+    asunto: str
+    contenido_html: str
+    reply_to: Optional[str] = None
+    simular: bool = True
+    excluir_folios: Optional[List[str]] = []
+    excluir_emails: Optional[List[str]] = []
+    excluir_clientes: Optional[List[str]] = []
+
+
+class SearchboxExpedienteResponse(BaseModel):
+    folio: str
+    cliente_principal: str
+    conteo_copropietarios: int
+    nombres_copropietarios: List[str]
+    correos_copropietarios: List[str]
+    proyecto: str
+    cluster: str
+    lote: str
+    estatus_expediente: str
+    m2: float
+    canal_ventas: str
+    asesor: str
