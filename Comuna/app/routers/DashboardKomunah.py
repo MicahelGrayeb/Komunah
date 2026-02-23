@@ -79,13 +79,14 @@ def get_dashboard_kpis(
 
         # 2. Métricas de Pagos (Notas de Crédito del SQL)
         query_pagos = db.query(
-            func.count(distinct(Pago.folio_venta)).label("notas_de_credito"),
-            func.sum(Pago.monto_flujo).label("total_notas_de_credito")
+            func.count(Pago.folio_venta).label("notas_de_credito"), 
+            func.sum(Pago.monto_pagado).label("total_notas_de_credito")
         ).join(Venta, Pago.folio_venta == Venta.folio).filter(
             Pago.fecha_comprobante >= start_date,
             Pago.fecha_comprobante <= end_date,
             func.lower(Pago.metodo_pago) == 'nota de crédito',
-            Pago.estatus_flujo == 'active'
+            Pago.estatus_flujo == 'active',
+            Pago.estatus == 'active'
         )
 
         if proyecto and proyecto.lower() != "todos":
@@ -165,26 +166,34 @@ def get_financial_charts(
     user: dict = Depends(es_admin)
     ):
     try:
-        # Definir el valor de búsqueda para la DB (mapeo de "No aplica")
         db_banco = "No aplica" if banco == "Banco Mercantil del Norte, S.A." else banco
 
         # 1. CÁLCULO DE DATOS ACTUALES
         query_stats = db.query(
             Pago.fecha_comprobante,
-            func.sum(case((and_(func.lower(Pago.estatus_flujo) == 'active', func.lower(Pago.estatus) == 'active'), Pago.monto_pagado), else_=0)).label("abonado"),
+            # Lógica de resta: Si es NC, el monto se suma como negativo
+            func.sum(case(
+                (and_(func.lower(Pago.estatus_flujo) == 'active', func.lower(Pago.estatus) == 'active'),
+                    case((func.lower(Pago.metodo_pago) == 'nota de crédito', -Pago.monto_pagado), else_=Pago.monto_pagado)
+                ), 
+                else_=0)
+            ).label("abonado"),
             func.sum(case((and_(func.lower(Pago.estatus_flujo).in_(['canceled', 'cancelado']), func.lower(Pago.estatus).in_(['canceled', 'cancelado'])), Pago.monto_flujo), else_=0)).label("cancelado"),
-            func.sum(case((and_(func.lower(Pago.estatus_flujo) == 'active', func.lower(Pago.estatus) == 'active'), 1), else_=0)).label("conteo")
+            # Conteo: Solo cuenta si NO es nota de crédito
+            func.sum(case(
+                (and_(func.lower(Pago.estatus_flujo) == 'active', func.lower(Pago.estatus) == 'active', func.lower(Pago.metodo_pago) != 'nota de crédito'), 1), 
+                else_=0)
+            ).label("conteo")
         ).filter(
             Pago.fecha_comprobante >= start_date, Pago.fecha_comprobante <= end_date,
-            Pago.fecha_comprobante != None, func.lower(Pago.estatus_flujo).in_(['active', 'canceled', 'cancelado']),
-            func.lower(Pago.metodo_pago) != 'nota de crédito'
+            Pago.fecha_comprobante != None, func.lower(Pago.estatus_flujo).in_(['active', 'canceled', 'cancelado'])
         )
         if proyecto and proyecto.lower() != "todos": query_stats = query_stats.filter(Pago.proyecto == proyecto)
         if banco and banco.lower() != "todos": query_stats = query_stats.filter(Pago.banco_caja == db_banco)
         
         daily_stats = query_stats.group_by(Pago.fecha_comprobante).order_by(Pago.fecha_comprobante).all()
 
-        # Procesamiento de series (Omitido por brevedad, se mantiene igual)
+        # Procesamiento de series
         data_map = {r.fecha_comprobante: r for r in daily_stats}
         series_abonado, series_cancelado, series_conteo, categories = [], [], [], []
         total_actual_abonado = 0
@@ -199,11 +208,17 @@ def get_financial_charts(
             con = int(val.conteo) if val and val.conteo else 0
             series_abonado.append(abo); series_cancelado.append(can); series_conteo.append(con)
             categories.append(day.strftime("%d/%m"))
-            total_actual_abonado += abo; total_actual_conteo += con
+            total_actual_abonado += abo; 
+            total_actual_conteo += con
 
-        # 3. LÓGICA YoY
+        # 3. LÓGICA YoY (Ajustada para restar NC también en el año pasado)
         prev_start, prev_end = get_full_month_range_previous_year(s_date_obj)
-        query_prev = db.query(func.sum(Pago.monto_pagado)).filter(
+        query_prev = db.query(
+            func.sum(case(
+                (func.lower(Pago.metodo_pago) == 'nota de crédito', -Pago.monto_pagado), 
+                else_=Pago.monto_pagado)
+            )
+        ).filter(
             Pago.fecha_comprobante >= prev_start, Pago.fecha_comprobante <= prev_end,
             func.lower(Pago.estatus_flujo) == 'active', func.lower(Pago.estatus) == 'active'
         )
@@ -213,9 +228,12 @@ def get_financial_charts(
         total_prev_abonado = float(query_prev.scalar() or 0)
         growth = ((total_actual_abonado - total_prev_abonado) / total_prev_abonado * 100) if total_prev_abonado > 0 else (100 if total_actual_abonado > 0 else 0)
 
-        # 5. COMPOSICIÓN (DONAS)
+        # 5. COMPOSICIÓN (DONAS - Ajustada para que el total coincida)
         def get_composition(field):
-            q = db.query(field, func.sum(Pago.monto_pagado)).filter(
+            q = db.query(
+                field, 
+                func.sum(case((func.lower(Pago.metodo_pago) == 'nota de crédito', -Pago.monto_pagado), else_=Pago.monto_pagado))
+            ).filter(
                 Pago.fecha_comprobante >= start_date, Pago.fecha_comprobante <= end_date,
                 func.lower(Pago.estatus_flujo) == 'active', func.lower(Pago.estatus) == 'active'
             )
@@ -227,8 +245,8 @@ def get_financial_charts(
         concepts_query = get_composition(Pago.concepto_pago)
         
         return {
-            "Total_abonado": total_actual_abonado, "Pagos_activos": total_actual_conteo, "Rendimiento_mes": round(growth, 1), 
-            "Comparativa_rendimiento": f"Total abonado mes actual: ({total_actual_abonado}) vs total abonado mes del año pasado: ({total_prev_abonado})",
+            "Total_abonado": round(total_actual_abonado, 2), "Pagos_activos": total_actual_conteo, "Rendimiento_mes": round(growth, 1), 
+            "Comparativa_rendimiento": f"Total abonado mes actual: ({round(total_actual_abonado, 2)}) vs total abonado mes del año pasado: ({round(total_prev_abonado, 2)})",
             "Historico_de_abonos": {"Categorias": categories, "Abonado": series_abonado, "Cancelado": series_cancelado, "Pagos_realizados": series_conteo},
             "Composicion_de_ingresos": {
                 "Metodos_de_pagos": [{"label": m[0] or "Sin definir", "value": float(m[1] or 0)} for m in methods_query],
