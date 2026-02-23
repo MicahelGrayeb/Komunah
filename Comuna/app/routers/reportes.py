@@ -171,7 +171,7 @@ def get_complementos_pago(anio: Optional[int] = None, folio: Optional[str] = Non
             "total": r["total_lotes"],
             "abono": float(r["monto_individual"]) * -1 if r["metodo_real"] == "Nota de Crédito" else float(r["monto_individual"]),
             "saldo": None,
-            "anio": int(str(r["fecha_pago_real"])[:4]) if r["fecha_pago_real"] else 0,
+            "anio": int(str(r["fecha_pago_real"])[:4]) if r["fecha_pago_real"] and str(r["fecha_pago_real"])[:4].isdigit() else (int(str(r["fecha_pago_real"])[-4:]) if r["fecha_pago_real"] and str(r["fecha_pago_real"])[-4:].isdigit() else 0),
             "id_pago": r["id_pago"],
             "id_flujo": r["id_flujo"],
             "estatus_flujo": r["estatus_flujo"],
@@ -251,7 +251,7 @@ def get_reporte_detallado(anio: Optional[int] = None, db: Session = Depends(get_
 
         detalles = []
         for row in result:
-            anio_real = int(str(row["FECHA DE PAGO"])[:4])
+            anio_real = int(str(row["FECHA DE PAGO"])[:4]) if row["FECHA DE PAGO"] and str(row["FECHA DE PAGO"])[:4].isdigit() else (int(str(row["FECHA DE PAGO"])[-4:]) if row["FECHA DE PAGO"] and str(row["FECHA DE PAGO"])[-4:].isdigit() else 0)
             fila_con_anio = {**dict(row), "anio": anio_real}
             t_vigente += float(row.get('SALDO VIGENTE') or 0)
             t_01_30 += float(row.get('01 A 30 DÍAS') or 0)

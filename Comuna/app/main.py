@@ -115,13 +115,13 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # Permitir CUALQUIER origen (Frontend local, IP, dominio, etc.)
-    allow_credentials=True,   # Permitir cookies y credenciales
-    allow_methods=["*"],      # Permitir TODOS los métodos (GET, POST, PUT, DELETE...)
-    allow_headers=["*"],      # Permitir TODOS los encabezados (Authorization, Content-Type...)
-)
+    allow_origin_regex=r"https?://.*", 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+) 
 
-def tarea_diaria_notificaciones():
+def tarea_diaria_notificaciones():  
     """Lógica del Cron Job."""
     db = SessionLocal()
     try:

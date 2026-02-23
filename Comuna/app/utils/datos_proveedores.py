@@ -1,5 +1,5 @@
 from sqlalchemy import text
-from ..models import Venta, Cliente, Amortizacion, GestionClientes, ConfigEtapa, Pago
+from ..models import Venta, Cliente, Amortizacion, GestionClientes, ConfigEtapa, Pago, Cartera
 from ..services.pagos_utils import encontrar_pago_actual, encontrar_pago_actual_mes
 from sqlalchemy.inspection import inspect
 from sqlalchemy.orm import Session, sessionmaker
@@ -437,3 +437,26 @@ def get_estado_etapas_komunah(db: Session):
             "total_folios": int(float(r.total_folios or 0))
         } for r in resultados
     ]
+
+def get_folios_dinamico_komunah(clusters: List[str], pipeline_status: List[str], db: Session):
+    """
+    Busca folios únicos filtrando por Etapa y/o Estatus de Pipeline.
+    Usa .distinct() para evitar mandar correos repetidos por cada deuda.
+    """
+    from sqlalchemy import cast, BigInteger
+    
+    # IMPORTANTE: Usamos .distinct() para que el folio 87 solo salga UNA vez
+    query = db.query(Venta.folio).distinct()
+
+    # Si hay clusters, filtramos en Ventas
+    if clusters and len(clusters) > 0:
+        query = query.filter(Venta.etapa.in_(clusters))
+
+    # Si hay pipeline_status, forzamos el cruce con Cartera
+    if pipeline_status and len(pipeline_status) > 0:
+        query = query.filter(Venta.estado_expediente.in_(pipeline_status))
+
+    registros = query.all()
+    
+    # Limpiamos los resultados para devolver solo la lista de strings
+    return [str(row.folio) for row in registros]
