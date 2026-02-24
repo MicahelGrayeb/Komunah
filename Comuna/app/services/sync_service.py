@@ -56,7 +56,7 @@ class AutoSyncManager:
     def ejecutar_sync_total(self):
         """Sincroniza las 8 tablas procesando una por una para no reventar la RAM."""
         try:
-            tablas_fuente = ['ventas', 'pagos', 'antig_saldos', 'cartera_vencida', 'clientes', 'amortizaciones']
+            tablas_fuente = ['ventas', 'pagos', 'antig_saldos', 'cartera_vencida', 'clientes', 'amortizaciones', 'flujo_caja']
             
             with self.engine.connect() as conn:
                 df_gestion_old = pd.read_sql("SELECT * FROM notificaciones_gestion_clientes", conn)
