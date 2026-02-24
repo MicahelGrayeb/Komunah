@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from sqlalchemy import text
 from zoneinfo import ZoneInfo
-import base64, json
+import base64, json, time
 from typing import List, Optional, Union, Any
 import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
@@ -794,9 +794,14 @@ class StaticEmailClusterUseCase:
             clientes_lote = []
             for i in range(1, 7): # Mapeo dinámico c1 a c6
                 nombre = data_sql.get(f"{{c{i}.client_name}}")
-                email = data_sql.get(f"{{g{i}.email}}")
+                
+                # FALLBACK: Si no hay email en GestionClientes, usar el de la tabla Cliente
+                email = data_sql.get(f"{{g{i}.email}}") or data_sql.get(f"{{c{i}.email}}")
                 phone = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "")
-                permiso = str(data_sql.get(f"{{g{i}.permite_email_lote}}")) in ["1", "True"]
+                
+                # PERMISO: Si no existe registro en Gestion, asumimos que SI permite (1)
+                permiso_raw = data_sql.get(f"{{g{i}.permite_email_lote}}")
+                permiso = str(permiso_raw) in ["1", "True", "None"] if permiso_raw is not None else True
 
                 if not nombre or not email: continue
                 if nombre.lower().strip() in excluir_nombres or email.lower().strip() in excluir_emails:
@@ -1470,7 +1475,7 @@ async def api_proceso_cluster(
         default=json.dumps(EJEMPLO_FINAL, indent=2),
         description="Pega el JSON con la configuración masiva"
     ), 
-    archivos: Optional[List[UploadFile]] = File(None),
+    archivos: Optional[List[UploadFile]] = File(None), 
     db: Session = Depends(get_db), 
     user: dict = Depends(es_admin)
 ):
