@@ -23,6 +23,10 @@ CONTRACT_STATUS_WHITELIST = [
     'agenda escritura', 'escriturado'
 ]
 
+LIQUIDADO_STATUS_WHITELIST = [
+    'liquidado', 'proceso escritura', 'agenda escritura', 'escriturado', 'entrega', 'finalizado'
+]
+
 def parse_date_param(date_str: str):
     """Convierte string YYYY-MM-DD a objeto date."""
     try:
@@ -128,7 +132,7 @@ def get_dashboard_kpis(
 
         # 5. Liquidados
         liquidados_query = db.query(func.count(Venta.folio)).filter(
-            func.lower(Venta.estado_expediente) == 'liquidado',
+            func.lower(Venta.estado_expediente).in_(LIQUIDADO_STATUS_WHITELIST),
             Venta.fecha_fin_pago_enganche >= start_date,
             Venta.fecha_fin_pago_enganche <= end_date
         )

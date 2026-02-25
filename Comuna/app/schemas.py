@@ -393,3 +393,117 @@ class SearchboxExpedienteResponse(BaseModel):
     m2: float
     canal_ventas: str
     asesor: str
+
+
+class ReporteJuridicoResponse(BaseModel):
+    Folio: Optional[str] = None
+    StatusPipeline: Optional[str] = None
+    TieneCopropietarios: Optional[str] = None
+    Ubicacion: Dict[str, Any] = Field(default_factory=dict)
+    ClienteFinanciamiento: Dict[str, Any] = Field(default_factory=dict)
+    AsesorComision: Dict[str, Any] = Field(default_factory=dict)
+    EstatusContrato: Dict[str, Any] = Field(default_factory=dict)
+    GestionJuridica: Dict[str, Any] = Field(default_factory=dict)
+    Testigos: Dict[str, Any] = Field(default_factory=dict)
+    Comentarios: Optional[str] = None
+    Comentarios2: Optional[str] = None
+    Observaciones: Optional[str] = None
+
+# --- Schemas para Reporte Jurídico ---
+
+class ReporteJuridicoUbicacion(BaseModel):
+    Mes: Optional[str] = None
+    ContratosElaborados: Optional[str] = None
+    Lote: Optional[str] = None
+    Cluster: Optional[str] = None
+    NumRegistral: Optional[str] = None
+    M2: Optional[str] = None
+
+class ReporteJuridicoClienteFinanciamiento(BaseModel):
+    NombreCliente: Optional[str] = None
+    PrecioFinal: Optional[str] = None
+    Promocion: Optional[str] = None
+
+class ReporteJuridicoAsesorComision(BaseModel):
+    Asesor: Optional[str] = None
+    FuerzaVenta: Optional[str] = None
+    EmailsAsesores: Optional[str] = None
+
+class ReporteJuridicoEstatusContrato(BaseModel):
+    Etapa: Optional[str] = None
+    TipoFirma: Optional[str] = None
+    AutEspecial: Optional[str] = None
+    FechaEntregaAut: Optional[str] = None
+
+class ReporteJuridicoGestionJuridica(BaseModel):
+    FechaIngresoJuridico: Optional[str] = None
+    FechaVerificacion: Optional[str] = None
+    TieneModificaciones: Optional[str] = None
+    FechaCorreccion: Optional[str] = None
+    ResponsableSubsanar: Optional[str] = None
+    FechaConfirmacion: Optional[str] = None
+    FirmaCliente: Optional[str] = None
+    IntentosFirma: Optional[str] = None
+    CierreJuridico: Optional[str] = None
+
+class ReporteJuridicoTestigos(BaseModel):
+    Blindaje: Optional[str] = None
+    FirmaCliente: Optional[str] = None
+    EnvioContabilidad: Optional[str] = None
+    Intentos: Optional[str] = None
+    FechaEntregaAut: Optional[str] = None
+    FirmaEllys: Optional[str] = None
+    StatusEllys: Optional[str] = None
+    FirmaTatiana: Optional[str] = None
+    StatusTatiana: Optional[str] = None
+    Cuzam: Optional[str] = None
+    StatusCuzam: Optional[str] = None
+    RiesgoEntregaPcv: Optional[str] = None
+
+class ReporteJuridicoResponse(BaseModel):
+    Folio: Optional[str] = None
+    # StatusPipeline: Optional[str] = None
+    TieneCopropietarios: Optional[bool] = None
+    Ubicacion: ReporteJuridicoUbicacion
+    ClienteFinanciamiento: ReporteJuridicoClienteFinanciamiento
+    AsesorComision: ReporteJuridicoAsesorComision
+    EstatusContrato: ReporteJuridicoEstatusContrato
+    GestionJuridica: ReporteJuridicoGestionJuridica
+    Testigos: ReporteJuridicoTestigos
+    Comentarios: Optional[str] = None
+    Comentarios2: Optional[str] = None 
+    Observaciones: Optional[str] = None
+
+class ReporteADMVentasJuridicoResponse(BaseModel):
+    Mes: Optional[str] = None
+    ContratosFirmados: Optional[str] = None
+    Lote: Optional[str] = None
+    Cluster: Optional[str] = None
+    NumRegistral: Optional[str] = None
+    M2: Optional[str] = None
+    NombreCliente: Optional[str] = None
+    Promocion: Optional[str] = None
+    NombreAsesor: Optional[str] = None
+    FuerzaVenta: Optional[str] = None
+    PrecioFinal: Optional[str] = None
+    AutEspecial: Optional[str] = None
+    FirmaCliente: Optional[str] = None
+
+
+class RecordatorioFirmaJuridicoResponse(BaseModel):
+    FechaNotificacion: Optional[str] = None
+    NumNotificaciones: Optional[str] = None
+    FechaFirmaTestigo1: Optional[str] = None
+    FechaFirmaTestigo2: Optional[str] = None
+    FechaFirmaRl: Optional[str] = None
+    Comentarios: Optional[str] = None
+
+class EscrituradosJuridicoResponse(BaseModel):
+    NombreCliente: Optional[str] = None
+    Lote: Optional[str] = None
+    Cluster: Optional[str] = None
+    FechaEscrituracion: Optional[str] = None
+    AnioEscrituracion: Optional[str] = None
+    Notario: Optional[str] = None
+    FechaEscrituraLista: Optional[str] = None
+    FechaEscrituraEntregada: Optional[str] = None
