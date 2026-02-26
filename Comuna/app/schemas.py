@@ -145,6 +145,7 @@ class AntigSaldosResponse(BaseModel):
     mas_120_dias: Any = Field(alias="MÁS DE 120 DÍAS", default=None)
     mensualidades_vencidas: Any = Field(alias="MENSUALIDADES VENCIDAS", default=None)
     total_vencido: Any = Field(alias="TOTAL VENCIDO", default=None)
+    total_vencido_2: Any = Field(alias="TOTAL VENCIDO 2", default=None)
     cartera_total: Any = Field(alias="CARTERA TOTAL", default=None)
     total_pagado: Any = Field(alias="TOTAL PAGADO", default=None)
     estatus_pipeline: Optional[str] = Field(alias="ESTATUS PIPELINE", default="Sin Estatus")
@@ -394,22 +395,9 @@ class SearchboxExpedienteResponse(BaseModel):
     canal_ventas: str
     asesor: str
 
+# ... (Todo lo que ya tenías arriba de PagoResponse, Venta, etc., se queda igual)
 
-class ReporteJuridicoResponse(BaseModel):
-    Folio: Optional[str] = None
-    StatusPipeline: Optional[str] = None
-    TieneCopropietarios: Optional[str] = None
-    Ubicacion: Dict[str, Any] = Field(default_factory=dict)
-    ClienteFinanciamiento: Dict[str, Any] = Field(default_factory=dict)
-    AsesorComision: Dict[str, Any] = Field(default_factory=dict)
-    EstatusContrato: Dict[str, Any] = Field(default_factory=dict)
-    GestionJuridica: Dict[str, Any] = Field(default_factory=dict)
-    Testigos: Dict[str, Any] = Field(default_factory=dict)
-    Comentarios: Optional[str] = None
-    Comentarios2: Optional[str] = None
-    Observaciones: Optional[str] = None
-
-# --- Schemas para Reporte Jurídico ---
+# --- BLOQUE DE REPORTES JURÍDICOS (LO QUE SUBIÓ EL OTRO) ---
 
 class ReporteJuridicoUbicacion(BaseModel):
     Mes: Optional[str] = None
@@ -462,7 +450,6 @@ class ReporteJuridicoTestigos(BaseModel):
 
 class ReporteJuridicoResponse(BaseModel):
     Folio: Optional[str] = None
-    # StatusPipeline: Optional[str] = None
     TieneCopropietarios: Optional[bool] = None
     Ubicacion: ReporteJuridicoUbicacion
     ClienteFinanciamiento: ReporteJuridicoClienteFinanciamiento
@@ -489,7 +476,6 @@ class ReporteADMVentasJuridicoResponse(BaseModel):
     AutEspecial: Optional[str] = None
     FirmaCliente: Optional[str] = None
 
-
 class RecordatorioFirmaJuridicoResponse(BaseModel):
     FechaNotificacion: Optional[str] = None
     NumNotificaciones: Optional[str] = None
@@ -507,3 +493,20 @@ class EscrituradosJuridicoResponse(BaseModel):
     Notario: Optional[str] = None
     FechaEscrituraLista: Optional[str] = None
     FechaEscrituraEntregada: Optional[str] = None
+
+
+
+class JuridicoBase(BaseModel):
+    nombre: str
+    categoria: str
+    html: str
+    activo: bool = False
+    tags_departamento: List[str] = []
+
+class JuridicoUpdate(BaseModel):
+    nombre: Optional[str] = None
+    categoria: Optional[str] = None
+    html: Optional[str] = None
+    activo: Optional[bool] = None
+    tags_departamento: Optional[List[str]] = None
+    
