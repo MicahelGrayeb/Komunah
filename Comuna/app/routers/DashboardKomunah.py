@@ -140,6 +140,7 @@ def get_dashboard_kpis(
         liquidados_count = liquidados_query.scalar() or 0
 
         return {
+            "proyecto": proyecto or "Todos",
             "ventas_totales": base_query.total_ventas or 0,
             "pipeline": base_query.pipeline or 0,
             "contratos_firmados": base_query.contratos_firmados or 0,
@@ -249,9 +250,17 @@ def get_financial_charts(
         concepts_query = get_composition(Pago.concepto_pago)
         
         return {
-            "Total_abonado": round(total_actual_abonado, 2), "Pagos_activos": total_actual_conteo, "Rendimiento_mes": round(growth, 1), 
+            "proyecto": proyecto or "Todos",
+            "Total_abonado": round(total_actual_abonado, 2), 
+            "Pagos_activos": total_actual_conteo, 
+            "Rendimiento_mes": round(growth, 1), 
             "Comparativa_rendimiento": f"Total abonado mes actual: ({round(total_actual_abonado, 2)}) vs total abonado mes del año pasado: ({round(total_prev_abonado, 2)})",
-            "Historico_de_abonos": {"Categorias": categories, "Abonado": series_abonado, "Cancelado": series_cancelado, "Pagos_realizados": series_conteo},
+            "Historico_de_abonos": {
+                "Categorias": categories, 
+                "Abonado": series_abonado, 
+                "Cancelado": series_cancelado, 
+                "Pagos_realizados": series_conteo
+                },
             "Composicion_de_ingresos": {
                 "Metodos_de_pagos": [{"label": m[0] or "Sin definir", "value": float(m[1] or 0)} for m in methods_query],
                 "Distribucion_por_conceptos": [{"label": c[0] or "Sin definir", "value": float(c[1] or 0)} for c in concepts_query]
@@ -337,6 +346,7 @@ def get_clusters_chart(
             totals_by_stage.append({"label": etapa, "value": total_etapa})
 
         return {
+            "proyecto": proyecto or "Todos",
             "evolution": {
                 "categories": categories,
                 "series": final_series
