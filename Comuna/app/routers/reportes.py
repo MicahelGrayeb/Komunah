@@ -1,17 +1,25 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import text
+from sqlalchemy import text, and_, func
 from typing import List, Optional
+import re
 from ..database import get_db
 from .. import schemas
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Dict 
 from ..services.security import get_current_user, es_admin, es_usuario
+from ..models import Venta, Pago
 
 router = APIRouter(prefix="/reportes", tags=["Reportes Financieros"])
+
+def extraer_numeros_finales(valor: Optional[str]) -> str:
+    texto = str(valor or "").strip()
+    match = re.search(r"(\d+)\s*$", texto)
+    return match.group(1) if match else ""
+
 @router.get("/pagos-historico", response_model=List[schemas.ConciliacionClienteResponse])
 def get_conciliacion_clientes(anio: Optional[int] = None, folio: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
-    
+
     if anio:
         folio = None 
     elif not folio:
@@ -91,11 +99,11 @@ def get_conciliacion_anual(db: Session = Depends(get_db), user: dict = Depends(e
         FROM ventas v
         INNER JOIN pagos p ON v.FOLIO = p.`Folio de la venta`
         WHERE p.`Estatus` = 'active'
-          AND p.`Método de pago` != 'Nota de Crédito'
-          AND p.`Cliente` IS NOT NULL
-          AND p.`Cliente` != ''
-          AND {col_fecha} IS NOT NULL 
-          AND {col_fecha} != ''
+            AND p.`Método de pago` != 'Nota de Crédito'
+            AND p.`Cliente` IS NOT NULL
+            AND p.`Cliente` != ''
+            AND {col_fecha} IS NOT NULL 
+            AND {col_fecha} != ''
         GROUP BY v.FOLIO, p.`Cliente`
         ORDER BY p.`Cliente` ASC
     """)
@@ -372,12 +380,12 @@ def get_reporte_expedientes_liquidados(db: Session = Depends(get_db), user: dict
         FROM ventas v
         INNER JOIN pagos p ON v.FOLIO = p.`Folio de la venta`
         WHERE p.`Estatus` = 'active'
-          AND v.`ESTADO DEL EXPEDIENTE` IN (
-              'liquidado', 'proceso de escritura', 
-              'agenda escritura', 'escriturado'
-          )
-          AND {col_fecha} IS NOT NULL 
-          AND {col_fecha} != ''
+            AND v.`ESTADO DEL EXPEDIENTE` IN (
+                'liquidado', 'proceso de escritura', 
+                'agenda escritura', 'escriturado'
+            )
+            AND {col_fecha} IS NOT NULL 
+            AND {col_fecha} != ''
         GROUP BY v.FOLIO, v.CLIENTE
         ORDER BY v.CLIENTE ASC
     """)
@@ -412,3 +420,327 @@ def get_reporte_expedientes_liquidados(db: Session = Depends(get_db), user: dict
         return final_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en reporte de expedientes liquidados: {str(e)}")
+
+# ENDPOINTS DE REPORTES JURÍDICOS
+
+@router.get("/Juridico", response_model=List[schemas.ReporteJuridicoResponse])
+def get_reporte_juridico(
+    start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
+    end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
+    proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
+):
+    try:
+        # Consulta base con join a pagos para acceder a datos relacionados
+        query = db.query(Venta, Pago).join(
+            Pago,
+            and_(
+                Pago.folio_venta == Venta.folio,
+                Pago.fecha_comprobante >= start_date,
+                Pago.fecha_comprobante <= end_date,
+                Pago.estatus_flujo == 'active',
+                Pago.estatus == 'active',
+                func.lower(Pago.metodo_pago) != 'nota de crédito'
+            )
+        ).filter(
+            Venta.fecha_inicio_operacion >= start_date,
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])   
+        ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
+
+        if proyecto and proyecto.lower() != "todos":
+            query = query.filter(Venta.desarrollo == proyecto)
+
+        filas = query.all()
+
+        # Evita duplicados por múltiples pagos (incluyendo pagos divididos)
+        ventas = {}
+        for venta, pago in filas:
+            if venta.folio not in ventas:
+                ventas[venta.folio] = (venta, pago)
+
+        meses = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+        reporte_final = []
+        for v, p in ventas.values():
+            # --- Lógica de Nombres y Copropietarios ---
+            nombres_lista = []
+            if v.cliente:
+                nombres_lista.append(v.cliente)
+            
+            # Buscamos copropietarios del 2 al 6
+            for i in range(2, 7):
+                nombre_copro = getattr(v, f"cliente_{i}", None)
+                if nombre_copro:
+                    nombres_lista.append(nombre_copro)
+
+            # Formateo del nombre final y bandera de copropietarios
+            tiene_copro = len(nombres_lista) > 1 
+
+            # Formateo del nombre
+            nombre_cliente_final = ""
+            if tiene_copro:
+                nombre_cliente_final = ", ".join(nombres_lista[:-1]) + " y " + nombres_lista[-1]
+            else:
+                nombre_cliente_final = nombres_lista[0] if nombres_lista else ""
+
+            # --- Obtener nombre del mes ---
+            mes_nombre = ""
+            if v.fecha_inicio_operacion:
+                try:
+                    mes_idx = int(str(v.fecha_inicio_operacion).split("-")[1])
+                    mes_nombre = meses[mes_idx]
+                except: pass
+
+            # Construcción del objeto de respuesta
+            obj = schemas.ReporteJuridicoResponse(
+                Folio=str(v.folio or ""),
+                # StatusPipeline=str(v.estado_expediente or ""),
+                TieneCopropietarios=tiene_copro,
+                Ubicacion={
+                    "Mes": mes_nombre,
+                    "ContratosElaborados": str(getattr(v, 'contratos_elaborados', "") or ""),
+                    "Lote": str(v.numero or ""),
+                    "Cluster": str(v.etapa or ""),
+                    "NumRegistral": extraer_numeros_finales(getattr(v, 'clasificador', "")),
+                    "M2": str(v.metros_cuadrados or "")
+                },
+                ClienteFinanciamiento={
+                    "NombreCliente": nombre_cliente_final, 
+                    "PrecioFinal": str(v.precio_final or ""),
+                    "Promocion": str(getattr(p, 'promocion', "") or "")
+                },
+                AsesorComision={
+                    "Asesor": str(v.asesor or ""),
+                    "FuerzaVenta": str(v.canal_ventas or ""),
+                    "EmailsAsesores": str(getattr(v, 'correo_electronicos', "") or "")
+                },
+                EstatusContrato={
+                    "Etapa": str(getattr(p, 'estatus_expediente', "") or ""),
+                    "TipoFirma": str(getattr(v, 'tipo_firma', "") or ""),
+                    "AutEspecial": str(getattr(v, 'autorizacion_especial', "") or ""),
+                    "FechaEntregaAut": str(getattr(v, 'fecha_entrega_autorizacion', "") or "")
+                },
+                GestionJuridica={
+                    "FechaIngresoJuridico": str(getattr(v, 'fecha_fin_pago_enganche', "") or ""),
+                    "FechaVerificacion": str(getattr(v, 'fecha_verificacion_juridico', "") or ""),
+                    "TieneModificaciones": str(getattr(v, 'modificaciones_contrato', "") or ""),
+                    "FechaCorreccion": str(getattr(v, 'fecha_correccion_contrato', "") or ""),
+                    "ResponsableSubsanar": str(getattr(v, 'responsable_subsanar', "") or ""),
+                    "FechaConfirmacion": str(getattr(v, 'fecha_confirmacion_contrato', "") or ""),
+                    "FirmaCliente": str(getattr(v, 'fecha_firma_cliente', "") or ""),
+                    "IntentosFirma": str(getattr(v, 'intentos_firma', "") or ""),
+                    "CierreJuridico": str(getattr(v, 'fecha_cierre_juridico', "") or "")
+                },
+                Testigos={
+                    "Blindaje": str(getattr(v, 'blindaje', "") or ""),
+                    "FirmaCliente": str(getattr(v, 'fecha_firma_testigos_cliente', "") or ""),
+                    "EnvioContabilidad": str(getattr(v, 'fecha_envio_contabilidad', "") or ""),
+                    "Intentos": str(getattr(v, 'intentos_testigos', "") or ""),
+                    "FechaEntregaAut": str(getattr(v, 'fecha_entrega_autorizacion_testigos', "") or ""),
+                    "FirmaEllys": str(getattr(v, 'firma_ellys', "") or ""),
+                    "StatusEllys": str(getattr(v, 'status_ellys', "") or ""),
+                    "FirmaTatiana": str(getattr(v, 'firma_tatiana', "") or ""),
+                    "StatusTatiana": str(getattr(v, 'status_tatiana', "") or ""),
+                    "Cuzam": str(getattr(v, 'cuzam', "") or ""),
+                    "StatusCuzam": str(getattr(v, 'status_cuzam', "") or ""),
+                    "RiesgoEntregaPcv": str(getattr(v, 'riesgo_entrega_pcv', "") or "")
+                },
+                Comentarios=str(getattr(v, 'comentarios_juridico', "") or ""),
+                Comentarios2=str(getattr(v, 'comentarios_testigos', "") or ""),
+                Observaciones=str(getattr(v, 'observaciones_juridico', "") or "")
+            )
+            reporte_final.append(obj)
+
+        return reporte_final
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en reporte jurídico: {str(e)}")
+
+@router.get("/JuridicoADMVentas", response_model=List[schemas.ReporteADMVentasJuridicoResponse])
+def get_reporteADMVentas_juridico(
+    start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
+    end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
+    proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
+):
+    try:
+        query = db.query(Venta, Pago).join(
+            Pago,
+            and_(
+                Pago.folio_venta == Venta.folio,
+                Pago.fecha_comprobante >= start_date,
+                Pago.fecha_comprobante <= end_date,
+                Pago.estatus_flujo == 'active',
+                Pago.estatus == 'active',
+                func.lower(Pago.metodo_pago) != 'nota de crédito'
+            )
+        ).filter(
+            Venta.fecha_inicio_operacion >= start_date,
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])
+        ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
+
+        if proyecto and proyecto.lower() != "todos":
+            query = query.filter(Venta.desarrollo == proyecto)
+
+        filas = query.all()
+
+        ventas = {}
+        for venta, pago in filas:
+            if venta.folio not in ventas:
+                ventas[venta.folio] = (venta, pago)
+
+        meses = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+        reporte_final = []
+        for v, p in ventas.values():
+            nombres_lista = []
+            if v.cliente:
+                nombres_lista.append(str(v.cliente))
+
+            for i in range(2, 7):
+                nombre_copro = getattr(v, f"cliente_{i}", None)
+                if nombre_copro:
+                    nombres_lista.append(str(nombre_copro))
+
+            if len(nombres_lista) > 1:
+                nombre_cliente_final = ", ".join(nombres_lista[:-1]) + " y " + nombres_lista[-1]
+            else:
+                nombre_cliente_final = nombres_lista[0] if nombres_lista else ""
+
+            mes_nombre = ""
+            if v.fecha_inicio_operacion:
+                try:
+                    mes_idx = int(str(v.fecha_inicio_operacion).split("-")[1])
+                    mes_nombre = meses[mes_idx]
+                except: pass
+
+            reporte_final.append(
+                schemas.ReporteADMVentasJuridicoResponse(
+                    Mes=mes_nombre,
+                    ContratosFirmados=str(getattr(v, "contratos_firmados", "") or ""),
+                    Lote=str(getattr(v, "numero", "") or ""),
+                    Cluster=str( getattr(v, "etapa", "") or ""),
+                    NumRegistral=str(getattr(v, "numero_registro", "") or ""),
+                    M2=str( getattr(v, "metros_cuadrados", "") or ""),
+                    NombreCliente=nombre_cliente_final,
+                    Promocion=str(getattr(p, "promocion", "") or ""),
+                    NombreAsesor=str( getattr(v, "asesor", "") or ""),
+                    FuerzaVenta=str(getattr(v, "canal_ventas", "") or ""),
+                    PrecioFinal=str(getattr(v, "precio_final", "") or ""),
+                    AutEspecial=str(getattr(v, "autorizacion_especial", "") or ""),
+                    FirmaCliente=str(getattr(v, "fecha_firma_cliente", "") or "")
+                )
+            )
+
+        return reporte_final
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en reporte ADM Ventas jurídico: {str(e)}")
+
+@router.get("/recordatorioFirmaJuridico", response_model=List[schemas.RecordatorioFirmaJuridicoResponse])
+def get_recordatorioFirma_juridico(
+    start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
+    end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
+    proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
+):
+    try:
+        query = db.query(Venta, Pago).join(
+            Pago,
+            and_(
+                Pago.folio_venta == Venta.folio,
+                Pago.fecha_comprobante >= start_date,
+                Pago.fecha_comprobante <= end_date,
+                Pago.estatus_flujo == 'active',
+                Pago.estatus == 'active',
+                func.lower(Pago.metodo_pago) != 'nota de crédito'
+            )
+        ).filter(
+            Venta.fecha_inicio_operacion >= start_date,
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])
+        ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
+
+        if proyecto and proyecto.lower() != "todos":
+            query = query.filter(Venta.desarrollo == proyecto)
+
+        filas = query.all()
+
+        ventas = {}
+        for venta, pago in filas:
+            if venta.folio not in ventas:
+                ventas[venta.folio] = (venta, pago)
+
+        recordatorios = []
+        for v, _ in ventas.values():
+            recordatorios.append(
+                schemas.RecordatorioFirmaJuridicoResponse(
+                    FechaNotificacion=str(getattr(v, 'fecha_notificacion_juridico', "") or ""),
+                    NumNotificaciones=str(getattr(v, 'intentos_firma', "") or ""),
+                    FechaFirmaTestigo1=str(getattr(v, 'firma_ellys', "") or ""),
+                    FechaFirmaTestigo2=str(getattr(v, 'firma_tatiana', "") or ""),
+                    FechaFirmaRl=str(getattr(v, 'fecha_firma_cliente', "") or ""),
+                    Comentarios=str(getattr(v, 'comentarios_juridico', "") or "")
+                )
+            )
+
+        return recordatorios
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en recordatorio de firma jurídico: {str(e)}")
+    
+@router.get("/Juridico/Escriturados", response_model=List[schemas.EscrituradosJuridicoResponse])
+def get_escriturados_juridico(
+    start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
+    end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
+    proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
+):
+    try:
+        query = db.query(Venta, Pago).join(
+            Pago,
+            and_(
+                Pago.folio_venta == Venta.folio,
+                Pago.fecha_comprobante >= start_date,
+                Pago.fecha_comprobante <= end_date,
+                Pago.estatus_flujo == 'active',
+                Pago.estatus == 'active',
+                func.lower(Pago.metodo_pago) != 'nota de crédito'
+            )
+        ).filter(
+            Venta.fecha_inicio_operacion >= start_date,
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])
+        ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
+
+        if proyecto and proyecto.lower() != "todos":
+            query = query.filter(Venta.desarrollo == proyecto)
+
+        filas = query.all()
+
+        ventas = {}
+        for venta, pago in filas:
+            if venta.folio not in ventas:
+                ventas[venta.folio] = (venta, pago)
+
+        recordatorios = []
+        for v, _ in ventas.values():
+            recordatorios.append(
+                schemas.EscrituradosJuridicoResponse(
+                    NombreCliente=str(getattr(v, 'cliente', "") or ""),
+                    Lote=str(getattr(v, 'numero', "") or ""),
+                    Cluster=str(getattr(v, 'etapa', "") or ""),
+                    FechaEscrituracion=str(getattr(v, 'fecha_escritura', "") or ""),
+                    AnioEscrituracion=str(getattr(v, 'anio_escritura', "") or ""),
+                    Notario=str(getattr(v, 'notario', "") or ""),
+                    FechaEscrituraLista=str(getattr(v, 'fecha_escritura_lista', "") or ""),
+                    FechaEscrituraEntregada=str(getattr(v, 'fecha_escritura_entregada', "") or "")
+                )
+            )
+
+        return recordatorios
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en escriturados jurídico: {str(e)}")

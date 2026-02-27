@@ -35,7 +35,7 @@ from .routers import (
     DashboardKomunah,
     remitentes,
     admin,
-    debug_config
+    Cobranza
 )
 
 
@@ -195,9 +195,6 @@ if APP_MODE == "NOTIFICACIONES":
     app.include_router(notificacionesMS.router_usuario)
     app.include_router(notificacionesMS.router_globales)
     app.include_router(remitentes.router)
-    app.include_router(debug_config.router)
-    
-    
 else:
     app.include_router(login.router)
     app.include_router(usuarios.router)
@@ -207,9 +204,10 @@ else:
     app.include_router(notificaciones_estaticas.router)
     app.include_router(reportes.router)
     app.include_router(webhook.router)
+    app.include_router(Cobranza.router)
     app.include_router(DashboardKomunah.router)
     app.include_router(admin.router)
-   
+
 # --- ARRANQUE ---
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
