@@ -2,7 +2,7 @@ import os
 import requests
 import re 
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, Body
-from ..schemas import EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate,EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse
+from ..schemas import EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate,EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, JuridicoBase, JuridicoUpdate
 from ..utils.datos_proveedores import get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, set_email_komunah_marketing, set_wa_komunah_marketing, get_folios_a_notificar_komunah, actualizar_switches_etapas, actualizar_switches_proyecto, get_estado_etapas_komunah, get_folios_deudores_komunah, get_folios_dinamico_komunah
 from urllib.parse import quote
 from ..database import get_db
@@ -299,6 +299,46 @@ class FirebaseRepository:
         full_url = f"{url}?{query_params}"
         
         return requests.patch(full_url, json={"fields": fields}, headers=self.headers, timeout=10)
+    
+    # --- CRUD JURÍDICO (SIN ASUNTO) ---
+    def listar_plantillas_juridico(self, empresa_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        return resp.json().get("documents", []) if resp.status_code == 200 else []
+
+    def obtener_un_doc_completo_juridico(self, empresa_id: str, doc_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        return resp.json() if resp.status_code == 200 else None
+
+    def generar_siguiente_id_juridico(self, empresa_id: str):
+        docs = self.listar_plantillas_juridico(empresa_id)
+        prefijo = empresa_id[:2].upper()
+        max_num = 0
+        for d in docs:
+            id_doc = d["name"].split("/")[-1]
+            match = re.search(rf"{prefijo}-(\d+)", id_doc)
+            if match:
+                num = int(match.group(1))
+                if num > max_num: max_num = num
+        return f"{prefijo}-{str(max_num + 1).zfill(4)}"
+
+    def actualizar_plantilla_juridico(self, empresa_id: str, doc_id: str, p: Any):
+        fields = {}
+        mask = []
+        if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
+        if p.html: fields["html"] = {"stringValue": p.html}; mask.append("html")
+        if p.categoria: fields["categoria"] = {"stringValue": p.categoria}; mask.append("categoria")
+        if p.activo is not None: fields["activo"] = {"booleanValue": bool(p.activo)}; mask.append("activo")
+        if hasattr(p, 'tags_departamento') and p.tags_departamento is not None:
+            fields["tags_departamento"] = {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}
+            mask.append("tags_departamento")
+        
+        if not mask: return None
+        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}?{query_params}"
+        return requests.patch(url, json={"fields": fields}, headers=self.headers, timeout=10)
+
 class NotificationGateway:
     """Maneja la comunicación pura con MailerSend."""
     @staticmethod
@@ -1559,4 +1599,85 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
 
     return resultado
 
-print("estoy biewwn ahora si")
+router_juridico = APIRouter(prefix="/v1/plantillas-juridico", tags=["CRUD Jurídico"])
+
+@router_juridico.get("/{empresa_id}")
+def listar_juridico(empresa_id: str, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    docs = repo.listar_plantillas_juridico(empresa_id)
+    resultado = []
+    for d in docs:
+        f = d.get("fields", {})
+        resultado.append({
+            "id": d["name"].split("/")[-1],
+            "nombre": f.get("nombre", {}).get("stringValue", ""),
+            "categoria": f.get("categoria", {}).get("stringValue", ""),
+            "activo": f.get("activo", {}).get("booleanValue", False),
+            "static": f.get("static", {}).get("booleanValue", False),
+            "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
+            "html": f.get("html", {}).get("stringValue", "")
+        })
+    return resultado
+
+@router_juridico.get("/{empresa_id}/{doc_id}")
+def api_get_detalle_juridico(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="No existe la plantilla de jurídico.")
+    f = doc.get("fields", {})
+    return {
+        "id": doc["name"].split("/")[-1],
+        "nombre": f.get("nombre", {}).get("stringValue", ""),
+        "categoria": f.get("categoria", {}).get("stringValue", ""),
+        "html": f.get("html", {}).get("stringValue", ""),
+        "activo": f.get("activo", {}).get("booleanValue", False),
+        "static": f.get("static", {}).get("booleanValue", False),
+        "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])]
+    }
+
+@router_juridico.post("/{empresa_id}", status_code=201)
+def crear_plantilla_juridico(empresa_id: str, p: JuridicoBase, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    nombre_id = repo.generar_siguiente_id_juridico(empresa_id)
+    url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico?documentId={nombre_id}"
+    
+    payload = {"fields": {
+        "id": {"stringValue": nombre_id},
+        "nombre": {"stringValue": p.nombre},
+        "categoria": {"stringValue": p.categoria},
+        "html": {"stringValue": p.html},
+        "activo": {"booleanValue": bool(p.activo)},
+        "static": {"booleanValue": False},
+        "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}
+    }}
+    
+    r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
+    if r.status_code == 200 and p.activo:
+        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, p.categoria, "plantillas_juridico")
+    return {"status": "creada", "id": nombre_id}
+
+@router_juridico.patch("/{empresa_id}/{doc_id}")
+def actualizar_juridico(empresa_id: str, doc_id: str, datos: JuridicoUpdate, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    res = repo.actualizar_plantilla_juridico(empresa_id, doc_id, datos)
+    
+    if res and res.status_code == 200 and datos.activo is True:
+        doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
+        cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
+        if cat:
+            TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_juridico")
+    return {"status": "actualizada", "id": doc_id}
+
+@router_juridico.delete("/{empresa_id}/{doc_id}")
+def eliminar_juridico(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
+    if not doc: raise HTTPException(status_code=404, detail="No existe.")
+    
+    if doc.get("fields", {}).get("static", {}).get("booleanValue", False):
+        raise HTTPException(status_code=403, detail="No puedes borrar una plantilla base del sistema.")
+    
+    url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
+    requests.delete(url, headers=repo.headers, timeout=10)
+    return {"status": "eliminada", "id": doc_id}
