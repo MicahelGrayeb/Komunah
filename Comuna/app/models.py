@@ -247,3 +247,25 @@ class ConfigEtapa(Base):
     total_folios = Column(Integer, default=0)
     etapa_activo = Column(String(255))   
     proyecto_activo = Column(String(255))
+
+
+class FlujoCaja(Base):
+    __tablename__ = "flujo_caja"
+    folio_venta = Column("Folio de venta", String(150))
+    id_flujo = Column("ID Flujo", String(150))
+    estado_expediente = Column("Estado del expediente", Text)
+    cliente = Column("Cliente", Text)
+    proyecto = Column("Proyecto", Text)
+    etapa = Column("Etapa", Text)
+    privada = Column("Privada", Text)
+    unidad = Column("Unidad", String(150))
+    tipo_abono = Column("Tipo de abono", Text)
+    fecha = Column("Fecha", Text)
+    forma_pago = Column("Forma de Pago", Text)
+    banco = Column("Banco", Text)
+    razon_social = Column("Razón Social", Text)
+    monto_pagado = Column("Monto Pagado", Numeric(20, 4))
+    tiene_penalizacion = Column("Tiene penalización", Text)
+    monto_penalizacion = Column("Monto Penalización", Numeric(20, 4))
+    folio_pago = Column("Folio de pago", String(150), primary_key=True)
+    numero_cuenta = Column("Número de cuenta", Text)

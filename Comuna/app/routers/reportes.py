@@ -260,13 +260,30 @@ def get_reporte_detallado(anio: Optional[int] = None, db: Session = Depends(get_
         detalles = []
         for row in result:
             anio_real = int(str(row["FECHA DE PAGO"])[:4]) if row["FECHA DE PAGO"] and str(row["FECHA DE PAGO"])[:4].isdigit() else (int(str(row["FECHA DE PAGO"])[-4:]) if row["FECHA DE PAGO"] and str(row["FECHA DE PAGO"])[-4:].isdigit() else 0)
-            fila_con_anio = {**dict(row), "anio": anio_real}
+            v01 = abs(float(row.get('01 A 30 DÍAS') or 0))
+            v31 = abs(float(row.get('31 A 60 DÍAS') or 0))
+            v61 = abs(float(row.get('61 A 90 DÍAS') or 0))
+            v91 = abs(float(row.get('91 A 120 DÍAS') or 0))
+            v120 = abs(float(row.get('MÁS DE 120 DÍAS') or 0))
+            
+            suma_vencido_2 = v01 + v31 + v61 + v91 + v120
+            fila_con_anio = {
+                **dict(row), 
+                "anio": anio_real, 
+                "TOTAL VENCIDO 2": suma_vencido_2,
+                "01 A 30 DÍAS": v01,      # <--- Obligas a que sea el positivo
+                "31 A 60 DÍAS": v31,
+                "61 A 90 DÍAS": v61,
+                "91 A 120 DÍAS": v91,
+                "MÁS DE 120 DÍAS": v120
+            }
+            
             t_vigente += float(row.get('SALDO VIGENTE') or 0)
-            t_01_30 += float(row.get('01 A 30 DÍAS') or 0)
-            t_31_60 += float(row.get('31 A 60 DÍAS') or 0)
-            t_61_90 += float(row.get('61 A 90 DÍAS') or 0)
-            t_91_120 += float(row.get('91 A 120 DÍAS') or 0)
-            t_mas_120 += float(row.get('MÁS DE 120 DÍAS') or 0)
+            t_01_30 += v01
+            t_31_60 += v31
+            t_61_90 += v61
+            t_91_120 += v91
+            t_mas_120 += v120
             t_vencido += float(row.get('TOTAL VENCIDO') or 0)
             t_cartera += float(row.get('CARTERA TOTAL') or 0)
             t_mensualidades += int(row.get('MENSUALIDADES VENCIDAS') or 0)

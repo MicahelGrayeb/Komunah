@@ -447,14 +447,19 @@ def get_folios_dinamico_komunah(clusters: List[str], pipeline_status: List[str],
     
     # IMPORTANTE: Usamos .distinct() para que el folio 87 solo salga UNA vez
     query = db.query(Venta.folio).distinct()
+    
+    from sqlalchemy import func
+    estados_prohibidos = ["cancelado", "expirado"]
+    query = query.filter(func.lower(Venta.estado_expediente).notin_(estados_prohibidos))
 
     # Si hay clusters, filtramos en Ventas
     if clusters and len(clusters) > 0:
         query = query.filter(Venta.etapa.in_(clusters))
 
-    # Si hay pipeline_status, forzamos el cruce con Cartera
+    # Si hay pipeline_status, filtramos con case-insensitivity
     if pipeline_status and len(pipeline_status) > 0:
-        query = query.filter(Venta.estado_expediente.in_(pipeline_status))
+        pipeline_status_lower = [s.lower().strip() for s in pipeline_status]
+        query = query.filter(func.lower(Venta.estado_expediente).in_(pipeline_status_lower))
 
     registros = query.all()
     
