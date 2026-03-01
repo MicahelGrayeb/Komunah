@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text, and_, func
 from typing import List, Optional
+import re
 from ..database import get_db
 from .. import schemas
 from datetime import datetime
@@ -10,9 +11,15 @@ from ..services.security import get_current_user, es_admin, es_usuario
 from ..models import Venta, Pago
 
 router = APIRouter(prefix="/reportes", tags=["Reportes Financieros"])
+
+def extraer_numeros_finales(valor: Optional[str]) -> str:
+    texto = str(valor or "").strip()
+    match = re.search(r"(\d+)\s*$", texto)
+    return match.group(1) if match else ""
+
 @router.get("/pagos-historico", response_model=List[schemas.ConciliacionClienteResponse])
 def get_conciliacion_clientes(anio: Optional[int] = None, folio: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
-    
+
     if anio:
         folio = None 
     elif not folio:
@@ -92,11 +99,11 @@ def get_conciliacion_anual(db: Session = Depends(get_db), user: dict = Depends(e
         FROM ventas v
         INNER JOIN pagos p ON v.FOLIO = p.`Folio de la venta`
         WHERE p.`Estatus` = 'active'
-          AND p.`Método de pago` != 'Nota de Crédito'
-          AND p.`Cliente` IS NOT NULL
-          AND p.`Cliente` != ''
-          AND {col_fecha} IS NOT NULL 
-          AND {col_fecha} != ''
+            AND p.`Método de pago` != 'Nota de Crédito'
+            AND p.`Cliente` IS NOT NULL
+            AND p.`Cliente` != ''
+            AND {col_fecha} IS NOT NULL 
+            AND {col_fecha} != ''
         GROUP BY v.FOLIO, p.`Cliente`
         ORDER BY p.`Cliente` ASC
     """)
@@ -390,12 +397,12 @@ def get_reporte_expedientes_liquidados(db: Session = Depends(get_db), user: dict
         FROM ventas v
         INNER JOIN pagos p ON v.FOLIO = p.`Folio de la venta`
         WHERE p.`Estatus` = 'active'
-          AND v.`ESTADO DEL EXPEDIENTE` IN (
-              'liquidado', 'proceso de escritura', 
-              'agenda escritura', 'escriturado'
-          )
-          AND {col_fecha} IS NOT NULL 
-          AND {col_fecha} != ''
+            AND v.`ESTADO DEL EXPEDIENTE` IN (
+                'liquidado', 'proceso de escritura', 
+                'agenda escritura', 'escriturado'
+            )
+            AND {col_fecha} IS NOT NULL 
+            AND {col_fecha} != ''
         GROUP BY v.FOLIO, v.CLIENTE
         ORDER BY v.CLIENTE ASC
     """)
@@ -431,6 +438,8 @@ def get_reporte_expedientes_liquidados(db: Session = Depends(get_db), user: dict
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en reporte de expedientes liquidados: {str(e)}")
 
+# ENDPOINTS DE REPORTES JURÍDICOS
+
 @router.get("/Juridico", response_model=List[schemas.ReporteJuridicoResponse])
 def get_reporte_juridico(
     start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
@@ -453,7 +462,8 @@ def get_reporte_juridico(
             )
         ).filter(
             Venta.fecha_inicio_operacion >= start_date,
-            Venta.fecha_inicio_operacion <= end_date
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])   
         ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
 
         if proyecto and proyecto.lower() != "todos":
@@ -510,7 +520,7 @@ def get_reporte_juridico(
                     "ContratosElaborados": str(getattr(v, 'contratos_elaborados', "") or ""),
                     "Lote": str(v.numero or ""),
                     "Cluster": str(v.etapa or ""),
-                    "NumRegistral": str(getattr(v, 'numero_registro', "") or ""),
+                    "NumRegistral": extraer_numeros_finales(getattr(v, 'clasificador', "")),
                     "M2": str(v.metros_cuadrados or "")
                 },
                 ClienteFinanciamiento={
@@ -564,7 +574,6 @@ def get_reporte_juridico(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en reporte jurídico: {str(e)}")
 
-
 @router.get("/JuridicoADMVentas", response_model=List[schemas.ReporteADMVentasJuridicoResponse])
 def get_reporteADMVentas_juridico(
     start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
@@ -586,7 +595,8 @@ def get_reporteADMVentas_juridico(
             )
         ).filter(
             Venta.fecha_inicio_operacion >= start_date,
-            Venta.fecha_inicio_operacion <= end_date
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])
         ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
 
         if proyecto and proyecto.lower() != "todos":
@@ -646,7 +656,6 @@ def get_reporteADMVentas_juridico(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en reporte ADM Ventas jurídico: {str(e)}")
 
-
 @router.get("/recordatorioFirmaJuridico", response_model=List[schemas.RecordatorioFirmaJuridicoResponse])
 def get_recordatorioFirma_juridico(
     start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
@@ -668,7 +677,8 @@ def get_recordatorioFirma_juridico(
             )
         ).filter(
             Venta.fecha_inicio_operacion >= start_date,
-            Venta.fecha_inicio_operacion <= end_date
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])
         ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
 
         if proyecto and proyecto.lower() != "todos":
@@ -719,7 +729,8 @@ def get_escriturados_juridico(
             )
         ).filter(
             Venta.fecha_inicio_operacion >= start_date,
-            Venta.fecha_inicio_operacion <= end_date
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])
         ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
 
         if proyecto and proyecto.lower() != "todos":
