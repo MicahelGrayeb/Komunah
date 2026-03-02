@@ -64,7 +64,7 @@ class AutoSyncManager:
 
             df_ventas_ref = None
             df_clientes_ref = None
-            # --- PROCESO SECUENCIAL (Una por una) ---
+         
             for t in tablas_fuente:
                 logger.info(f"📡 Descargando {t}...")
                 query = f"SELECT * FROM `{self.project_id}.{self.dataset_id}.{t}`"

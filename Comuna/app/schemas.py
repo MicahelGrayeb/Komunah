@@ -395,10 +395,6 @@ class SearchboxExpedienteResponse(BaseModel):
     canal_ventas: str
     asesor: str
 
-# ... (Todo lo que ya tenías arriba de PagoResponse, Venta, etc., se queda igual)
-
-# --- BLOQUE DE REPORTES JURÍDICOS (LO QUE SUBIÓ EL OTRO) ---
-
 class ReporteJuridicoUbicacion(BaseModel):
     Mes: Optional[str] = None
     ContratosElaborados: Optional[str] = None
