@@ -28,6 +28,10 @@ load_dotenv()
 PROCESSED_EVENTS = set()
 session = requests.Session()
 db_firestore = firestore.Client(project=os.getenv("FIREBASE_PLANTILLAS_PROJECT_ID"))
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PLANTILLAS_PROJECT_ID", "").strip()
+FIREBASE_API_KEY = os.getenv("FIREBASE_PLANTILLAS_API_KEY", "")
+FIREBASE_BASE_URL = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents"
+FIREBASE_HEADERS = {"X-Goog-Api-Key": FIREBASE_API_KEY, "Content-Type": "application/json"}
 # --- Configuración de Vertex AI ---
 # Se requiere que la variable de entorno GOOGLE_APPLICATION_CREDENTIALS apunte al JSON de la cuenta de servicio
 # o que el entorno esté autenticado mediante gcloud.
@@ -164,15 +168,48 @@ def analizar_comprobante(url_imagen: str) -> Dict[str, Any]:
     
 # --- FIREBASE REST HELPERS ---
 
+def _to_firestore_value(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {"nullValue": None}
+    if isinstance(value, bool):
+        return {"booleanValue": value}
+    if isinstance(value, int):
+        return {"integerValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    if isinstance(value, dict):
+        return {
+            "mapValue": {
+                "fields": {k: _to_firestore_value(v) for k, v in value.items()}
+            }
+        }
+    if isinstance(value, list):
+        return {
+            "arrayValue": {
+                "values": [_to_firestore_value(item) for item in value]
+            }
+        }
+    return {"stringValue": str(value)}
+
 def guardar_comprobante_firebase(datos: Dict[str, Any]) -> bool:
-    """Guarda en Firestore usando el SDK oficial (gRPC) para evitar errores SSL."""
+    """Guarda en Firestore usando REST API con URL base."""
     try:
-        # El SDK gestiona internamente los reintentos y la estabilidad de la conexión
-        doc_ref = db_firestore.collection("ComprobantePago").document()
-        doc_ref.set(datos)
+        if not FIREBASE_PROJECT_ID or not FIREBASE_API_KEY:
+            raise ValueError("Configuración de Firebase incompleta")
+
+        url = f"{FIREBASE_BASE_URL}/ComprobantePago"
+        payload = {
+            "fields": {k: _to_firestore_value(v) for k, v in datos.items()}
+        }
+
+        response = requests.post(url, headers=FIREBASE_HEADERS, json=payload, timeout=15)
+        if response.status_code not in [200, 201]:
+            logger.error(f"❌ Error Firebase REST {response.status_code}: {response.text}")
+            return False
+
         return True
     except Exception as e:
-        logger.error(f"❌ Error al guardar en Firestore SDK: {e}")
+        logger.error(f"❌ Error al guardar en Firestore REST: {e}")
         
         # Notificación de error solicitada
         telefono_contacto = datos.get("Contacto", {}).get("Telefono")
@@ -255,11 +292,11 @@ def procesar_evento_background(evento: Dict[str, Any]):
         # Limpiamos el texto del OCR para evitar espacios extraños al inicio o fin
         concepto_ocr = resultado_ocr.get("concepto", "").strip()
         
-       # \d{1,4} -> 1 a 4 dígitos iniciales
-       # # \s?[A-Z]{1,2} -> 1 a 2 letras opcionales (ej: G)
-       # # [\s-]* -> Cualquier combinación de espacios o guiones (o nada)
-       # # [A-Z]{0,4} -> 0 a 4 letras del sub-lote (ej: CM, SUB)
-       # # \s?\d{0,4} -> 0 a 4 dígitos finales
+        # \d{1,4} -> 1 a 4 dígitos iniciales
+        # # \s?[A-Z]{1,2} -> 1 a 2 letras opcionales (ej: G)
+        # # [\s-]* -> Cualquier combinación de espacios o guiones (o nada)
+        # # [A-Z]{0,4} -> 0 a 4 letras del sub-lote (ej: CM, SUB)
+        # # \s?\d{0,4} -> 0 a 4 dígitos finales
         regex_lote = r'\b\d{1,4}\s?[A-Z]{1,2}[\s-]*[A-Z]{0,4}\s?\d{0,4}\b'
         
         lote_match = re.search(regex_lote, concepto_ocr, re.IGNORECASE)
@@ -292,7 +329,13 @@ def procesar_evento_background(evento: Dict[str, Any]):
                     "cliente": nombre_cliente,
                     "lote": lote_cliente,
                     "proyecto": registro_venta.desarrollo,
-                    "etapa": registro_venta.etapa
+                    "etapa": registro_venta.etapa,
+                    "EstatusExpediente": registro_venta.estado_expediente,
+                    "cliente2": registro_venta.cliente_2 or "Sin copropietario adicional",
+                    "cliente3": registro_venta.cliente_3 or "Sin copropietario adicional",
+                    "cliente4": registro_venta.cliente_4 or "Sin copropietario adicional",
+                    "cliente5": registro_venta.cliente_5 or "Sin copropietario adicional",
+                    "cliente6": registro_venta.cliente_6 or "Sin copropietario adicional"
                 }
             else:
                 logger.warning(f"Lote '{lote_final}' no válido o cancelado en Cartera.")
@@ -308,7 +351,7 @@ def procesar_evento_background(evento: Dict[str, Any]):
             "IDComprobante": id_comprobante,
             "IDMensaje": str(message_wrapper.get("messageId")),
             "IDCanalMensaje": message_wrapper.get("channelId"),
-            "Status": "Pendiente por validar",
+            "Status": "En revision.",
             "Contacto": {
                 "IDContacto": contact_id,
                 "NombreContacto": f"{contact.get('firstName', '')} {contact.get('lastName', '')}".strip(),
@@ -319,8 +362,17 @@ def procesar_evento_background(evento: Dict[str, Any]):
             },
             "Ocr_analisis": resultado_ocr,
             "Sql_data_extra": {
-                "EtapaActiva": datos_sincronizados.get("etapa"),
-                "Proyecto": datos_sincronizados.get("proyecto")
+                "Cluster": datos_sincronizados.get("etapa"),
+                "Proyecto": datos_sincronizados.get("proyecto"),
+                "EstatusExpediente": datos_sincronizados.get("EstatusExpediente"),
+                "Propietario": datos_sincronizados.get("cliente"),
+                "Copropietarios": [
+                    datos_sincronizados.get("cliente2"),
+                    datos_sincronizados.get("cliente3"),
+                    datos_sincronizados.get("cliente4"),
+                    datos_sincronizados.get("cliente5"),
+                    datos_sincronizados.get("cliente6")
+                ]
             },
             "Archivo": target_attachment.get("fileName") or "Comprobante.jpg",
             "Url": url_imagen,
