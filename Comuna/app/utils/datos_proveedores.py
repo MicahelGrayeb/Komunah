@@ -1,4 +1,4 @@
-from sqlalchemy import text
+﻿from sqlalchemy import text
 from ..models import Venta, Cliente, Amortizacion, GestionClientes, ConfigEtapa, Pago, Cartera
 from ..services.pagos_utils import encontrar_pago_actual, encontrar_pago_actual_mes
 from sqlalchemy.inspection import inspect
@@ -49,17 +49,26 @@ def get_komunah_data(folio_ref: str, db: Session):
     
     conf_cluster = db.query(ConfigEtapa).filter(ConfigEtapa.etapa == venta.etapa).first()
     
-    
+    def _es_activo(val):
+        """Normaliza valores decimales/booleanos/string a bool. 
+        Necesario porque MySQL guarda DECIMAL(10,4): 0.0000 ó 1.0000."""
+        if val is None:
+            return False
+        try:
+            return bool(float(str(val)))
+        except (ValueError, TypeError):
+            return str(val).strip().lower() not in ('false', '0', '')
+
     etapa_permiso = "1"
     motivo_bloqueo = None 
 
     if not conf_cluster:
         etapa_permiso = "0"
         motivo_bloqueo = f"CONFIG_FALTANTE: Etapa '{venta.etapa}' no existe en SQL"
-    elif conf_cluster.proyecto_activo == False:
+    elif not _es_activo(conf_cluster.proyecto_activo):
         etapa_permiso = "0"
         motivo_bloqueo = f"PROYECTO_OFF: Desarrollo '{conf_cluster.proyecto}' desactivado"
-    elif conf_cluster.etapa_activo == False:
+    elif not _es_activo(conf_cluster.etapa_activo):
         etapa_permiso = "0"
         motivo_bloqueo = f"ETAPA_OFF: Cluster '{conf_cluster.etapa}' desactivado"
     
@@ -133,11 +142,26 @@ def get_komunah_data(folio_ref: str, db: Session):
         except:
             c_id_limpio = str(c_id_raw)
 
-        cliente_db = db.query(Cliente).filter(Cliente.client_id == c_id_limpio).first()
+        # Algunas columnas Float en la tabla clientes tienen '' en vez de NULL.
+        # SQLAlchemy nativo falla con ValueError al hacer el type-cast.
+        # Intentamos ORM primero; si falla, caemos a SQL crudo que no castea tipos.
+        try:
+            cliente_db = db.query(Cliente).filter(Cliente.client_id == c_id_limpio).first()
+        except ValueError:
+            from types import SimpleNamespace
+            row = db.execute(
+                text("SELECT * FROM clientes WHERE client_id = :id"),
+                {"id": c_id_limpio}
+            ).mappings().first()
+            if row:
+                cliente_db = SimpleNamespace(**{k: (None if v == '' else v) for k, v in dict(row).items()})
+            else:
+                cliente_db = None
+
         if cliente_db:
             prefijo = f"c{i}." 
-            for col in inspect(cliente_db).mapper.column_attrs:
-                val_c = getattr(cliente_db, col.key)
+            for col in inspect(Cliente).mapper.column_attrs:   # clase, no instancia
+                val_c = getattr(cliente_db, col.key, None)
                 if val_c is not None: 
                     data[f"{{{prefijo}{col.key.lower()}}}"] = str(val_c)
         
@@ -220,28 +244,38 @@ def get_komunah_data(folio_ref: str, db: Session):
 
 def get_folios_a_notificar_komunah(db: Session, fecha: str):
     """
-    PARA EL RECORDATORIO AMISTOSO:
-    Busca folios que vencen en 'fecha', pero EXCLUYE a los que ya deben
-    mensualidades anteriores (porque esos van para cobranza).
+    RECORDATORIO AMISTOSO: folios que vencen en 'fecha' sin deuda de meses anteriores.
+    CORREGIDO: usa SUM de pagos para detectar deuda real (no registro individual),
+    evitando clasificar mal a clientes que pagan en varios abonos.
     """
     query = text("""
         SELECT DISTINCT a.folder_id 
         FROM amortizaciones a
+        JOIN ventas v ON v.FOLIO = a.folder_id
+        JOIN config_etapas ce ON ce.etapa = v.ETAPA
         LEFT JOIN pagos p ON a.folder_id = p.`Folio de la venta` AND a.number = p.`Número de pago`
         WHERE a.date = :f
+        AND CAST(ce.etapa_activo AS DECIMAL(10,4)) > 0
+        AND CAST(ce.proyecto_activo AS DECIMAL(10,4)) > 0
         AND (IFNULL(p.`Estatus expediente`, '') != 'Liquidado')
         AND (
-            p.`Folio de la venta` IS NULL -- No hay registro de pago
-            OR IFNULL(p.`Monto pagado`, 0) < IFNULL(p.`Monto a pagar`, 0) -- Debe dinero
-            OR p.Estatus = 'canceled' -- El pago se canceló
+            p.`Folio de la venta` IS NULL
+            OR IFNULL(p.`Monto pagado`, 0) < IFNULL(p.`Monto a pagar`, 0)
+            OR p.Estatus = 'canceled'
         )
-        -- EXCLUSIÓN: No debe tener ninguna letra anterior con deuda
+        AND v.`ESTADO DEL EXPEDIENTE` IN ('Incidencias', 'Contrato Firmado', 'Firma', 'Firma de Testigos', 'Firmado por Cliente')
+        -- EXCLUSIÓN: no tiene letras anteriores con deuda REAL (sumando todos sus abonos)
         AND NOT EXISTS (
             SELECT 1 FROM amortizaciones a2
-            LEFT JOIN pagos p2 ON a2.folder_id = p2.`Folio de la venta` AND a2.number = p2.`Número de pago`
-            WHERE a2.folder_id = a.folder_id 
+            WHERE a2.folder_id = a.folder_id
             AND a2.date < a.date
-            AND (p2.`Folio de la venta` IS NULL OR IFNULL(p2.`Monto pagado`, 0) < IFNULL(p2.`Monto a pagar`, 0))
+            AND a2.total > (
+                SELECT IFNULL(SUM(px.`Monto pagado`), 0)
+                FROM pagos px
+                WHERE px.`Folio de la venta` = a2.folder_id
+                  AND px.`Número de pago` = a2.number
+                  AND IFNULL(px.Estatus, '') != 'canceled'
+            )
         )
     """)
     registros = db.execute(query, {"f": fecha}).fetchall()
@@ -249,21 +283,34 @@ def get_folios_a_notificar_komunah(db: Session, fecha: str):
 
 def get_folios_deudores_komunah(db: Session, fecha: str):
     """
-    COBRANZA SELECCIONADA: 
-    Busca folios que vencen en 'fecha', pero que ya traen atrasos de meses anteriores.
+    COBRANZA: folios que vencen en 'fecha' y YA tienen deuda real de meses anteriores.
+    CORREGIDO: usa SUM de pagos para detectar deuda real (no registro individual).
     """
     query = text("""
         SELECT DISTINCT a.folder_id 
         FROM amortizaciones a
-        WHERE a.date = :f  
+        JOIN ventas v ON v.FOLIO = a.folder_id
+        JOIN config_etapas ce ON ce.etapa = v.ETAPA
+        WHERE a.date = :f
+        AND CAST(ce.etapa_activo AS DECIMAL(10,4)) > 0
+        AND CAST(ce.proyecto_activo AS DECIMAL(10,4)) > 0
+        AND v.`ESTADO DEL EXPEDIENTE` IN ('Incidencias', 'Contrato Firmado', 'Firma', 'Firma de Testigos', 'Firmado por Cliente')
+        -- INCLUSIÓN: tiene al menos una letra anterior con deuda REAL
         AND EXISTS (
             SELECT 1 FROM amortizaciones a2
-            LEFT JOIN pagos p2 ON a2.folder_id = p2.`Folio de la venta` AND a2.number = p2.`Número de pago`
-            WHERE a2.folder_id = a.folder_id 
+            WHERE a2.folder_id = a.folder_id
             AND a2.date < a.date
-            AND (p2.`Folio de la venta` IS NULL OR IFNULL(p2.`Monto pagado`, 0) < IFNULL(p2.`Monto a pagar`, 0))
+            AND a2.total > (
+                SELECT IFNULL(SUM(px.`Monto pagado`), 0)
+                FROM pagos px
+                WHERE px.`Folio de la venta` = a2.folder_id
+                  AND px.`Número de pago` = a2.number
+                  AND IFNULL(px.Estatus, '') != 'canceled'
+            )
         )
     """)
+    registros = db.execute(query, {"f": fecha}).fetchall()
+    return [row[0] for row in registros]
     registros = db.execute(query, {"f": fecha}).fetchall()
     return [row[0] for row in registros]
 
