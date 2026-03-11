@@ -241,7 +241,7 @@ def obtener_comprobantes():
     try:
         url = f"{_base_url}/ComprobantePago"
         resp = requests.get(url, headers=_headers, timeout=10)
-        
+
         if resp.status_code != 200:
             logger.error(f"Firebase error {resp.status_code}: {resp.text}")
             raise HTTPException(status_code=500, detail="Error al obtener comprobantes")

@@ -35,7 +35,8 @@ from .routers import (
     DashboardKomunah,
     remitentes,
     admin,
-    Cobranza
+    Cobranza,
+    debug_config
 )
 
 
@@ -196,6 +197,7 @@ if APP_MODE == "NOTIFICACIONES":
     app.include_router(notificacionesMS.router_globales)
     app.include_router(notificacionesMS.router_juridico)
     app.include_router(remitentes.router)
+    app.include_router(notificacionesMS.router_juridico)
 else:
     app.include_router(login.router)
     app.include_router(usuarios.router)
@@ -208,6 +210,7 @@ else:
     app.include_router(Cobranza.router)
     app.include_router(DashboardKomunah.router)
     app.include_router(admin.router)
+    app.include_router(debug_config.router)
 
 # --- ARRANQUE ---
 if __name__ == "__main__":
