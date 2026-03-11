@@ -1,28 +1,44 @@
 import os
 import requests
-import re 
+import re
+import base64
+import asyncio
+from playwright.async_api import async_playwright
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, Body
-from ..schemas import EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate,EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, JuridicoBase, JuridicoUpdate
-from ..utils.datos_proveedores import get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, set_email_komunah_marketing, set_wa_komunah_marketing, get_folios_a_notificar_komunah, actualizar_switches_etapas, actualizar_switches_proyecto, get_estado_etapas_komunah, get_folios_deudores_komunah, get_folios_dinamico_komunah
+from ..schemas import (
+    EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate, 
+    EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, 
+    WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, 
+    RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, 
+    JuridicoBase, JuridicoUpdate
+)
+from ..utils.datos_proveedores import (
+    get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, 
+    set_email_komunah_marketing, set_wa_komunah_marketing, 
+    get_folios_a_notificar_komunah, actualizar_switches_etapas, 
+    actualizar_switches_proyecto, get_estado_etapas_komunah, 
+    get_folios_deudores_komunah, get_folios_dinamico_komunah
+)
 from urllib.parse import quote
 from ..database import get_db
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
-from sqlalchemy import text
 from zoneinfo import ZoneInfo
-import base64, json, time
+import json, time
 from typing import List, Optional, Union, Any
 import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 from argparse import Namespace
 from ..models import Venta, Cliente
 from mailersend import MailerSendClient
- 
+from datetime import datetime, date, timedelta
+
+
 router = APIRouter(prefix="/v1/notificaciones", tags=["Motor Envios"])
 router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas"])
 router_wa = APIRouter(prefix="/v1/plantillas-wa", tags=["CRUD WhatsApp"])
 router_usuario = APIRouter(prefix="/v1/preferencias-usuario", tags=["Switches Clientes"])
 router_globales = APIRouter(prefix="/v1/configuracion-global", tags=["Configuración Global"])
+router_juridico = APIRouter(prefix="/v1/plantillas-juridico", tags=["CRUD Jurídico"])
 
 EMPRESAS_AUTORIZADAS = ["komunah", "empresa_test"]
 PROVIDERS = {
@@ -432,7 +448,7 @@ class StaticNotificationUseCase:
         for tag, valor in vars.items():
             texto = texto.replace(tag, str(valor))
         return texto
- 
+
 class StaticWAUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
         self.repo = repo
@@ -880,11 +896,71 @@ class StaticEmailClusterUseCase:
                 time.sleep(0.5)
 
         return {"modo": "SIMULACION" if datos.simular else "REAL", "resumen": conteo, "detalles": reporte_global}
+    
+class GenerarPDFUseCase:
+    def __init__(self, repo: FirebaseRepository):
+        self.repo = repo
+
+    @staticmethod
+    def _normalizar_fragmento(valor: Any, fallback: str = "N/A") -> str:
+        texto = str(valor).strip() if valor is not None else ""
+        if not texto:
+            texto = fallback
+        # Evitar separadores invalidos en nombre/ruta.
+        return re.sub(r"[\\/:*?\"<>|]", "_", texto)
+
+    @staticmethod
+    def _reemplazar_etiquetas(texto: str, variables: dict):
+        if not texto:
+            return texto
+        for tag, valor in variables.items():
+            texto = texto.replace(tag, str(valor))
+        return re.sub(r"\{[^}]+\}", "", texto)
+
+    async def generar_pdf_desde_plantilla(self, empresa_id: str, id_plantilla: str, folio: str, db: Session):
+        plantilla = self.repo.obtener_un_doc_completo_juridico(empresa_id, id_plantilla)
+        if not plantilla:
+            raise HTTPException(status_code=404, detail="No existe la plantilla jurídica seleccionada.")
+
+        pack_empresa = PROVIDERS.get(empresa_id, {})
+        extraer_datos = pack_empresa.get("get")
+        if not extraer_datos:
+            raise HTTPException(status_code=400, detail="Empresa no configurada.")
+
+        data_sql = extraer_datos(folio, db)
+        if not data_sql:
+            raise HTTPException(status_code=404, detail="Folio no encontrado.")
+
+        fields = plantilla.get("fields", {})
+        html_raw = fields.get("html", {}).get("stringValue", "")
+        if not html_raw:
+            raise HTTPException(status_code=400, detail="La plantilla no tiene HTML.")
+
+        html_final = self._reemplazar_etiquetas(html_raw, data_sql)
+
+        nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
+        nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')}.pdf"
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+            page = await browser.new_page()
+            await page.set_content(html_final, wait_until="networkidle")
+            await page.emulate_media(media="screen")
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(400)
+            pdf_bytes = await page.pdf(format="A4", print_background=True)
+            await browser.close()
+
+        return {
+            "filename": nombre_pdf,
+            "content": base64.b64encode(pdf_bytes).decode("utf-8"),
+            "content_type": "application/pdf",
+        }
 
 @router_crud.get("/{empresa_id}/conteo/{categoria}")
 def api_contar_plantillas(empresa_id: str, categoria: str,user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
-   
+
     total = TemplateUseCase.contar_plantillas_por_categoria(repo, empresa_id, categoria) 
     return {"categoria": categoria, "total": total}
 
@@ -1094,6 +1170,7 @@ def api_get_diccionario_maestro(
 @router.post("/enviar/{empresa_id}")
 async def api_enviar_estatico(
     empresa_id: str,
+    id_plantilla: Optional[str],
     datos_json: str = Form(..., description="Pega aquí tu bloque de JSON completo"), 
     archivos: Optional[List[UploadFile]] = File(None), 
     db: Session = Depends(get_db), user: dict = Depends(es_usuario)
@@ -1114,13 +1191,26 @@ async def api_enviar_estatico(
 
     if archivos:
         for f in archivos:
-           
+            
             if f.filename:
                 contenido = await f.read()
                 adjuntos_procesados.append({
                     "content": base64.b64encode(contenido).decode('utf-8'),
                     "filename": f.filename
                 })
+
+    if id_plantilla:
+        pdf_service = GenerarPDFUseCase(FirebaseRepository())
+        adjunto_pdf = await pdf_service.generar_pdf_desde_plantilla(
+            empresa_id=empresa_id,
+            id_plantilla=id_plantilla,
+            folio=str(d.get("folio", "")),
+            db=db,
+        )
+        adjuntos_procesados.append({
+            "content": adjunto_pdf["content"],
+            "filename": adjunto_pdf["filename"],
+        })
 
     from argparse import Namespace
     datos_finales = Namespace(
@@ -1136,6 +1226,7 @@ async def api_enviar_estatico(
     )
 
     return use_case.ejecutar_envio_manual(empresa_id, datos_finales, db)
+
 @router.post("/{empresa_id}/enviar-whatsapp")
 def api_enviar_wa(empresa_id: str, datos: WhatsAppManualSchema, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     """
@@ -1146,7 +1237,7 @@ def api_enviar_wa(empresa_id: str, datos: WhatsAppManualSchema, db: Session = De
     gateway = NotificationGateway()
     use_case = StaticWAUseCase(repo, gateway)
     return use_case.ejecutar_envio_wa(empresa_id, datos, db)
- 
+
 @router.post("/{empresa_id}/enviar-email-folio")
 def api_enviar_email(
     empresa_id: str, 
@@ -1352,7 +1443,6 @@ def api_switch_whatsapp(empresa_id: str, estado: bool, user: dict = Depends(es_a
 
 
 @router.get("/monitoreo/fallas/{empresa_id}", tags=["Monitoreo de Logs"])
-
 def api_ver_fallas_pendientes(empresa_id: str, user: dict = Depends(es_admin)):
     """
     Devuelve todos los logs con todos sus campos y un contador de pendientes (no leídos).
@@ -1398,6 +1488,7 @@ def api_ver_fallas_pendientes(empresa_id: str, user: dict = Depends(es_admin)):
         "total_pendientes": conteo_no_leidos, 
         "logs": lista_completa               
     }
+
 @router.patch("/monitoreo/fallas/{empresa_id}/{log_id}/leer", tags=["Monitoreo de Logs"])
 def api_marcar_falla_como_leida(empresa_id: str, log_id: str, user: dict = Depends(es_admin)):
     """Cuando ya viste el error, le picas aquí para 'apagarlo'."""
@@ -1431,7 +1522,6 @@ def api_switch_etapas(
     
     raise HTTPException(status_code=400, detail="Error al actualizar en SQL.")
 
-
 @router_globales.patch("/proyecto/{empresa_id}")
 def api_switch_proyecto_completo(
     empresa_id: str, 
@@ -1453,7 +1543,7 @@ def api_switch_proyecto_completo(
     
     raise HTTPException(status_code=400, detail="Error al actualizar en SQL.")
 
- 
+
 @router_globales.get("/estado-etapas/{empresa_id}")
 def api_get_estado_etapas(empresa_id: str, db: Session = Depends(get_db), user: dict = Depends(es_admin)):
     func = PROVIDERS.get(empresa_id, {}).get("get_estado_etapas")
@@ -1541,7 +1631,6 @@ async def api_proceso_cluster(
     use_case = StaticEmailClusterUseCase(FirebaseRepository(), NotificationGateway())
     return use_case.ejecutar_proceso_cluster(empresa_id, Namespace(**config_final), db)
 
-
 @router.get("/busqueda-expedientes", response_model=List[SearchboxExpedienteResponse])
 def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     # 1. Filtramos activos: Diferente a 'Expirado' y 'Cancelado'
@@ -1600,7 +1689,8 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
 
     return resultado
 
-router_juridico = APIRouter(prefix="/v1/plantillas-juridico", tags=["CRUD Jurídico"])
+
+# --- ENDPOINTS JURIDICO --- #
 
 @router_juridico.get("/{empresa_id}")
 def listar_juridico(empresa_id: str, user: dict = Depends(es_admin)):
@@ -1682,3 +1772,4 @@ def eliminar_juridico(empresa_id: str, doc_id: str, user: dict = Depends(es_admi
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
     requests.delete(url, headers=repo.headers, timeout=10)
     return {"status": "eliminada", "id": doc_id}
+
