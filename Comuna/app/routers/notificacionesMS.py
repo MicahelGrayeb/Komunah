@@ -1,4 +1,4 @@
-import os
+﻿import os
 import requests
 import re
 import base64
@@ -40,9 +40,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/notificaciones", tags=["Motor Envios"])
 router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas"])
 router_wa = APIRouter(prefix="/v1/plantillas-wa", tags=["CRUD WhatsApp"])
-router_juridico = APIRouter(prefix="/v1/plantillas-juridico", tags=["CRUD JurÃ­dico"])
+router_juridico = APIRouter(prefix="/v1/plantillas-juridico", tags=["CRUD Jurídico"])
 router_usuario = APIRouter(prefix="/v1/preferencias-usuario", tags=["Switches Clientes"])
-router_globales = APIRouter(prefix="/v1/configuracion-global", tags=["ConfiguraciÃ³n Global"])
+router_globales = APIRouter(prefix="/v1/configuracion-global", tags=["Configuración Global"])
 BUCKET_NAME = "bucket-grupo-komunah-juridico"
 
 EMPRESAS_AUTORIZADAS = ["komunah", "empresa_test"]
@@ -61,7 +61,7 @@ PROVIDERS = {
 }
 
 class FirebaseRepository:
-    """Maneja la comunicaciÃ³n tÃ©cnica con Firebase Firestore."""
+    """Maneja la comunicación técnica con Firebase Firestore."""
     
     def __init__(self):
         self.project_id = os.getenv('FIREBASE_PLANTILLAS_PROJECT_ID', '').strip()
@@ -70,7 +70,7 @@ class FirebaseRepository:
         self.headers = {"X-Goog-Api-Key": self.api_key, "Content-Type": "application/json"}
 
     def obtener_config_empresa(self, empresa_id: str):
-        """lÃ³gica  de switches."""
+        """lógica  de switches."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/general"
         try:
             resp = requests.get(url, headers=self.headers, timeout=5)
@@ -96,7 +96,7 @@ class FirebaseRepository:
             data = response.json()
             return data.get("fields", {}).get("html", {}).get("stringValue", "")
         except Exception as e:
-            print(f"DEBUG FIREBASE - ExcepciÃ³n: {e}")
+            print(f"DEBUG FIREBASE - Excepción: {e}")
             return None
 
     def query_categoria(self, empresa_id: str, categoria: str, coleccion: str = "plantillas"): 
@@ -128,12 +128,12 @@ class FirebaseRepository:
         return requests.patch(url, json=payload, headers=self.headers, timeout=10)
     
     def eliminar_plantilla(self, empresa_id: str, doc_id: str):
-        """Elimina fÃ­sicamente el documento."""
+        """Elimina físicamente el documento."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
         return requests.delete(url, headers=self.headers, timeout=10)
 
     def actualizar_plantilla(self, empresa_id: str, doc_id: str, p: PlantillaUpdate):
-        """Actualiza campos especÃ­ficos usando updateMask."""
+        """Actualiza campos específicos usando updateMask."""
         fields = {}
         mask = []
         if p.nombre: 
@@ -185,7 +185,7 @@ class FirebaseRepository:
         return resp.json().get("documents", []) if resp.status_code == 200 else []
 
     def generar_siguiente_id(self, empresa_id: str):
-        """Busca el mÃ¡ximo y usa 4 dÃ­gitos para que quepan hasta 9,999 plantillas."""
+        """Busca el máximo y usa 4 dígitos para que quepan hasta 9,999 plantillas."""
         docs = self.listar_todas_plantillas(empresa_id)
         prefijo = empresa_id[:2].upper()
         max_num = 0
@@ -203,13 +203,13 @@ class FirebaseRepository:
         return f"{prefijo}-{str(max_num + 1).zfill(4)}"
 
     def obtener_un_doc_completo(self, empresa_id: str, doc_id: str):
-        """Para el GET de ediciÃ³n (trae todos los campos)."""
+        """Para el GET de edición (trae todos los campos)."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
         resp = requests.get(url, headers=self.headers, timeout=10)
         return resp.json() if resp.status_code == 200 else None
     
     def obtener_un_doc_completo_wa(self, empresa_id: str, doc_id: str):
-        """Busca un solo documento en la colecciÃ³n de WhatsApp."""
+        """Busca un solo documento en la colección de WhatsApp."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
         resp = requests.get(url, headers=self.headers, timeout=10)
         return resp.json() if resp.status_code == 200 else None
@@ -280,7 +280,7 @@ class FirebaseRepository:
             requests.patch(url, json=payload, headers=self.headers) 
 
     def obtener_config_recordatorios(self, empresa_id: str):
-        """Trae los dÃ­as de recordatorio desde Firebase."""
+        """Trae los días de recordatorio desde Firebase."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
         resp = requests.get(url, headers=self.headers, timeout=5)
         if resp.status_code != 200:
@@ -294,7 +294,7 @@ class FirebaseRepository:
         }
     
     def actualizar_config_recordatorios(self, empresa_id: str, datos: dict):
-        """Recibe un diccionario y parchea solo los campos presentes en Ã©l."""
+        """Recibe un diccionario y parchea solo los campos presentes en él."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
         fields = {}
         mask = []
@@ -321,7 +321,7 @@ class FirebaseRepository:
         
         return requests.patch(full_url, json={"fields": fields}, headers=self.headers, timeout=10)
     
-    # --- CRUD JURÃDICO (SIN ASUNTO) ---
+    # --- CRUD JURÍDICO (SIN ASUNTO) ---
     def listar_plantillas_juridico(self, empresa_id: str):
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico"
         resp = requests.get(url, headers=self.headers, timeout=10)
@@ -361,7 +361,7 @@ class FirebaseRepository:
         return requests.patch(url, json={"fields": fields}, headers=self.headers, timeout=10)
 
 class NotificationGateway:
-    """Maneja la comunicaciÃ³n pura con MailerSend."""
+    """Maneja la comunicación pura con MailerSend."""
     @staticmethod
     def enviar_email(payload: dict):
         api_key = os.getenv("MAILERSEND_API_KEY")
@@ -463,7 +463,7 @@ class StaticNotificationUseCase:
             if res.status_code not in [200, 201, 202]:
                 FirebaseRepository().registrar_log_falla(
                     empresa_id, 
-                    f"Email Manual fallÃ³ ({res.status_code}) para {email_destino}", 
+                    f"Email Manual falló ({res.status_code}) para {email_destino}", 
                     "MANUAL_EMAIL"
                 )
             reporte.append({"email": email_destino, "status_code": res.status_code})
@@ -502,7 +502,7 @@ class StaticWAUseCase:
         
         data_sql = extraer_datos(datos.folio, db)
         if not data_sql:
-            self.repo.registrar_log_falla(empresa_id, f"Folio {datos.folio} no encontrado en SQL para envÃ­o manual", "MANUAL_WA_ERROR")
+            self.repo.registrar_log_falla(empresa_id, f"Folio {datos.folio} no encontrado en SQL para envío manual", "MANUAL_WA_ERROR")
             raise HTTPException(status_code=404, detail="Folio no encontrado.")
 
         docs_wa = self.repo.query_categoria(empresa_id, datos.categoria, "plantillas_whatsapp")
@@ -556,7 +556,7 @@ class StaticWAUseCase:
             if res.status_code not in [200, 201, 202]:
                 self.repo.registrar_log_falla(
                     empresa_id, 
-                    f"WhatsApp Manual fallÃ³ ({res.status_code}) para {nombre} en folio {datos.folio}", 
+                    f"WhatsApp Manual falló ({res.status_code}) para {nombre} en folio {datos.folio}", 
                     "WA_PROVIDER_ERROR"
                 )
 
@@ -630,11 +630,11 @@ class StaticEmailFolioUseCase:
         return {"folio": datos.folio, "categoria": datos.categoria, "detalles": reporte}
 
 class TemplateUseCase:
-    """Maneja la lÃ³gica del switch de activaciÃ³n: uno true, el resto false."""
+    """Maneja la lógica del switch de activación: uno true, el resto false."""
     
     @staticmethod
     def asegurar_activacion_unica(repo: FirebaseRepository, empresa_id: str, doc_id: str, categoria: str, coleccion: str):
-        """Apaga el resto de la categorÃ­a si la nueva estÃ¡ activa."""
+        """Apaga el resto de la categoría si la nueva está activa."""
         docs = repo.query_categoria(empresa_id, categoria, coleccion)
         for item in docs:
             if "document" not in item: continue
@@ -655,7 +655,7 @@ class NotificationUseCase:
         self.repo = repo
         self.gateway = gateway
 
-    async def ejecutar_barrido_automatico(self, empresa_id: str, dias: int, categoria: str, db: Session, tipo: str = "normal", simular: bool = False, categoria_doc: Optional[str] = None):
+    def ejecutar_barrido_automatico(self, empresa_id: str, dias: int, categoria: str, db: Session, tipo: str = "normal"):
         pack_empresa = PROVIDERS.get(empresa_id, {})
         extraer_datos = pack_empresa.get("get")
         if not extraer_datos:
@@ -676,7 +676,7 @@ class NotificationUseCase:
             return str(valor or "").strip().lower()
         
         if not config.get("proyecto"):
-            self.repo.registrar_log_falla(empresa_id, f"Barrido cancelado: Proyecto desactivado en configuraciÃ³n global", "AUTO_BARRIDO")
+            self.repo.registrar_log_falla(empresa_id, f"Barrido cancelado: Proyecto desactivado en configuración global", "AUTO_BARRIDO")
             return {"status": "off", "msj": "Proyecto desactivado"}
         
         docs_email = self.repo.query_categoria(empresa_id, categoria, "plantillas")
@@ -738,7 +738,7 @@ class NotificationUseCase:
             
 
             if data_sql.get("{sys.etapa_activa}") == "0":
-                motivo = data_sql.get("{sys.bloqueo_motivo}", "Bloqueo por configuraciÃ³n de Etapa/Proyecto")
+                motivo = data_sql.get("{sys.bloqueo_motivo}", "Bloqueo por configuración de Etapa/Proyecto")
 
                 self.repo.registrar_log_falla(empresa_id, f"Folio {row} saltado: {motivo}", "BLOQUEO_ADMINISTRATIVO")
                 continue
@@ -766,62 +766,30 @@ class NotificationUseCase:
                     self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Sin plantilla activa.", "PLANTILLA_OFF")
                     resultado_envio["email"] = "NO_TEMPLATE"
                 elif not acepta_email_lote:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Usuario apagÃ³ switch de lote {row}.", "USER_LOTE_OFF")
+                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Usuario apagó switch de lote {row}.", "USER_LOTE_OFF")
                     resultado_envio["email"] = "LOTE_OFF"
                 elif not email:
                     self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: No tiene correo registrado.", "DATA_MISSING")
                     resultado_envio["email"] = "NO_DATA"
                 else:
-                    if simular:
-                        resultado_envio["email"] = "SIMULADO (No enviado)"
-                        resultado_envio["saldo_detectado"] = data_sql.get("{ven.saldo_total_a_pagar}")
-                    else:
-                        try:
-                            lista_adjuntos = []
-                            # 1. Adjuntos fijos de la plantilla
-                            adjuntos_raw = p_email.get("adjuntos_url", {}).get("arrayValue", {}).get("values", [])
-                            for adj in adjuntos_raw:
-                                url_archivo = adj.get("stringValue")
-                                info_archivo = self._descargar_a_base64(url_archivo)
-                                if info_archivo:
-                                    lista_adjuntos.append(info_archivo)
-
-                            # 2. Generación dinámica de PDF (Nuevo requerimiento)
-                            if categoria_doc:
-                                try:
-                                    pdf_service = GenerarPDFUseCase(self.repo)
-                                    adjunto_pdf = await pdf_service.generar_pdf_por_categoria(
-                                        empresa_id=empresa_id,
-                                        categoria=categoria_doc,
-                                        folio=str(row),
-                                        db=db,
-                                        subir_bucket=False,
-                                    )
-                                    lista_adjuntos.append({
-                                        "content": adjunto_pdf["content"],
-                                        "filename": adjunto_pdf["filename"]
-                                    })
-                                except Exception as e_pdf:
-                                    logger.error(f"Error generando PDF para folio {row}: {e_pdf}")
-                                    self.repo.registrar_log_falla(empresa_id, f"Falla PDF ({categoria_doc}) - Folio {row}: {str(e_pdf)}", "PDF_GENERATION_ERROR")
-
-                            res_mail = self.gateway.enviar_email({
-                                "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": f"Notificaciones {empresa_id}"},
-                                "to": [{"email": email, "name": nombre}],
-                                "subject": self._limpiar(p_email["asunto"]["stringValue"], data_sql, nombre, email, phone),
-                                "html": self._limpiar(p_email["html"]["stringValue"], data_sql, nombre, email, phone),
-                                "attachments": lista_adjuntos
-                            })
-                            if res_mail.status_code not in [200, 201, 202]:
-                                self.repo.registrar_log_falla(empresa_id, f"Email falló ({res_mail.status_code}) para {email}", "MAIL_PROVIDER")
-                            resultado_envio["email"] = f"Status: {res_mail.status_code} | {res_mail.text[:100]}"
-                        except Exception as e_send:
-                            import traceback
-                            err_msg = f"Error crítico en envío Email (Folio {row}, {email}): {str(e_send)}"
-                            stack = traceback.format_exc()
-                            logger.exception(err_msg)
-                            self.repo.registrar_log_falla(empresa_id, err_msg, f"TRACEBACK:\n{stack}\n\nPAYLOAD_DATA:\n{json.dumps(data_sql, indent=2)}")
-                            resultado_envio["email"] = "CRITICAL_ERROR"
+                    lista_adjuntos = []
+                    adjuntos_raw = p_email.get("adjuntos_url", {}).get("arrayValue", {}).get("values", [])
+                    for adj in adjuntos_raw:
+                        url_archivo = adj.get("stringValue")
+                        info_archivo = self._descargar_a_base64(url_archivo)
+                        if info_archivo:
+                            lista_adjuntos.append(info_archivo)
+                        
+                    res_mail = self.gateway.enviar_email({
+                        "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": f"Notificaciones {empresa_id}"},
+                        "to": [{"email": email, "name": nombre}],
+                        "subject": self._limpiar(p_email["asunto"]["stringValue"], data_sql, nombre, email, phone),
+                        "html": self._limpiar(p_email["html"]["stringValue"], data_sql, nombre, email, phone),
+                        "attachments": lista_adjuntos
+                    })
+                    if res_mail.status_code not in [200, 201, 202]:
+                        self.repo.registrar_log_falla(empresa_id, f"Email falló ({res_mail.status_code}) para {email}", "MAIL_PROVIDER")
+                    resultado_envio["email"] = f"Status: {res_mail.status_code} | {res_mail.text[:100]}"
                         
 
 
@@ -835,31 +803,33 @@ class NotificationUseCase:
                     self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Lote bloqueado en SQL.", "USER_LOTE_OFF")
                     resultado_envio["wa"] = "LOTE_OFF"
                 elif not phone:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Falta nÃºmero de telÃ©fono.", "DATA_MISSING")
+                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Falta número de teléfono.", "DATA_MISSING")
                     resultado_envio["wa"] = "NO_PHONE"
                 else:
-                    if simular:
-                        resultado_envio["wa"] = "SIMULADO (No enviado)"
-                    else:
-                        parametros_dinamicos = []
-                        for var_nombre in p_wa["variables"]:
-                            if var_nombre in ["{cl.cliente}", "{cliente}", "{v.cliente}"]:
-                                valor = nombre
-                            elif var_nombre == "{email_cliente}":
-                                valor = email
-                            elif var_nombre == "{telefono_cliente}": 
-                                valor = phone
-                            else:
-                                valor = data_sql.get(var_nombre, "N/A")
-                            parametros_dinamicos.append(valor)
-                        num_wa = phone if "+" in phone else f"+521{phone}"
-                        texto_completo = p_wa["texto_base"]
-                        for idx, v_nombre in enumerate(p_wa["variables"], 1):
-                            texto_completo = texto_completo.replace(v_nombre, f"{{{{{idx}}}}}")
-                        res_wa = self.gateway.enviar_whatsapp(num_wa, p_wa["id_respond"], p_wa["lenguaje"], parametros_dinamicos, texto_cuerpo=texto_completo)
-                        if res_wa.status_code not in [200, 201, 202]:
-                            self.repo.registrar_log_falla(empresa_id, f"WhatsApp falló ({res_wa.status_code}) para {phone}", "WA_PROVIDER")
-                        resultado_envio["wa"] = f"Status: {res_wa.status_code}"
+
+                    parametros_dinamicos = []
+                    for var_nombre in p_wa["variables"]:
+                        if var_nombre in ["{cl.cliente}", "{cliente}", "{v.cliente}"]:
+                            valor = nombre
+                        elif var_nombre == "{email_cliente}":
+                            valor = email
+                        elif var_nombre == "{telefono_cliente}": 
+                            valor = phone
+                        else:
+                            valor = data_sql.get(var_nombre, "N/A")
+                        parametros_dinamicos.append(valor)
+
+                    num_wa = phone if "+" in phone else f"+521{phone}"
+                    texto_completo = p_wa["texto_base"]
+                    for idx, v_nombre in enumerate(p_wa["variables"], 1):
+                        texto_completo = texto_completo.replace(v_nombre, f"{{{{{idx}}}}}")
+
+                    res_wa = self.gateway.enviar_whatsapp(num_wa, p_wa["id_respond"], p_wa["lenguaje"], parametros_dinamicos, texto_cuerpo=texto_completo)
+                    
+                    if res_wa.status_code not in [200, 201, 202]:
+                        self.repo.registrar_log_falla(empresa_id, f"WhatsApp falló ({res_wa.status_code}) para {phone}", "WA_PROVIDER")
+                    
+                    resultado_envio["wa"] = f"Status: {res_wa.status_code}"
 
                 reporte_detallado.append(resultado_envio)
 
@@ -922,14 +892,14 @@ class StaticDualUseCase:
                 "resultado_email": reporte_email.get("detalles", [])
             }
         except Exception as e:
-            self.repo.registrar_log_falla(empresa_id, f"Error en envÃ­o Dual: {str(e)}", "DUAL_SEND_ERROR")
+            self.repo.registrar_log_falla(empresa_id, f"Error en envío Dual: {str(e)}", "DUAL_SEND_ERROR")
             raise HTTPException(status_code=400, detail=f"Error en el proceso dual: {str(e)}")
 
 class StaticEmailClusterUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
         self.repo = repo
         self.gateway = gateway
-        # Inicializamos el cliente de MailerSend para el envÃ­o masivo
+        # Inicializamos el cliente de MailerSend para el envío masivo
         self.ms = MailerSendClient()
 
     def ejecutar_proceso_cluster(self, empresa_id: str, datos: Any, db: Session):
@@ -951,7 +921,7 @@ class StaticEmailClusterUseCase:
         conteo = {"exitosos": 0, "bloqueados_sys": 0, "omitidos_user": 0, "excluidos_manual": 0}
         procesador = NotificationUseCase(self.repo, self.gateway)
 
-        # Preparar la cola para el envÃ­o masivo
+        # Preparar la cola para el envío masivo
         cola_bulk_moderna = []
 
         for f in folios_brutos:
@@ -966,7 +936,7 @@ class StaticEmailClusterUseCase:
                 continue
 
             clientes_lote = []
-            for i in range(1, 7): # Mapeo dinÃ¡mico c1 a c6
+            for i in range(1, 7): # Mapeo dinámico c1 a c6
                 nombre = data_sql.get(f"{{c{i}.client_name}}")
                 
                 # FALLBACK: Si no hay email en GestionClientes, usar el de la tabla Cliente
@@ -986,7 +956,7 @@ class StaticEmailClusterUseCase:
                 asunto_final = procesador._limpiar(datos.asunto, data_sql, nombre, email, phone)
                 html_final = procesador._limpiar(datos.contenido_html, data_sql, nombre, email, phone)
 
-                # Si es envÃ­o REAL y tiene permiso, armamos el objeto para la cola
+                # Si es envío REAL y tiene permiso, armamos el objeto para la cola
                 if not datos.simular and permiso:
                     email_obj = {
                         "from": {"email": datos.remitente, "name": f"Notificaciones {empresa_id.capitalize()}"},
@@ -1072,19 +1042,19 @@ class GenerarPDFUseCase:
             logger.exception("[PDF_COTIZACIONES] Error consultando amortizaciones | folio=%s | error=%s", folio, str(e))
             raise HTTPException(status_code=500, detail=f"Error al consultar amortizaciones para folio {folio}: {str(e)}")
 
-        # --- INICIO DE BÃšSQUEDA CORREGIDA ---
-        # 1. Encontramos la posiciÃ³n de la primera variable de la fila
+        # --- INICIO DE BÚSQUEDA CORREGIDA ---
+        # 1. Encontramos la posición de la primera variable de la fila
         idx_pago = html_raw.find("{pago.numero}")
         
         if idx_pago == -1:
-            logger.info("[PDF_COTIZACIONES] Paso: no se encontrÃ³ plantilla de fila de pagos en HTML")
+            logger.info("[PDF_COTIZACIONES] Paso: no se encontró plantilla de fila de pagos en HTML")
             return html_raw, {
                 "{totales.suma_capital}": self._formatear_moneda(0),
                 "{totales.suma_enganche}": self._formatear_moneda(0),
                 "{totales.suma_total}": self._formatear_moneda(0),
             }
 
-        # 2. Buscamos el inicio de esa fila hacia atrÃ¡s y el final hacia adelante
+        # 2. Buscamos el inicio de esa fila hacia atrás y el final hacia adelante
         idx_tr_start = html_raw.rfind("<tr", 0, idx_pago)
         idx_tr_end = html_raw.find("</tr>", idx_pago)
 
@@ -1098,7 +1068,7 @@ class GenerarPDFUseCase:
 
         # 3. Extraemos exactamente la fila (sumamos 5 para incluir los caracteres de "</tr>")
         fila_template = html_raw[idx_tr_start:idx_tr_end + 5]
-        # --- FIN DE BÃšSQUEDA CORREGIDA ---
+        # --- FIN DE BÚSQUEDA CORREGIDA ---
 
         pagos_apartado = [a for a in amortizaciones if str(getattr(a, "concept", "")).strip() == "initial_payment"]
         pagos_enganche = [a for a in amortizaciones if str(getattr(a, "concept", "")).strip() == "down_payment"]
@@ -1193,7 +1163,7 @@ class GenerarPDFUseCase:
                 candidatos.append(d)
 
         if not candidatos:
-            raise HTTPException(status_code=404, detail=f"No existe plantilla jurÃ­dica para categorÃ­a '{categoria}'.")
+            raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica para categoría '{categoria}'.")
 
         return next(
             (
@@ -1325,7 +1295,7 @@ class GenerarPDFUseCase:
             logger.info("[PDF_GENERADOR] Paso: obtener plantilla por id")
             plantilla = self.repo.obtener_un_doc_completo_juridico(empresa_id, id_plantilla)
             if not plantilla:
-                raise HTTPException(status_code=404, detail="No existe la plantilla jurÃ­dica seleccionada.")
+                raise HTTPException(status_code=404, detail="No existe la plantilla jurídica seleccionada.")
 
             pack_empresa = PROVIDERS.get(empresa_id, {})
             extraer_datos = pack_empresa.get("get")
@@ -1345,10 +1315,10 @@ class GenerarPDFUseCase:
             # Convertimos la data de SQL a diccionario para poder inyectarle los totales
             variables_html = dict(data_sql)
             
-            # Obtenemos la categorÃ­a directamente del documento de Firebase
+            # Obtenemos la categoría directamente del documento de Firebase
             categoria_plantilla = fields.get("categoria", {}).get("stringValue", "")
 
-            # Validamos si es una cotizaciÃ³n para construir la tabla dinÃ¡mica
+            # Validamos si es una cotización para construir la tabla dinámica
             if self._es_cotizaciones(categoria_plantilla):
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones desde ID")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
@@ -1437,7 +1407,7 @@ def api_actualizar_plantilla(empresa_id: str, doc_id: str, datos: PlantillaUpdat
 
     campos = datos.dict(exclude_unset=True)
     if not campos or (len(campos) == 1 and "static" in campos):
-        raise HTTPException(status_code=400, detail="No enviaste campos vÃ¡lidos para actualizar.")
+        raise HTTPException(status_code=400, detail="No enviaste campos válidos para actualizar.")
     repo = FirebaseRepository()
     
 
@@ -1486,7 +1456,7 @@ def api_eliminar_plantilla(empresa_id: str, doc_id: str, user: dict = Depends(es
         )
         raise HTTPException(
             status_code=403, 
-            detail="OperaciÃ³n Prohibida: Esta es una plantilla base del sistema y no puede ser eliminada."
+            detail="Operación Prohibida: Esta es una plantilla base del sistema y no puede ser eliminada."
         )
     
     res = repo.eliminar_plantilla(empresa_id, doc_id)
@@ -1501,7 +1471,7 @@ def api_eliminar_plantilla(empresa_id: str, doc_id: str, user: dict = Depends(es
 
 @router_crud.get("/{empresa_id}")
 def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
-    """Obtiene un listado bÃ¡sico de todas las plantillas de una empresa."""
+    """Obtiene un listado básico de todas las plantillas de una empresa."""
     repo = FirebaseRepository()
     docs = repo.listar_todas_plantillas(empresa_id)
     
@@ -1527,7 +1497,7 @@ def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
 
 @router_crud.get("/{empresa_id}/{doc_id}")
 def api_get_detalle_plantilla(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
-    """Obtiene todos los campos de una plantilla especÃ­fica para ediciÃ³n.
+    """Obtiene todos los campos de una plantilla específica para edición.
     """
     repo = FirebaseRepository()
     doc = repo.obtener_un_doc_completo(empresa_id, doc_id)
@@ -1581,7 +1551,7 @@ def api_get_diccionario_maestro(
     user: dict = Depends(es_admin)
 ):
     """
-    Endpoint Ãšnico: Devuelve el catÃ¡logo de etiquetas.
+    Endpoint Único: Devuelve el catálogo de etiquetas.
     Si mandas folio, mete los valores reales de SQL abajo.
     """
     if empresa_id == "komunah":
@@ -1613,13 +1583,13 @@ def api_get_diccionario_maestro(
 
 #endregion
 
-#region Endpoints de EnvÃ­o Manual de correo y WhatsApp
+#region Endpoints de Envío Manual de correo y WhatsApp
 
 @router.post("/enviar/{empresa_id}")
 async def api_enviar_estatico(
     empresa_id: str,
     id_plantilla: Optional[str],
-    datos_json: str = Form(..., description="Pega aquÃ­ tu bloque de JSON completo"), 
+    datos_json: str = Form(..., description="Pega aquí tu bloque de JSON completo"), 
     archivos: Optional[List[UploadFile]] = File(None), 
     db: Session = Depends(get_db), user: dict = Depends(es_usuario)
 ):
@@ -1630,10 +1600,10 @@ async def api_enviar_estatico(
     except Exception:
         FirebaseRepository().registrar_log_falla(
             empresa_id, 
-            f"Error de entrada: El JSON enviado para Email Manual no es vÃ¡lido.", 
+            f"Error de entrada: El JSON enviado para Email Manual no es válido.", 
             "INPUT_ERROR"
         )
-        raise HTTPException(status_code=400, detail="El JSON estÃ¡ mal formado.")
+        raise HTTPException(status_code=400, detail="El JSON está mal formado.")
 
     adjuntos_procesados = []
 
@@ -1678,8 +1648,8 @@ async def api_enviar_estatico(
 @router.post("/{empresa_id}/enviar-whatsapp")
 def api_enviar_wa(empresa_id: str, datos: WhatsAppManualSchema, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     """
-    EnvÃ­a una plantilla de WhatsApp a una lista ilimitada de nÃºmeros.
-    Busca automÃ¡ticamente la plantilla ACTIVA de la categorÃ­a enviada.
+    Envía una plantilla de WhatsApp a una lista ilimitada de números.
+    Busca automáticamente la plantilla ACTIVA de la categoría enviada.
     """
     repo = FirebaseRepository()
     gateway = NotificationGateway()
@@ -1705,8 +1675,8 @@ def api_enviar_ambos_manual(
     user: dict = Depends(es_usuario)
 ):
     """
-    ENVÃO DUAL: Dispara WhatsApp y Email al mismo tiempo para un folio.
-    Usa las plantillas activas de la categorÃ­a proporcionada.
+    ENVÍO DUAL: Dispara WhatsApp y Email al mismo tiempo para un folio.
+    Usa las plantillas activas de la categoría proporcionada.
     """
 
     repo = FirebaseRepository()
@@ -1722,15 +1692,13 @@ def api_disparar_barrido(
     dias: int, 
     categoria: str,  
     tipo: str = "normal",
-    simular: bool = False,
-    categoria_doc: Optional[str] = None,
     db: Session = Depends(get_db), user: dict = Depends(es_usuario)
 ):
-    """Barrido Automático Genérico. simular=true para ver quienes recibirían sin enviar nada."""
+    """Barrido Automático Genérico: Email (Firebase) + WhatsApp (Respond.io)."""
     repo = FirebaseRepository()
     gateway = NotificationGateway()
     use_case = NotificationUseCase(repo, gateway)
-    return await use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo, simular=simular, categoria_doc=categoria_doc)
+    return use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo)
 
 #endregion
 
@@ -1778,7 +1746,7 @@ def api_patch_wa(empresa_id: str, doc_id: str, datos: PlantillaWAUpdate, user: d
     if res.status_code == 200 and datos.activo is True:
         doc_actual = repo.obtener_un_doc_completo_wa(empresa_id, doc_id)
         if doc_actual:
-            # Extraemos la categorÃ­a del JSON de Firebase
+            # Extraemos la categoría del JSON de Firebase
             fields = doc_actual.get("fields", {})
             categoria = fields.get("categoria", {}).get("stringValue")
             if categoria:
@@ -1827,7 +1795,7 @@ def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
 
 @router_wa.get("/{empresa_id}/{doc_id}")
 def api_get_detalle_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
-    """Trae la totalidad de la informaciÃ³n de una sola plantilla."""
+    """Trae la totalidad de la información de una sola plantilla."""
     repo = FirebaseRepository()
     doc = repo.obtener_un_doc_completo_wa(empresa_id, doc_id)
     
@@ -1856,7 +1824,7 @@ def switch_email_lote_usuario(empresa_id: str, client_id: str, folio: str, estad
     func = PROVIDERS.get(empresa_id, {}).get("set_email_lote")
     if func and func(client_id, folio, estado, db):
         return {"status": "ok", "tipo": "lote", "folio": folio, "email_lote_activo": estado}
-    raise HTTPException(status_code=404, detail="RelaciÃ³n lote-cliente no encontrada")
+    raise HTTPException(status_code=404, detail="Relación lote-cliente no encontrada")
 
 # --- SWITCH POR LOTE WHATSAPP ---
 @router_usuario.patch("/whatsapp/{empresa_id}/{client_id}/{folio}")
@@ -1864,7 +1832,7 @@ def switch_wa_lote_usuario(empresa_id: str, client_id: str, folio: str, estado: 
     func = PROVIDERS.get(empresa_id, {}).get("set_wa_lote")
     if func and func(client_id, folio, estado, db):
         return {"status": "ok", "tipo": "lote", "folio": folio, "whatsapp_lote_activo": estado}
-    raise HTTPException(status_code=404, detail="RelaciÃ³n lote-cliente no encontrada en WA")
+    raise HTTPException(status_code=404, detail="Relación lote-cliente no encontrada en WA")
 
 # --- 1. VER EL ESTADO DE LOS 3 SWITCHES ---
 @router_globales.get("/{empresa_id}")
@@ -1917,7 +1885,7 @@ def api_switch_etapas(
     if func(diccionario_cambios, db):
         return {
             "status": "ok",
-            "mensaje": f"Se actualizÃ³ el estado a {estado} para {len(ids)} IDs.",
+            "mensaje": f"Se actualizó el estado a {estado} para {len(ids)} IDs.",
             "ids_afectados": ids
         }
     
@@ -1935,11 +1903,11 @@ def api_switch_proyecto_completo(
     if not func:
         raise HTTPException(status_code=404, detail="Empresa no configurada.")
 
-    # Llamamos a la lÃ³gica enviando ambos parÃ¡metros
+    # Llamamos a la lógica enviando ambos parámetros
     if func(proyectos, estado, db):
         return {
             "status": "ok",
-            "mensaje": f"Se aplicÃ³ {estado} a los proyectos: {', '.join(proyectos)}"
+            "mensaje": f"Se aplicó {estado} a los proyectos: {', '.join(proyectos)}"
         }
     
     raise HTTPException(status_code=400, detail="Error al actualizar en SQL.")
@@ -1960,7 +1928,7 @@ def api_get_estado_etapas(empresa_id: str, db: Session = Depends(get_db), user: 
 @router.get("/monitoreo/fallas/{empresa_id}", tags=["Monitoreo de Logs"])
 def api_ver_fallas_pendientes(empresa_id: str, user: dict = Depends(es_admin)):
     """
-    Devuelve todos los logs con todos sus campos y un contador de pendientes (no leÃ­dos).
+    Devuelve todos los logs con todos sus campos y un contador de pendientes (no leídos).
     """
     repo = FirebaseRepository()
     url = f"{repo.base_url}/empresas/{empresa_id}:runQuery"
@@ -2006,15 +1974,15 @@ def api_ver_fallas_pendientes(empresa_id: str, user: dict = Depends(es_admin)):
 
 @router.patch("/monitoreo/fallas/{empresa_id}/{log_id}/leer", tags=["Monitoreo de Logs"])
 def api_marcar_falla_como_leida(empresa_id: str, log_id: str, user: dict = Depends(es_admin)):
-    """Cuando ya viste el error, le picas aquÃ­ para 'apagarlo'."""
+    """Cuando ya viste el error, le picas aquí para 'apagarlo'."""
     repo = FirebaseRepository()
     url = f"{repo.base_url}/empresas/{empresa_id}/logs_fallas/{log_id}?updateMask.fieldPaths=leido"
     requests.patch(url, json={"fields": {"leido": {"booleanValue": True}}}, headers=repo.headers)
-    return {"status": "ok", "msj": "NotificaciÃ³n apagada"}
+    return {"status": "ok", "msj": "Notificación apagada"}
 
 #endregion
 
-#region Endpoint de EnvÃ­o Masivo por Cluster
+#region Endpoint de Envío Masivo por Cluster
 
 EJEMPLO_FINAL = {
     "clusters": ["Planta Baja", "Etapa 1"],
@@ -2034,7 +2002,7 @@ async def api_proceso_cluster(
     empresa_id: str,
     datos_json: str = Form(
         default=json.dumps(EJEMPLO_FINAL, indent=2),
-        description="Pega el JSON con la configuraciÃ³n masiva"
+        description="Pega el JSON con la configuración masiva"
     ), 
     archivos: Optional[List[UploadFile]] = File(None), 
     db: Session = Depends(get_db), 
@@ -2063,7 +2031,7 @@ async def api_proceso_cluster(
 
 
 
-#region ConfiguraciÃ³n de Recordatorios
+#region Configuración de Recordatorios
 
 @router_globales.patch("/config-recordatorios/{empresa_id}")
 def api_actualizar_dias_recordatorio(
@@ -2076,12 +2044,12 @@ def api_actualizar_dias_recordatorio(
     res = repo.actualizar_config_recordatorios(empresa_id, datos.dict(exclude_unset=True))
     
     if res is None:
-        raise HTTPException(status_code=400, detail="El JSON estÃ¡ vacÃ­o o no tiene campos vÃ¡lidos.")
+        raise HTTPException(status_code=400, detail="El JSON está vacío o no tiene campos válidos.")
         
     if res.status_code != 200:
         raise HTTPException(status_code=res.status_code, detail=res.text)
 
-    return {"status": "ok", "msj": "ConfiguraciÃ³n actualizada", "campos": list(datos.dict(exclude_unset=True).keys())}
+    return {"status": "ok", "msj": "Configuración actualizada", "campos": list(datos.dict(exclude_unset=True).keys())}
 
 @router_globales.get("/config-recordatorios/{empresa_id}")
 def api_obtener_config_recordatorios(
@@ -2089,8 +2057,8 @@ def api_obtener_config_recordatorios(
     user: dict = Depends(es_admin)
 ):
     """
-    Recupera los dÃ­as y la hora programada para los recordatorios de una empresa.
-    Si no existe configuraciÃ³n.
+    Recupera los días y la hora programada para los recordatorios de una empresa.
+    Si no existe configuración.
     """
     repo = FirebaseRepository()
     config = repo.obtener_config_recordatorios(empresa_id)
@@ -2102,7 +2070,7 @@ def api_obtener_config_recordatorios(
 @router.get("/busqueda-expedientes", response_model=List[SearchboxExpedienteResponse])
 def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     # 1. Filtramos activos: Diferente a 'Expirado' y 'Cancelado'
-    # Usamos notin_ para que Carlitos solo vea lo que estÃ¡ "vivo"
+    # Usamos notin_ para que Carlitos solo vea lo que está "vivo"
     expedientes = db.query(Venta).filter(
         Venta.estado_expediente.notin_(['Expirado', 'Cancelado', 'EXPIRADO', 'CANCELADO'])
     ).all()
@@ -2113,7 +2081,7 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
         coprops_nombres = []
         ids_a_buscar = []
         
-        # 2. LÃ³gica de Integrantes (del 2 al 6)
+        # 2. Lógica de Integrantes (del 2 al 6)
         # Revisamos si hay nombre y si hay ID para ir a buscar el correo
         for i in range(2, 7):
             nom_val = getattr(v, f"cliente_{i}")
@@ -2158,7 +2126,7 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
     return resultado
 
 
-#region CRUD Plantillas para JurÃ­dico
+#region CRUD Plantillas para Jurídico
 
 @router_juridico.get("/{empresa_id}")
 def listar_juridico(empresa_id: str, user: dict = Depends(es_admin)):
@@ -2183,7 +2151,7 @@ def api_get_detalle_juridico(empresa_id: str, doc_id: str, user: dict = Depends(
     repo = FirebaseRepository()
     doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="No existe la plantilla de jurÃ­dico.")
+        raise HTTPException(status_code=404, detail="No existe la plantilla de jurídico.")
     f = doc.get("fields", {})
     return {
         "id": doc["name"].split("/")[-1],
