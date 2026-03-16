@@ -5,7 +5,7 @@ from sqlalchemy import func, and_, case, distinct, cast, Date
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from ..database import get_db
-from ..models import Venta, Pago
+from ..models import Venta, Pago, ConfigEtapa
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 import calendar
 
@@ -357,4 +357,42 @@ def get_clusters_chart(
 
     except Exception as e:
         logger.error(f"Error en Clusters: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- ENDPOINT 4: PROYECTOS Y ETAPAS (Configuración) ---
+@router.get("/proyectos")
+def get_proyectos(
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_admin)
+    ):
+    try:
+        resultados = db.query(ConfigEtapa).all()
+
+        def to_bool(val):
+            if val is None:
+                return False
+
+            str_val = str(val).strip().lower()
+
+            if str_val in ("false", "none", "", "0", "0.0", "0.0000"):
+                return False
+
+            try:
+                return bool(float(str_val))
+            except (ValueError, TypeError):
+                return True
+
+        return [
+            {
+                "id": r.id,
+                "proyecto": r.proyecto,
+                "etapa": r.etapa,
+                "etapa_activo": to_bool(r.etapa_activo),
+                "proyecto_activo": to_bool(r.proyecto_activo),
+                "total_folios": int(float(r.total_folios or 0))
+            } for r in resultados
+        ]
+
+    except Exception as e:
+        logger.error(f"Error en Proyectos: {e}")
         raise HTTPException(status_code=500, detail=str(e))

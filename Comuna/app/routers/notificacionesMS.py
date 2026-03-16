@@ -1,28 +1,49 @@
 import os
 import requests
-import re 
+import re
+import base64
+import asyncio
+import logging
+from playwright.async_api import async_playwright
+from google.cloud import storage
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, Body
-from ..schemas import EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate,EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, JuridicoBase, JuridicoUpdate
-from ..utils.datos_proveedores import get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, set_email_komunah_marketing, set_wa_komunah_marketing, get_folios_a_notificar_komunah, actualizar_switches_etapas, actualizar_switches_proyecto, get_estado_etapas_komunah, get_folios_deudores_komunah, get_folios_dinamico_komunah
+from ..schemas import (
+    EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate, 
+    EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, 
+    WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, 
+    RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, 
+    JuridicoBase, JuridicoUpdate
+)
+from ..utils.datos_proveedores import (
+    get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, 
+    set_email_komunah_marketing, set_wa_komunah_marketing, 
+    get_folios_a_notificar_komunah, actualizar_switches_etapas, 
+    actualizar_switches_proyecto, get_estado_etapas_komunah, 
+    get_folios_deudores_komunah, get_folios_dinamico_komunah
+)
 from urllib.parse import quote
 from ..database import get_db
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
-from sqlalchemy import text
 from zoneinfo import ZoneInfo
-import base64, json, time
+import json, time
 from typing import List, Optional, Union, Any
 import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 from argparse import Namespace
-from ..models import Venta, Cliente
+from ..models import Venta, Cliente, Amortizacion
 from mailersend import MailerSendClient
- 
+from datetime import datetime, date, timedelta
+
+logger = logging.getLogger(__name__)
+
+
 router = APIRouter(prefix="/v1/notificaciones", tags=["Motor Envios"])
 router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas"])
 router_wa = APIRouter(prefix="/v1/plantillas-wa", tags=["CRUD WhatsApp"])
+router_juridico = APIRouter(prefix="/v1/plantillas-juridico", tags=["CRUD Jurídico"])
 router_usuario = APIRouter(prefix="/v1/preferencias-usuario", tags=["Switches Clientes"])
 router_globales = APIRouter(prefix="/v1/configuracion-global", tags=["Configuración Global"])
+BUCKET_NAME = "bucket-grupo-komunah-juridico"
 
 EMPRESAS_AUTORIZADAS = ["komunah", "empresa_test"]
 PROVIDERS = {
@@ -353,7 +374,15 @@ class NotificationGateway:
         return requests.post(url, headers=headers, json=payload, timeout=10)
     
     @staticmethod
-    def enviar_whatsapp(numero: str, template_name: str, language_code: str, parametros: list, texto_cuerpo: str = ""):
+    def enviar_whatsapp(
+        numero: str,
+        template_name: str,
+        language_code: str,
+        parametros: list,
+        texto_cuerpo: str = "",
+        header_document_link: Optional[str] = None,
+        header_document_filename: Optional[str] = None,
+    ):
         token = os.getenv("RESPOND_IO_TOKEN")
         channel_id = os.getenv("RESPOND_IO_CHANNEL_ID")
         
@@ -361,6 +390,30 @@ class NotificationGateway:
         url = f"https://api.respond.io/v2/contact/{identifier}/message"
         
         
+        components = []
+        if header_document_link:
+            header_component = {
+                "type": "header",
+                "parameters": [
+                    {
+                        "type": "document",
+                        "document": {
+                            "link": header_document_link,
+                            "caption": header_document_filename or ""
+                        }
+                    }
+                ]
+            }
+            components.append(header_component)
+
+        components.append(
+            {
+                "type": "body",
+                "text": texto_cuerpo,
+                "parameters": [{"type": "text", "text": str(p)} for p in parametros]
+            }
+        )
+
         payload = {
             "channelId": int(channel_id),
             "message": {
@@ -368,13 +421,7 @@ class NotificationGateway:
                 "template": {
                     "name": template_name,
                     "languageCode": language_code,
-                    "components": [
-                        {
-                            "type": "body", 
-                            "text": texto_cuerpo,
-                            "parameters": [{"type": "text", "text": str(p)} for p in parametros]
-                        }
-                    ]
+                    "components": components
                 }
             }
         }
@@ -428,13 +475,24 @@ class StaticNotificationUseCase:
         for tag, valor in vars.items():
             texto = texto.replace(tag, str(valor))
         return texto
- 
+
 class StaticWAUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
         self.repo = repo
         self.gateway = gateway
 
     def ejecutar_envio_wa(self, empresa_id: str, datos: WhatsAppManualSchema, db: Session):
+        pdf_service = GenerarPDFUseCase(self.repo)
+        adjunto_pdf = asyncio.run(
+            pdf_service.generar_pdf_por_categoria(
+                empresa_id=empresa_id,
+                categoria=datos.categoriaDocumento,
+                folio=str(datos.folio),
+                db=db,
+                subir_bucket=True,
+            )
+        )
+        link_documento = adjunto_pdf.get("url_descarga")
         
         pack_empresa = PROVIDERS.get(empresa_id, {})
         extraer_datos = pack_empresa.get("get")
@@ -449,8 +507,8 @@ class StaticWAUseCase:
 
         docs_wa = self.repo.query_categoria(empresa_id, datos.categoria, "plantillas_whatsapp")
         p_wa_raw = next((d["document"] for d in docs_wa if "document" in d 
-                         and (d["document"]["fields"].get("activo", {}).get("booleanValue") is True 
-                              or d["document"]["fields"].get("activo", {}).get("stringValue") == "true")), None)
+                        and (d["document"]["fields"].get("activo", {}).get("booleanValue") is True 
+                            or d["document"]["fields"].get("activo", {}).get("stringValue") == "true")), None)
         
         if not p_wa_raw:
             self.repo.registrar_log_falla(empresa_id, f"Manual WA: Sin plantilla activa para '{datos.categoria}'", "MANUAL_WA_ERROR")
@@ -467,6 +525,7 @@ class StaticWAUseCase:
         for i in range(1, 7):
             nombre = data_sql.get(f"{{c{i}.client_name}}")
             telefono = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "").replace("-", "")
+            # telefono = "9999012292"
             
             if not nombre or not telefono:
                 continue
@@ -489,7 +548,9 @@ class StaticWAUseCase:
                 config_plantilla["id_respond"], 
                 config_plantilla["lenguaje"], 
                 parametros_finales,
-                texto_cuerpo=texto_listo
+                texto_cuerpo=texto_listo,
+                header_document_link=link_documento,
+                header_document_filename=adjunto_pdf.get("filename"),
             )
 
             if res.status_code not in [200, 201, 202]:
@@ -512,6 +573,16 @@ class StaticEmailFolioUseCase:
         self.gateway = gateway
 
     def ejecutar_envio_email_folio(self, empresa_id: str, datos: EmailFolioSchema, db: Session):
+        pdf_service = GenerarPDFUseCase(self.repo)
+        adjunto_pdf = asyncio.run(
+            pdf_service.generar_pdf_por_categoria(
+                empresa_id=empresa_id,
+                categoria=datos.categoriaDocumento,
+                folio=str(datos.folio),
+                db=db,
+                subir_bucket=False,
+            )
+        )
         pack_empresa = PROVIDERS.get(empresa_id, {})
         extraer_datos = pack_empresa.get("get")
 
@@ -521,7 +592,7 @@ class StaticEmailFolioUseCase:
 
         docs_email = self.repo.query_categoria(empresa_id, datos.categoria, "plantillas")
         p_email_raw = next((d["document"] for d in docs_email if "document" in d 
-                           and (d["document"]["fields"].get("activo", {}).get("booleanValue") is True)), None)
+                        and (d["document"]["fields"].get("activo", {}).get("booleanValue") is True)), None)
         
         if not p_email_raw:
             raise HTTPException(status_code=400, detail=f"No hay plantilla de email activa para '{datos.categoria}'")
@@ -541,11 +612,17 @@ class StaticEmailFolioUseCase:
             asunto_listo = cleaner._limpiar(f_email.get("asunto", {}).get("stringValue", ""), data_sql, nombre, email, phone)
             html_listo = cleaner._limpiar(f_email.get("html", {}).get("stringValue", ""), data_sql, nombre, email, phone)
 
+            # "to": [{"email": email, "name": nombre}],
             res = self.gateway.enviar_email({
                 "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": f"Notificaciones {empresa_id.capitalize()}"},
-                "to": [{"email": email, "name": nombre}],
+                "to": [{"email": "brandon.avila@techmaleon.mx", "name": nombre}],
+                "cc": [{"email": "cmezquita@techmaleon.mx"}],
                 "subject": asunto_listo,
-                "html": html_listo
+                "html": html_listo,
+                "attachments": [{
+                    "content": adjunto_pdf["content"],
+                    "filename": adjunto_pdf["filename"]
+                }]
             })
 
             reporte.append({"cliente": nombre, "email": email, "status": res.status_code})
@@ -588,6 +665,15 @@ class NotificationUseCase:
         config = self.repo.obtener_config_empresa(empresa_id)
         sistema_email_ok = config.get("email")
         sistema_wa_ok = config.get("whatsapp")
+
+        def _activo(fields: dict) -> bool:
+            raw = fields.get("activo", {})
+            if "booleanValue" in raw:
+                return raw.get("booleanValue") is True
+            return str(raw.get("stringValue", "")).lower() == "true"
+
+        def _norm_categoria(valor: str) -> str:
+            return str(valor or "").strip().lower()
         
         if not config.get("proyecto"):
             self.repo.registrar_log_falla(empresa_id, f"Barrido cancelado: Proyecto desactivado en configuración global", "AUTO_BARRIDO")
@@ -595,12 +681,30 @@ class NotificationUseCase:
         
         docs_email = self.repo.query_categoria(empresa_id, categoria, "plantillas")
         p_email = next((d["document"]["fields"] for d in docs_email if "document" in d 
-                        and d["document"]["fields"].get("activo", {}).get("booleanValue")), None)
-       
+                        and _activo(d["document"]["fields"])), None)
+
+        if not p_email:
+            cat_objetivo = _norm_categoria(categoria)
+            docs_email_all = self.repo.listar_todas_plantillas(empresa_id)
+            p_email = next((
+                d.get("fields", {}) for d in docs_email_all
+                if _norm_categoria(d.get("fields", {}).get("categoria", {}).get("stringValue", "")) == cat_objetivo
+                and _activo(d.get("fields", {}))
+            ), None)
+
         docs_wa = self.repo.query_categoria(empresa_id, categoria, "plantillas_whatsapp")
         
         p_wa_raw = next((d["document"] for d in docs_wa if "document" in d 
-                        and d["document"]["fields"].get("activo", {}).get("booleanValue")), None)
+                        and _activo(d["document"]["fields"])), None)
+
+        if not p_wa_raw:
+            cat_objetivo = _norm_categoria(categoria)
+            docs_wa_all = self.repo.listar_plantillas_wa(empresa_id)
+            p_wa_raw = next((
+                {"fields": d.get("fields", {})} for d in docs_wa_all
+                if _norm_categoria(d.get("fields", {}).get("categoria", {}).get("stringValue", "")) == cat_objetivo
+                and _activo(d.get("fields", {}))
+            ), None)
         
         if config.get("email") and not p_email:
             self.repo.registrar_log_falla(empresa_id, f"Email activado pero no hay plantilla activa para '{categoria}'", "AUTO_BARRIDO")
@@ -771,19 +875,19 @@ class StaticDualUseCase:
         self.repo = repo
         self.gateway = gateway
 
-    def ejecutar_envio_dual(self, empresa_id: str, datos: EmailFolioSchema, db: Session):
+    def ejecutar_envio_dual(self, empresa_id: str, datos_wa: WhatsAppManualSchema, datos_email: EmailFolioSchema, db: Session):
 
         motor_wa = StaticWAUseCase(self.repo, self.gateway)
         motor_email = StaticEmailFolioUseCase(self.repo, self.gateway)
 
         try:
-            reporte_wa = motor_wa.ejecutar_envio_wa(empresa_id, datos, db)
-            reporte_email = motor_email.ejecutar_envio_email_folio(empresa_id, datos, db)
+            reporte_wa = motor_wa.ejecutar_envio_wa(empresa_id, datos_wa, db)
+            reporte_email = motor_email.ejecutar_envio_email_folio(empresa_id, datos_email, db)
 
             return {
                 "status": "completado",
-                "folio": datos.folio,
-                "categoria": datos.categoria,
+                "folio": datos_email.folio,
+                "categoria": datos_email.categoria,
                 "resultado_whatsapp": reporte_wa.get("detalles", []),
                 "resultado_email": reporte_email.get("detalles", [])
             }
@@ -880,11 +984,393 @@ class StaticEmailClusterUseCase:
                 time.sleep(0.5)
 
         return {"modo": "SIMULACION" if datos.simular else "REAL", "resumen": conteo, "detalles": reporte_global}
+    
+class GenerarPDFUseCase:
+    def __init__(self, repo: FirebaseRepository):
+        self.repo = repo
+
+    @staticmethod
+    def _normalizar_fragmento(valor: Any, fallback: str = "N/A") -> str:
+        texto = str(valor).strip() if valor is not None else ""
+        if not texto:
+            texto = fallback
+        # Evitar separadores invalidos en nombre/ruta.
+        return re.sub(r"[\\/:*?\"<>|]", "_", texto)
+
+    @staticmethod
+    def _reemplazar_etiquetas(texto: str, variables: dict):
+        if not texto:
+            return texto
+        for tag, valor in variables.items():
+            texto = texto.replace(tag, str(valor))
+        return re.sub(r"\{[^}]+\}", "", texto)
+
+    @staticmethod
+    def _es_cotizaciones(categoria: str) -> bool:
+        return str(categoria or "").strip().lower() == "cotizaciones"
+
+    @staticmethod
+    def _a_float(valor: Any) -> float:
+        try:
+            return float(valor)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _formatear_moneda(valor: Any) -> str:
+        numero = GenerarPDFUseCase._a_float(valor)
+        return f"${numero:,.2f}"
+
+    def _construir_tabla_pagos_cotizaciones(self, html_raw: str, folio: str, db: Session):
+        logger.info("[PDF_COTIZACIONES] Entrada _construir_tabla_pagos_cotizaciones | folio=%s", folio)
+        try:
+            logger.info("[PDF_COTIZACIONES] Paso: consultar amortizaciones por folio")
+            amortizaciones = (
+                db.query(
+                    Amortizacion.number,
+                    Amortizacion.date,
+                    Amortizacion.concept,
+                    Amortizacion.capital,
+                    Amortizacion.down_payment,
+                    Amortizacion.total
+                )
+                .filter(Amortizacion.folder_id == str(folio))
+                .order_by(Amortizacion.date.asc())
+                .all()
+            )
+        except Exception as e:
+            logger.exception("[PDF_COTIZACIONES] Error consultando amortizaciones | folio=%s | error=%s", folio, str(e))
+            raise HTTPException(status_code=500, detail=f"Error al consultar amortizaciones para folio {folio}: {str(e)}")
+
+        # --- INICIO DE BÚSQUEDA CORREGIDA ---
+        # 1. Encontramos la posición de la primera variable de la fila
+        idx_pago = html_raw.find("{pago.numero}")
+        
+        if idx_pago == -1:
+            logger.info("[PDF_COTIZACIONES] Paso: no se encontró plantilla de fila de pagos en HTML")
+            return html_raw, {
+                "{totales.suma_capital}": self._formatear_moneda(0),
+                "{totales.suma_enganche}": self._formatear_moneda(0),
+                "{totales.suma_total}": self._formatear_moneda(0),
+            }
+
+        # 2. Buscamos el inicio de esa fila hacia atrás y el final hacia adelante
+        idx_tr_start = html_raw.rfind("<tr", 0, idx_pago)
+        idx_tr_end = html_raw.find("</tr>", idx_pago)
+
+        if idx_tr_start == -1 or idx_tr_end == -1:
+            logger.error("[PDF_COTIZACIONES] Paso: No se pudo delimitar la fila <tr> en el HTML")
+            return html_raw, {
+                "{totales.suma_capital}": self._formatear_moneda(0),
+                "{totales.suma_enganche}": self._formatear_moneda(0),
+                "{totales.suma_total}": self._formatear_moneda(0),
+            }
+
+        # 3. Extraemos exactamente la fila (sumamos 5 para incluir los caracteres de "</tr>")
+        fila_template = html_raw[idx_tr_start:idx_tr_end + 5]
+        # --- FIN DE BÚSQUEDA CORREGIDA ---
+
+        pagos_apartado = [a for a in amortizaciones if str(getattr(a, "concept", "")).strip() == "initial_payment"]
+        pagos_enganche = [a for a in amortizaciones if str(getattr(a, "concept", "")).strip() == "down_payment"]
+        pagos_restantes = [
+            a
+            for a in amortizaciones
+            if str(getattr(a, "concept", "")).strip() not in {"initial_payment", "down_payment"}
+        ]
+
+        secuencia = []
+        for idx, pago in enumerate(pagos_apartado, 1):
+            etiqueta = "A" if idx == 1 else f"A{idx}"
+            secuencia.append((etiqueta, pago))
+        for idx, pago in enumerate(pagos_enganche, 1):
+            secuencia.append((f"{idx}E", pago))
+        for pago in pagos_restantes:
+            secuencia.append((str(getattr(pago, "number", "")), pago))
+
+        total_capital = sum(
+            self._a_float(getattr(p, "capital", 0))
+            for p in pagos_restantes
+        )
+        saldo_capital = total_capital
+
+        suma_capital = 0.0
+        suma_enganche = 0.0
+        suma_total = 0.0
+        filas_renderizadas = []
+
+        for etiqueta, pago in secuencia:
+            concepto = str(getattr(pago, "concept", "")).strip()
+            capital = self._a_float(getattr(pago, "capital", 0))
+            enganche = self._a_float(getattr(pago, "down_payment", 0))
+            total = self._a_float(getattr(pago, "total", 0))
+
+            suma_capital += capital
+            suma_enganche += enganche
+            suma_total += total
+
+            if concepto in {"initial_payment", "down_payment"}:
+                capital_txt = ""
+                saldo_txt = ""
+                enganche_txt = self._formatear_moneda(enganche)
+            else:
+                saldo_capital = max(saldo_capital - capital, 0)
+                capital_txt = self._formatear_moneda(capital)
+                enganche_txt = self._formatear_moneda(enganche)
+                saldo_txt = self._formatear_moneda(saldo_capital)
+
+            total_txt = self._formatear_moneda(total) if total else ""
+
+            fila = fila_template
+            fila = fila.replace("{pago.numero}", str(etiqueta))
+            fila = fila.replace("{pago.fecha}", str(getattr(pago, "date", "") or ""))
+            fila = fila.replace("{pago.capital}", capital_txt)
+            fila = fila.replace("{pago.enganche}", enganche_txt)
+            fila = fila.replace("{pago.total}", total_txt)
+            fila = fila.replace("{pago.saldo_capital}", saldo_txt)
+            filas_renderizadas.append(fila)
+
+        if not filas_renderizadas:
+            fila = fila_template
+            fila = fila.replace("{pago.numero}", "")
+            fila = fila.replace("{pago.fecha}", "")
+            fila = fila.replace("{pago.capital}", "")
+            fila = fila.replace("{pago.enganche}", "")
+            fila = fila.replace("{pago.total}", "")
+            fila = fila.replace("{pago.saldo_capital}", "")
+            filas_renderizadas.append(fila)
+
+        html_con_filas = html_raw.replace(fila_template, "\n".join(filas_renderizadas), 1)
+        totales = {
+            "{totales.suma_capital}": self._formatear_moneda(suma_capital),
+            "{totales.suma_enganche}": self._formatear_moneda(suma_enganche),
+            "{totales.suma_total}": self._formatear_moneda(suma_total),
+        }
+        logger.info(
+            "[PDF_COTIZACIONES] Paso: tabla construida | filas=%s | suma_capital=%s | suma_enganche=%s | suma_total=%s",
+            len(filas_renderizadas),
+            totales["{totales.suma_capital}"],
+            totales["{totales.suma_enganche}"],
+            totales["{totales.suma_total}"],
+        )
+        return html_con_filas, totales
+
+    def _obtener_plantillas_por_categoria(self, empresa_id: str, categoria: str):
+        docs = self.repo.listar_plantillas_juridico(empresa_id)
+        candidatos = []
+        for d in docs:
+            fields = d.get("fields", {})
+            if fields.get("categoria", {}).get("stringValue", "") == categoria:
+                candidatos.append(d)
+
+        if not candidatos:
+            raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica para categoría '{categoria}'.")
+
+        return next(
+            (
+                d for d in candidatos
+                if d.get("fields", {}).get("activo", {}).get("booleanValue") is True
+            ),
+            candidatos[0],
+        )
+
+    @staticmethod
+    def _subir_pdf_a_bucket(pdf_bytes: bytes, ruta_carpeta: str, nombre_archivo: str) -> str:
+        cred_path = os.getenv("STORAGE_CREDENTIALS_PATH")
+        if not cred_path:
+            raise HTTPException(status_code=500, detail="Falta STORAGE_CREDENTIALS_PATH")
+
+        storage_client = storage.Client.from_service_account_json(cred_path)
+        bucket = storage_client.bucket(BUCKET_NAME)
+        ruta_completa = f"{ruta_carpeta}/{nombre_archivo}"
+        blob = bucket.blob(ruta_completa)
+
+        if not blob.exists():
+            blob.upload_from_string(pdf_bytes, content_type="application/pdf")
+
+        return blob.generate_signed_url(version="v4", expiration=timedelta(hours=1), method="GET")
+
+    async def generar_pdf_por_categoria(
+        self,
+        empresa_id: str,
+        categoria: str,
+        folio: str,
+        db: Session,
+        subir_bucket: bool = False,
+    ):
+        logger.info(
+            "[PDF_GENERADOR] Entrada generar_pdf_por_categoria | empresa=%s | categoria=%s | folio=%s | subir_bucket=%s",
+            empresa_id,
+            categoria,
+            folio,
+            subir_bucket,
+        )
+        try:
+            logger.info("[PDF_GENERADOR] Paso: obtener plantilla por categoria")
+            plantilla = self._obtener_plantillas_por_categoria(empresa_id, categoria)
+
+            logger.info("[PDF_GENERADOR] Paso: obtener proveedor de datos")
+            pack_empresa = PROVIDERS.get(empresa_id, {})
+            extraer_datos = pack_empresa.get("get_sin_clientes")
+            if not extraer_datos:
+                raise HTTPException(status_code=400, detail="Empresa no configurada.")
+
+            logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio")
+            data_sql = extraer_datos(folio, db)
+            if not data_sql:
+                raise HTTPException(status_code=404, detail="Folio no encontrado.")
+
+            cliente = (
+                    data_sql.get("{c1.client_name}")
+                    or data_sql.get("{cliente}")
+                    or data_sql.get("{cl.cliente}")
+                    or data_sql.get("{v.cliente}")
+                    or "Cliente"
+                )
+
+            fields = plantilla.get("fields", {})
+            html_raw = fields.get("html", {}).get("stringValue", "")
+            if not html_raw:
+                raise HTTPException(status_code=400, detail="La plantilla no tiene HTML.")
+
+            variables_html = dict(data_sql)
+            if self._es_cotizaciones(categoria):
+                logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
+                html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
+                variables_html.update(totales)
+
+            logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas y generar PDF")
+            html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+            nombre_plantilla = fields.get("categoria", {}).get("stringValue", "documento")
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')} - {self._normalizar_fragmento(cliente, 'Cliente')}.pdf"
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+                page = await browser.new_page()
+                await page.set_content(html_final, wait_until="networkidle")
+                await page.emulate_media(media="screen")
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(400)
+                pdf_bytes = await page.pdf(format="A4", print_background=True)
+                await browser.close()
+
+            respuesta = {
+                "filename": nombre_pdf,
+                "content": base64.b64encode(pdf_bytes).decode("utf-8"),
+                "content_type": "application/pdf",
+            }
+
+            if subir_bucket:
+                logger.info("[PDF_GENERADOR] Paso: subir PDF a bucket")
+                ruta = f"Komunah/PlantillasWeb/Categorias/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
+                respuesta["url_descarga"] = self._subir_pdf_a_bucket(pdf_bytes, ruta, nombre_pdf)
+
+            logger.info("[PDF_GENERADOR] Paso: PDF generado correctamente | filename=%s", nombre_pdf)
+            return respuesta
+        except HTTPException:
+            logger.exception(
+                "[PDF_GENERADOR] Error HTTP en generar_pdf_por_categoria | empresa=%s | categoria=%s | folio=%s",
+                empresa_id,
+                categoria,
+                folio,
+            )
+            raise
+        except Exception as e:
+            logger.exception(
+                "[PDF_GENERADOR] Error inesperado en generar_pdf_por_categoria | empresa=%s | categoria=%s | folio=%s | error=%s",
+                empresa_id,
+                categoria,
+                folio,
+                str(e),
+            )
+            raise HTTPException(status_code=500, detail=f"Error en generar_pdf_por_categoria (folio={folio}, categoria={categoria}): {str(e)}")
+
+    async def generar_pdf_desde_plantilla(self, empresa_id: str, id_plantilla: str, folio: str, db: Session):
+        logger.info(
+            "[PDF_GENERADOR] Entrada generar_pdf_desde_plantilla | empresa=%s | plantilla=%s | folio=%s",
+            empresa_id,
+            id_plantilla,
+            folio,
+        )
+        try:
+            logger.info("[PDF_GENERADOR] Paso: obtener plantilla por id")
+            plantilla = self.repo.obtener_un_doc_completo_juridico(empresa_id, id_plantilla)
+            if not plantilla:
+                raise HTTPException(status_code=404, detail="No existe la plantilla jurídica seleccionada.")
+
+            pack_empresa = PROVIDERS.get(empresa_id, {})
+            extraer_datos = pack_empresa.get("get")
+            if not extraer_datos:
+                raise HTTPException(status_code=400, detail="Empresa no configurada.")
+
+            logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio")
+            data_sql = extraer_datos(folio, db)
+            if not data_sql:
+                raise HTTPException(status_code=404, detail="Folio no encontrado.")
+
+            fields = plantilla.get("fields", {})
+            html_raw = fields.get("html", {}).get("stringValue", "")
+            if not html_raw:
+                raise HTTPException(status_code=400, detail="La plantilla no tiene HTML.")
+
+            # Convertimos la data de SQL a diccionario para poder inyectarle los totales
+            variables_html = dict(data_sql)
+            
+            # Obtenemos la categoría directamente del documento de Firebase
+            categoria_plantilla = fields.get("categoria", {}).get("stringValue", "")
+
+            # Validamos si es una cotización para construir la tabla dinámica
+            if self._es_cotizaciones(categoria_plantilla):
+                logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones desde ID")
+                html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
+                variables_html.update(totales)
+
+            # Reemplazamos las etiquetas usando el diccionario actualizado
+            html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+            nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')}.pdf"
+
+            logger.info("[PDF_GENERADOR] Paso: render PDF con Playwright")
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+                page = await browser.new_page()
+                await page.set_content(html_final, wait_until="networkidle")
+                await page.emulate_media(media="screen")
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(400)
+                pdf_bytes = await page.pdf(format="A4", print_background=True)
+                await browser.close()
+
+            logger.info("[PDF_GENERADOR] Paso: PDF generado correctamente | filename=%s", nombre_pdf)
+            return {
+                "filename": nombre_pdf,
+                "content": base64.b64encode(pdf_bytes).decode("utf-8"),
+                "content_type": "application/pdf",
+            }
+        except HTTPException:
+            logger.exception(
+                "[PDF_GENERADOR] Error HTTP en generar_pdf_desde_plantilla | empresa=%s | plantilla=%s | folio=%s",
+                empresa_id,
+                id_plantilla,
+                folio,
+            )
+            raise
+        except Exception as e:
+            logger.exception(
+                "[PDF_GENERADOR] Error inesperado en generar_pdf_desde_plantilla | empresa=%s | plantilla=%s | folio=%s | error=%s",
+                empresa_id,
+                id_plantilla,
+                folio,
+                str(e),
+            )
+            raise HTTPException(status_code=500, detail=f"Error en generar_pdf_desde_plantilla (folio={folio}, plantilla={id_plantilla}): {str(e)}")
+
+#region CRUD Plantillas para correo
 
 @router_crud.get("/{empresa_id}/conteo/{categoria}")
 def api_contar_plantillas(empresa_id: str, categoria: str,user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
-   
+
     total = TemplateUseCase.contar_plantillas_por_categoria(repo, empresa_id, categoria) 
     return {"categoria": categoria, "total": total}
 
@@ -1031,6 +1517,10 @@ def api_get_detalle_plantilla(empresa_id: str, doc_id: str, user: dict = Depends
         "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])]
     }
 
+#endregion
+
+#region variables para HTML
+
 @router.get("/inspeccionar")
 def api_inspeccionar_variables(folio: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(es_admin)):
     """
@@ -1090,10 +1580,15 @@ def api_get_diccionario_maestro(
         return catalogo
     
     raise HTTPException(status_code=404, detail="Empresa no configurada.")
-    
+
+#endregion
+
+#region Endpoints de Envío Manual de correo y WhatsApp
+
 @router.post("/enviar/{empresa_id}")
 async def api_enviar_estatico(
     empresa_id: str,
+    id_plantilla: Optional[str],
     datos_json: str = Form(..., description="Pega aquí tu bloque de JSON completo"), 
     archivos: Optional[List[UploadFile]] = File(None), 
     db: Session = Depends(get_db), user: dict = Depends(es_usuario)
@@ -1114,13 +1609,26 @@ async def api_enviar_estatico(
 
     if archivos:
         for f in archivos:
-           
+            
             if f.filename:
                 contenido = await f.read()
                 adjuntos_procesados.append({
                     "content": base64.b64encode(contenido).decode('utf-8'),
                     "filename": f.filename
                 })
+
+    if id_plantilla:
+        pdf_service = GenerarPDFUseCase(FirebaseRepository())
+        adjunto_pdf = await pdf_service.generar_pdf_desde_plantilla(
+            empresa_id=empresa_id,
+            id_plantilla=id_plantilla,
+            folio=str(d.get("folio", "")),
+            db=db,
+        )
+        adjuntos_procesados.append({
+            "content": adjunto_pdf["content"],
+            "filename": adjunto_pdf["filename"],
+        })
 
     from argparse import Namespace
     datos_finales = Namespace(
@@ -1136,6 +1644,7 @@ async def api_enviar_estatico(
     )
 
     return use_case.ejecutar_envio_manual(empresa_id, datos_finales, db)
+
 @router.post("/{empresa_id}/enviar-whatsapp")
 def api_enviar_wa(empresa_id: str, datos: WhatsAppManualSchema, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     """
@@ -1146,7 +1655,7 @@ def api_enviar_wa(empresa_id: str, datos: WhatsAppManualSchema, db: Session = De
     gateway = NotificationGateway()
     use_case = StaticWAUseCase(repo, gateway)
     return use_case.ejecutar_envio_wa(empresa_id, datos, db)
- 
+
 @router.post("/{empresa_id}/enviar-email-folio")
 def api_enviar_email(
     empresa_id: str, 
@@ -1169,11 +1678,13 @@ def api_enviar_ambos_manual(
     ENVÍO DUAL: Dispara WhatsApp y Email al mismo tiempo para un folio.
     Usa las plantillas activas de la categoría proporcionada.
     """
+
     repo = FirebaseRepository()
     gateway = NotificationGateway()
     use_case = StaticDualUseCase(repo, gateway)
+    datos_wa = WhatsAppManualSchema(folio=datos.folio, categoria=datos.categoria, categoriaDocumento=datos.categoriaDocumento)
     
-    return use_case.ejecutar_envio_dual(empresa_id, datos, db)
+    return use_case.ejecutar_envio_dual(empresa_id, datos_wa, datos, db)
 
 @router.post("/auto-notificar/{empresa_id}", tags=["Motor Notificaciones"])
 def api_disparar_barrido(
@@ -1189,7 +1700,11 @@ def api_disparar_barrido(
     use_case = NotificationUseCase(repo, gateway)
     return use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo)
 
-@router_wa.post("/{empresa_id}", status_code=201, tags=["CRUD WhatsApp"])
+#endregion
+
+#region CRUD Plantillas para WhatsApp
+
+@router_wa.post("/{empresa_id}", status_code=201)
 def api_crear_plantilla_wa(empresa_id: str, p: PlantillaWABase, user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
     
@@ -1242,7 +1757,7 @@ def api_patch_wa(empresa_id: str, doc_id: str, datos: PlantillaWAUpdate, user: d
 
     return {"status": "actualizada", "id": doc_id}
 
-@router_wa.delete("/{empresa_id}/{doc_id}", tags=["CRUD WhatsApp"])
+@router_wa.delete("/{empresa_id}/{doc_id}")
 def api_eliminar_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
     """Elimina permanentemente una plantilla de WhatsApp."""
     repo = FirebaseRepository()
@@ -1257,7 +1772,7 @@ def api_eliminar_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depends
         
     return {"status": "eliminada", "id": doc_id}
 
-@router_wa.get("/{empresa_id}", tags=["CRUD WhatsApp"])
+@router_wa.get("/{empresa_id}")
 def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
     """Obtiene el listado completo con todos los datos de cada plantilla."""
     repo = FirebaseRepository()
@@ -1278,7 +1793,7 @@ def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
         })
     return resultado
 
-@router_wa.get("/{empresa_id}/{doc_id}", tags=["CRUD WhatsApp"])
+@router_wa.get("/{empresa_id}/{doc_id}")
 def api_get_detalle_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
     """Trae la totalidad de la información de una sola plantilla."""
     repo = FirebaseRepository()
@@ -1298,7 +1813,10 @@ def api_get_detalle_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depe
         "activo": f.get("activo", {}).get("booleanValue", False),
         "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])]
     }
-    
+
+#endregion
+
+#region Endpoints de Switches Globales y por Lote
 
 # --- SWITCHES POR LOTE ---
 @router_usuario.patch("/email/{empresa_id}/{client_id}/{folio}")
@@ -1349,9 +1867,65 @@ def api_switch_whatsapp(empresa_id: str, estado: bool, user: dict = Depends(es_a
     res = repo.actualizar_configuracion(empresa_id, ConfigUpdate(whatsapp_enabled=estado))
     return {"status": "ok", "whatsapp_global": estado}
 
+# --- SWITCH MASIVO POR ID ---
+@router_globales.patch("/etapas/{empresa_id}")
+def api_switch_etapas(
+    empresa_id: str, 
+    estado: bool,            
+    ids: List[int],     
+    db: Session = Depends(get_db), user: dict = Depends(es_admin)
+):
+    func = PROVIDERS.get(empresa_id, {}).get("set_etapas_bulk")
+    
+    if not func:
+        raise HTTPException(status_code=404, detail="Empresa no configurada.")
+
+    diccionario_cambios = {id_num: estado for id_num in ids}
+
+    if func(diccionario_cambios, db):
+        return {
+            "status": "ok",
+            "mensaje": f"Se actualizó el estado a {estado} para {len(ids)} IDs.",
+            "ids_afectados": ids
+        }
+    
+    raise HTTPException(status_code=400, detail="Error al actualizar en SQL.")
+
+@router_globales.patch("/proyecto/{empresa_id}")
+def api_switch_proyecto_completo(
+    empresa_id: str, 
+    estado: bool,                    
+    proyectos: List[str] = Body(...), 
+    db: Session = Depends(get_db), user: dict = Depends(es_admin)
+):
+    func = PROVIDERS.get(empresa_id, {}).get("set_proyecto_bulk")
+    
+    if not func:
+        raise HTTPException(status_code=404, detail="Empresa no configurada.")
+
+    # Llamamos a la lógica enviando ambos parámetros
+    if func(proyectos, estado, db):
+        return {
+            "status": "ok",
+            "mensaje": f"Se aplicó {estado} a los proyectos: {', '.join(proyectos)}"
+        }
+    
+    raise HTTPException(status_code=400, detail="Error al actualizar en SQL.")
+
+@router_globales.get("/estado-etapas/{empresa_id}")
+def api_get_estado_etapas(empresa_id: str, db: Session = Depends(get_db), user: dict = Depends(es_admin)):
+    func = PROVIDERS.get(empresa_id, {}).get("get_estado_etapas")
+    
+    if not func:
+        raise HTTPException(status_code=404, detail="Empresa no configurada.")
+        
+    return func(db)
+
+#endregion
+
+#region Endpoints de Monitoreo de Logs
 
 @router.get("/monitoreo/fallas/{empresa_id}", tags=["Monitoreo de Logs"])
-
 def api_ver_fallas_pendientes(empresa_id: str, user: dict = Depends(es_admin)):
     """
     Devuelve todos los logs con todos sus campos y un contador de pendientes (no leídos).
@@ -1397,6 +1971,7 @@ def api_ver_fallas_pendientes(empresa_id: str, user: dict = Depends(es_admin)):
         "total_pendientes": conteo_no_leidos, 
         "logs": lista_completa               
     }
+
 @router.patch("/monitoreo/fallas/{empresa_id}/{log_id}/leer", tags=["Monitoreo de Logs"])
 def api_marcar_falla_como_leida(empresa_id: str, log_id: str, user: dict = Depends(es_admin)):
     """Cuando ya viste el error, le picas aquí para 'apagarlo'."""
@@ -1405,96 +1980,10 @@ def api_marcar_falla_como_leida(empresa_id: str, log_id: str, user: dict = Depen
     requests.patch(url, json={"fields": {"leido": {"booleanValue": True}}}, headers=repo.headers)
     return {"status": "ok", "msj": "Notificación apagada"}
 
+#endregion
 
-# --- SWITCH MASIVO POR ID ---
-@router_globales.patch("/etapas/{empresa_id}")
-def api_switch_etapas(
-    empresa_id: str, 
-    estado: bool,            
-    ids: List[int],     
-    db: Session = Depends(get_db), user: dict = Depends(es_admin)
-):
-    func = PROVIDERS.get(empresa_id, {}).get("set_etapas_bulk")
-    
-    if not func:
-        raise HTTPException(status_code=404, detail="Empresa no configurada.")
+#region Endpoint de Envío Masivo por Cluster
 
-    diccionario_cambios = {id_num: estado for id_num in ids}
-
-    if func(diccionario_cambios, db):
-        return {
-            "status": "ok",
-            "mensaje": f"Se actualizó el estado a {estado} para {len(ids)} IDs.",
-            "ids_afectados": ids
-        }
-    
-    raise HTTPException(status_code=400, detail="Error al actualizar en SQL.")
-
-
-@router_globales.patch("/proyecto/{empresa_id}")
-def api_switch_proyecto_completo(
-    empresa_id: str, 
-    estado: bool,                    
-    proyectos: List[str] = Body(...), 
-    db: Session = Depends(get_db), user: dict = Depends(es_admin)
-):
-    func = PROVIDERS.get(empresa_id, {}).get("set_proyecto_bulk")
-    
-    if not func:
-        raise HTTPException(status_code=404, detail="Empresa no configurada.")
-
-    # Llamamos a la lógica enviando ambos parámetros
-    if func(proyectos, estado, db):
-        return {
-            "status": "ok",
-            "mensaje": f"Se aplicó {estado} a los proyectos: {', '.join(proyectos)}"
-        }
-    
-    raise HTTPException(status_code=400, detail="Error al actualizar en SQL.")
-
- 
-@router_globales.get("/estado-etapas/{empresa_id}")
-def api_get_estado_etapas(empresa_id: str, db: Session = Depends(get_db), user: dict = Depends(es_admin)):
-    func = PROVIDERS.get(empresa_id, {}).get("get_estado_etapas")
-    
-    if not func:
-        raise HTTPException(status_code=404, detail="Empresa no configurada.")
-        
-    return func(db)
-
-@router_globales.patch("/config-recordatorios/{empresa_id}")
-def api_actualizar_dias_recordatorio(
-    empresa_id: str, 
-    datos: RecordatoriosUpdate, 
-    user: dict = Depends(es_admin)
-):
-    repo = FirebaseRepository()
-    
-    res = repo.actualizar_config_recordatorios(empresa_id, datos.dict(exclude_unset=True))
-    
-    if res is None:
-        raise HTTPException(status_code=400, detail="El JSON está vacío o no tiene campos válidos.")
-        
-    if res.status_code != 200:
-        raise HTTPException(status_code=res.status_code, detail=res.text)
-
-    return {"status": "ok", "msj": "Configuración actualizada", "campos": list(datos.dict(exclude_unset=True).keys())}
-
-@router_globales.get("/config-recordatorios/{empresa_id}")
-def api_obtener_config_recordatorios(
-    empresa_id: str, 
-    user: dict = Depends(es_admin)
-):
-    """
-    Recupera los días y la hora programada para los recordatorios de una empresa.
-    Si no existe configuración.
-    """
-    repo = FirebaseRepository()
-    config = repo.obtener_config_recordatorios(empresa_id)
-    
-    return config
-
-# 1. Definimos el objeto de ejemplo
 EJEMPLO_FINAL = {
     "clusters": ["Planta Baja", "Etapa 1"],
     "pipeline_status": ["Contrato Firmado"], # <-- Nuevo filtro
@@ -1540,6 +2029,43 @@ async def api_proceso_cluster(
     use_case = StaticEmailClusterUseCase(FirebaseRepository(), NotificationGateway())
     return use_case.ejecutar_proceso_cluster(empresa_id, Namespace(**config_final), db)
 
+
+
+#region Configuración de Recordatorios
+
+@router_globales.patch("/config-recordatorios/{empresa_id}")
+def api_actualizar_dias_recordatorio(
+    empresa_id: str, 
+    datos: RecordatoriosUpdate, 
+    user: dict = Depends(es_admin)
+):
+    repo = FirebaseRepository()
+    
+    res = repo.actualizar_config_recordatorios(empresa_id, datos.dict(exclude_unset=True))
+    
+    if res is None:
+        raise HTTPException(status_code=400, detail="El JSON está vacío o no tiene campos válidos.")
+        
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail=res.text)
+
+    return {"status": "ok", "msj": "Configuración actualizada", "campos": list(datos.dict(exclude_unset=True).keys())}
+
+@router_globales.get("/config-recordatorios/{empresa_id}")
+def api_obtener_config_recordatorios(
+    empresa_id: str, 
+    user: dict = Depends(es_admin)
+):
+    """
+    Recupera los días y la hora programada para los recordatorios de una empresa.
+    Si no existe configuración.
+    """
+    repo = FirebaseRepository()
+    config = repo.obtener_config_recordatorios(empresa_id)
+    
+    return config
+
+#endregion
 
 @router.get("/busqueda-expedientes", response_model=List[SearchboxExpedienteResponse])
 def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
@@ -1599,7 +2125,8 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
 
     return resultado
 
-router_juridico = APIRouter(prefix="/v1/plantillas-juridico", tags=["CRUD Jurídico"])
+
+#region CRUD Plantillas para Jurídico
 
 @router_juridico.get("/{empresa_id}")
 def listar_juridico(empresa_id: str, user: dict = Depends(es_admin)):
@@ -1681,3 +2208,5 @@ def eliminar_juridico(empresa_id: str, doc_id: str, user: dict = Depends(es_admi
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
     requests.delete(url, headers=repo.headers, timeout=10)
     return {"status": "eliminada", "id": doc_id}
+
+#endregion

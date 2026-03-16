@@ -326,6 +326,7 @@ class PlantillaWAUpdate(BaseModel):
 class WhatsAppManualSchema(BaseModel):
     folio: str
     categoria: str
+    categoriaDocumento: Optional[str] = None
     
     
 class UsuarioUpdate(BaseModel):
@@ -347,6 +348,7 @@ class GlobalMassiveUpdate(BaseModel):
 class EmailFolioSchema(BaseModel):
     folio: str
     categoria: str
+    categoriaDocumento: Optional[str] = None
 
 class RemitenteCreate(BaseModel):
     remitente: EmailStr

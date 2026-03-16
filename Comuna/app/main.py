@@ -195,8 +195,8 @@ if APP_MODE == "NOTIFICACIONES":
     app.include_router(notificacionesMS.router_wa)
     app.include_router(notificacionesMS.router_usuario)
     app.include_router(notificacionesMS.router_globales)
-    app.include_router(remitentes.router)
     app.include_router(notificacionesMS.router_juridico)
+    app.include_router(remitentes.router)
 else:
     app.include_router(login.router)
     app.include_router(usuarios.router)

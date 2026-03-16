@@ -1,12 +1,18 @@
 import os
 import logging
+import re
 import requests
 from ..services.security import get_current_user, es_admin, es_usuario
 from ..database import get_db
+from ..utils.datos_proveedores import get_komunah_data
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
+from playwright.sync_api import sync_playwright
+from google.cloud import storage
+from datetime import date, timedelta
 
 load_dotenv()
 
@@ -17,11 +23,216 @@ _project_id = os.getenv("FIREBASE_PLANTILLAS_PROJECT_ID", "").strip()
 _api_key    = os.getenv("FIREBASE_PLANTILLAS_API_KEY", "")
 _base_url   = f"https://firestore.googleapis.com/v1/projects/{_project_id}/databases/(default)/documents"
 _headers    = {"X-Goog-Api-Key": _api_key, "Content-Type": "application/json"}
+_bucket_name = "bucket-grupo-komunah-juridico"
+
+
+class CobranzaStatusUpdate(BaseModel):
+    id_empresa: str
+    id: str
+    status: str
 
 
 class StatusPagoUpdate(BaseModel):
     id: str
     status: str
+
+
+class CobranzaService:
+    def __init__(self):
+        self.base_url = _base_url
+        self.headers = _headers
+        self.project_id = _project_id
+        self.api_key = _api_key
+
+    @staticmethod
+    def _clean_firestore_value(v):
+        if not isinstance(v, dict):
+            return v
+        if "mapValue" in v:
+            fields = v["mapValue"].get("fields", {})
+            return {k: CobranzaService._clean_firestore_value(val) for k, val in fields.items()}
+        if "arrayValue" in v:
+            return [CobranzaService._clean_firestore_value(i) for i in v["arrayValue"].get("values", [])]
+        if "stringValue" in v:
+            return v["stringValue"]
+        if "integerValue" in v:
+            return int(v["integerValue"])
+        if "doubleValue" in v:
+            return float(v["doubleValue"])
+        if "booleanValue" in v:
+            return v["booleanValue"]
+        if "timestampValue" in v:
+            return v["timestampValue"]
+        return list(v.values())[0] if v else None
+
+    @staticmethod
+    def _normalizar_fragmento(valor, fallback="N/A") -> str:
+        texto = str(valor).strip() if valor is not None else ""
+        if not texto:
+            texto = fallback
+        return re.sub(r"[\\/:*?\"<>|]", "_", texto)
+
+    def _validar_config(self):
+        if not self.project_id or not self.api_key:
+            raise HTTPException(status_code=500, detail="Configuración de Firebase incompleta")
+
+    def obtener_comprobante(self, comprobante_id: str):
+        self._validar_config()
+        url = f"{self.base_url}/ComprobantePago/{comprobante_id}"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="Comprobante no encontrado")
+        if resp.status_code != 200:
+            logger.error(f"Firebase error {resp.status_code}: {resp.text}")
+            raise HTTPException(status_code=500, detail="Error al obtener comprobante")
+        return resp.json()
+
+    def actualizar_status(self, comprobante_id: str, nuevo_status: str):
+        self._validar_config()
+        url = f"{self.base_url}/ComprobantePago/{comprobante_id}?updateMask.fieldPaths=Status"
+        body = {"fields": {"Status": {"stringValue": nuevo_status}}}
+        resp = requests.patch(url, json=body, headers=self.headers, timeout=10)
+
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="Comprobante no encontrado")
+        if resp.status_code == 400:
+            logger.error(f"Firebase error 400: {resp.text}")
+            raise HTTPException(status_code=400, detail="Solicitud inválida para Firebase")
+        if resp.status_code not in [200, 201]:
+            logger.exception(f"Firebase error {resp.status_code}: {resp.text}")
+            raise HTTPException(status_code=500, detail="Error al actualizar status")
+
+    def obtener_plantilla_juridico(self, id_empresa: str, plantilla_id: str = "KO-0009"):
+        self._validar_config()
+        url = f"{self.base_url}/empresas/{id_empresa}/plantillas_juridico/{plantilla_id}"
+        resp = requests.get(url, headers=self.headers, timeout=10)
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Plantilla jurídica {plantilla_id} no encontrada")
+        if resp.status_code != 200:
+            logger.error(f"Firebase error plantilla {resp.status_code}: {resp.text}")
+            raise HTTPException(status_code=500, detail="Error al obtener plantilla jurídica")
+        return resp.json()
+
+    def obtener_parcialidad_por_folio(self, folio: str, db: Session) -> str:
+        query = text("""
+            SELECT t.`NÚMERO DE PARCIALIDADES VENCIDAS TOTALES` AS parcialidad
+            FROM (
+                SELECT
+                    cv.`FOLIO`,
+                    cv.`NÚMERO DE PARCIALIDADES VENCIDAS TOTALES`,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY cv.`FOLIO`
+                        ORDER BY ABS(DATEDIFF(STR_TO_DATE(cv.`FECHA DE PAGO`, '%d/%m/%Y'), CURDATE())) ASC
+                    ) AS rank_fecha
+                FROM cartera_vencida cv
+                WHERE cv.`FOLIO` = :folio
+            ) t
+            WHERE t.rank_fecha = 1
+            LIMIT 1
+        """)
+        result = db.execute(query, {"folio": str(folio)}).mappings().first()
+        if not result:
+            return "0"
+        parcialidad = result.get("parcialidad")
+        return str(parcialidad).strip() if parcialidad is not None else "0"
+
+    @staticmethod
+    def reemplazar_etiquetas(texto: str, variables: dict):
+        if not texto:
+            return texto
+        for tag, valor in variables.items():
+            texto = texto.replace(tag, str(valor))
+        return re.sub(r"\{[^}]+\}", "", texto)
+
+    def generar_pdf_bytes(self, html: str) -> bytes:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+            page = browser.new_page()
+            page.set_content(html, wait_until="networkidle")
+            page.emulate_media(media="screen")
+            page.wait_for_load_state("networkidle")
+            page.wait_for_timeout(400)
+            pdf_bytes = page.pdf(format="A4", print_background=True)
+            browser.close()
+        return pdf_bytes
+
+    def subir_a_bucket(self, pdf_bytes: bytes, ruta_carpeta: str, nombre_archivo: str) -> str:
+        cred_path = os.getenv("STORAGE_CREDENTIALS_PATH")
+        if not cred_path:
+            raise HTTPException(status_code=500, detail="Falta STORAGE_CREDENTIALS_PATH")
+
+        storage_client = storage.Client.from_service_account_json(cred_path)
+        bucket = storage_client.bucket(_bucket_name)
+        ruta_completa = f"{ruta_carpeta}/{nombre_archivo}"
+        blob = bucket.blob(ruta_completa)
+
+        if not blob.exists():
+            blob.upload_from_string(pdf_bytes, content_type="application/pdf")
+
+        return blob.generate_signed_url(version="v4", expiration=timedelta(hours=1), method="GET")
+
+    def generar_y_subir_pdf(self, id_empresa: str, comprobante_id: str, db: Session):
+        comprobante_doc = self.obtener_comprobante(comprobante_id)
+        comprobante_fields = comprobante_doc.get("fields", {})
+        comprobante_limpio = {k: self._clean_firestore_value(v) for k, v in comprobante_fields.items()}
+
+        folio = str(comprobante_limpio.get("Contacto", {}).get("FolioExpediente", "")).strip()
+        if not folio:
+            raise HTTPException(status_code=400, detail="El comprobante no contiene folio")
+
+        plantilla = self.obtener_plantilla_juridico(id_empresa, "KO-0009")
+        p_fields = plantilla.get("fields", {})
+        html_raw = p_fields.get("html", {}).get("stringValue", "")
+        categoria = p_fields.get("categoria", {}).get("stringValue", "general")
+        if not html_raw:
+            raise HTTPException(status_code=400, detail="La plantilla KO-0009 no contiene html")
+
+        data_sql = get_komunah_data(folio, db)
+        if not data_sql:
+            raise HTTPException(status_code=404, detail=f"Folio {folio} no encontrado en SQL")
+
+        html_final = self.reemplazar_etiquetas(html_raw, data_sql)
+        pdf_bytes = self.generar_pdf_bytes(html_final)
+
+        parcialidad = self.obtener_parcialidad_por_folio(folio, db)
+        cliente = (
+            data_sql.get("{c1.client_name}")
+            or data_sql.get("{cliente}")
+            or data_sql.get("{cl.cliente}")
+            or data_sql.get("{v.cliente}")
+            or "Cliente"
+        )
+        lote = (
+            data_sql.get("{v.numero}")
+            or data_sql.get("{lote}")
+            or data_sql.get("{unidad}")
+            or "SinLote"
+        )
+
+        fecha_hoy = date.today().isoformat()
+        nombre_pdf = (
+            f"{self._normalizar_fragmento(folio, 'SinFolio')}_"
+            f"{self._normalizar_fragmento(parcialidad, '0')}_"
+            f"{self._normalizar_fragmento(lote, 'SinLote')}_"
+            f"{fecha_hoy}.pdf"
+        )
+        ruta = (
+            f"Komunah/PlantillasMovil/Categorias/"
+            f"{self._normalizar_fragmento(categoria, 'general')}/"
+            f"{self._normalizar_fragmento(cliente, 'Cliente')}"
+        )
+
+        url_descarga = self.subir_a_bucket(pdf_bytes, ruta, nombre_pdf)
+        return {
+            "folio": folio,
+            "categoria": categoria,
+            "cliente": cliente,
+            "parcialidad": parcialidad,
+            "lote": lote,
+            "ruta": ruta,
+            "filename": nombre_pdf,
+            "url_descarga": url_descarga,
+        }
 
 
 @router.get("/comprobantes")
@@ -64,31 +275,25 @@ def obtener_comprobantes():
 
 
 @router.post("/actualizarStatusPagos")
-def actualizar_status_pagos(payload: StatusPagoUpdate):
-    """Actualiza el campo status de un comprobante por su ID en Firestore."""
+def actualizar_status_pagos(payload: CobranzaStatusUpdate, db: Session = Depends(get_db)):
+    """Actualiza status de comprobante y genera/sube PDF jurídico KO-0009."""
     try:
-        if not _project_id or not _api_key:
-            raise HTTPException(status_code=500, detail="Configuración de Firebase incompleta")
+        service = CobranzaService()
 
         nuevo_status = payload.status.strip()
         if not nuevo_status:
             raise HTTPException(status_code=400, detail="El campo status es obligatorio")
 
-        url = f"{_base_url}/ComprobantePago/{payload.id}?updateMask.fieldPaths=Status"
-        body = {"fields": {"Status": {"stringValue": nuevo_status}}}
-        resp = requests.patch(url, json=body, headers=_headers, timeout=10)
+        service.actualizar_status(payload.id, nuevo_status)
+        pdf_info = service.generar_y_subir_pdf(payload.id_empresa, payload.id, db)
 
-        if resp.status_code == 404:
-            raise HTTPException(status_code=404, detail="Comprobante no encontrado")
-        if resp.status_code == 400:
-            logger.error(f"Firebase error 400: {resp.text}")
-            raise HTTPException(status_code=400, detail="Solicitud inválida para Firebase")
-        if resp.status_code not in [200, 201]:
-            logger.exception(f"Firebase error {resp.status_code}: {resp.text}")
-            raise HTTPException(status_code=500, detail="Error al actualizar status")
-
-        return {"status": "success", "id": payload.id, "nuevo_status": nuevo_status}
-
+        return {
+            "status": "success",
+            "id": payload.id,
+            "id_empresa": payload.id_empresa,
+            "nuevo_status": nuevo_status,
+            "pdf": pdf_info,
+        }
     except HTTPException:
         raise
     except Exception as e:
