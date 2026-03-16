@@ -6,7 +6,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from typing import List
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import logging
+
+logger = logging.getLogger(__name__)
+
 def get_komunah_data(folio_ref: str, db: Session):
+    logger.info("[DATOS_KOMUNAH] Entrada get_komunah_data | folio=%s", folio_ref)
     # 1. BUSCAR VENTA
 
     if folio_ref is None or str(folio_ref).upper() == "NULL":
@@ -41,8 +46,10 @@ def get_komunah_data(folio_ref: str, db: Session):
         return data
 
         
+    logger.info("[DATOS_KOMUNAH] Paso: consultar venta")
     venta = db.query(Venta).filter(Venta.folio == folio_ref).first()
     if not venta:
+        logger.warning("[DATOS_KOMUNAH] Venta no encontrada | folio=%s", folio_ref)
         return {}
 
     data = {}
@@ -75,6 +82,7 @@ def get_komunah_data(folio_ref: str, db: Session):
             data[f"{{v.{col.key.lower()}}}"] = str(val)
 
 
+    logger.info("[DATOS_KOMUNAH] Paso: consultar amortizaciones")
     amortizaciones = db.query(Amortizacion).filter(Amortizacion.folder_id == folio_ref)\
                     .order_by(Amortizacion.date.asc()).all()
     
@@ -133,7 +141,18 @@ def get_komunah_data(folio_ref: str, db: Session):
         except:
             c_id_limpio = str(c_id_raw)
 
-        cliente_db = db.query(Cliente).filter(Cliente.client_id == c_id_limpio).first()
+        try:
+            logger.info("[DATOS_KOMUNAH] Paso: consultar cliente | client_id=%s", c_id_limpio)
+            cliente_db = db.query(Cliente).filter(Cliente.client_id == c_id_limpio).first() #Revisar copn el Ingeniero si construyendo de otra forma el query funciona y no da error de string a float
+        except Exception as e:
+            logger.exception(
+                "[DATOS_KOMUNAH] Error consultando clientes por client_id=%s | folio=%s | error=%s",
+                c_id_limpio,
+                folio_ref,
+                str(e),
+            )
+            cliente_db = None
+
         if cliente_db:
             prefijo = f"c{i}." 
             for col in inspect(cliente_db).mapper.column_attrs:
@@ -141,10 +160,20 @@ def get_komunah_data(folio_ref: str, db: Session):
                 if val_c is not None: 
                     data[f"{{{prefijo}{col.key.lower()}}}"] = str(val_c)
         
-        gestion_db = db.query(GestionClientes).filter(
-            GestionClientes.folio == folio_ref,
-            GestionClientes.client_id == c_id_limpio
-        ).first()
+        try:
+            logger.info("[DATOS_KOMUNAH] Paso: consultar gestion cliente | folio=%s | client_id=%s", folio_ref, c_id_limpio)
+            gestion_db = db.query(GestionClientes).filter(
+                GestionClientes.folio == folio_ref,
+                GestionClientes.client_id == c_id_limpio
+            ).first()
+        except Exception as e:
+            logger.exception(
+                "[DATOS_KOMUNAH] Error consultando gestion clientes | folio=%s | client_id=%s | error=%s",
+                folio_ref,
+                c_id_limpio,
+                str(e),
+            )
+            gestion_db = None
 
         if gestion_db:
             prefijo_g = f"g{i}."
@@ -216,6 +245,7 @@ def get_komunah_data(folio_ref: str, db: Session):
 
     })
     
+    logger.info("[DATOS_KOMUNAH] Paso: salida get_komunah_data | folio=%s | tags=%s", folio_ref, len(data))
     return data
 
 def get_folios_a_notificar_komunah(db: Session, fecha: str):
@@ -226,23 +256,36 @@ def get_folios_a_notificar_komunah(db: Session, fecha: str):
     """
     query = text("""
         SELECT DISTINCT a.folder_id 
-        FROM amortizaciones a
-        LEFT JOIN pagos p ON a.folder_id = p.`Folio de la venta` AND a.number = p.`Número de pago`
-        WHERE a.date = :f
-        AND (IFNULL(p.`Estatus expediente`, '') != 'Liquidado')
-        AND (
-            p.`Folio de la venta` IS NULL -- No hay registro de pago
-            OR IFNULL(p.`Monto pagado`, 0) < IFNULL(p.`Monto a pagar`, 0) -- Debe dinero
-            OR p.Estatus = 'canceled' -- El pago se canceló
-        )
-        -- EXCLUSIÓN: No debe tener ninguna letra anterior con deuda
-        AND NOT EXISTS (
-            SELECT 1 FROM amortizaciones a2
-            LEFT JOIN pagos p2 ON a2.folder_id = p2.`Folio de la venta` AND a2.number = p2.`Número de pago`
-            WHERE a2.folder_id = a.folder_id 
-            AND a2.date < a.date
-            AND (p2.`Folio de la venta` IS NULL OR IFNULL(p2.`Monto pagado`, 0) < IFNULL(p2.`Monto a pagar`, 0))
-        )
+            FROM amortizaciones a
+            JOIN ventas v ON v.FOLIO = a.folder_id
+            JOIN config_etapas ce ON ce.etapa = v.ETAPA
+            WHERE a.date = :f
+            AND CAST(ce.etapa_activo AS DECIMAL(10,4)) > 0
+            AND CAST(ce.proyecto_activo AS DECIMAL(10,4)) > 0
+            AND v.ESTADO DEL EXPEDIENTE IN ('Incidencias', 'Contrato Firmado', 'Firma', 'Firma de Testigos', 'Firmado por Cliente')
+            
+            -- NUEVA INCLUSIÓN: Comparamos el total de la amortización ACTUAL contra la suma REAL de sus abonos válidos
+            AND a.total > (
+                SELECT IFNULL(SUM(p.Monto pagado), 0)
+                FROM pagos p
+                WHERE p.Folio de la venta = a.folder_id
+                    AND p.Número de pago = a.number
+                    AND IFNULL(p.Estatus, '') != 'canceled'
+            )
+            
+            -- EXCLUSIÓN: no tiene letras anteriores con deuda REAL (sumando todos sus abonos)
+            AND NOT EXISTS (
+                SELECT 1 FROM amortizaciones a2
+                WHERE a2.folder_id = a.folder_id
+                AND a2.date < a.date
+                AND a2.total > (
+                    SELECT IFNULL(SUM(px.Monto pagado), 0)
+                    FROM pagos px
+                    WHERE px.Folio de la venta = a2.folder_id
+                        AND px.Número de pago = a2.number
+                        AND IFNULL(px.Estatus, '') != 'canceled'
+                )
+            );
     """)
     registros = db.execute(query, {"f": fecha}).fetchall()
     return [row[0] for row in registros]

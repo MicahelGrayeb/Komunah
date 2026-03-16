@@ -152,12 +152,17 @@ class Amortizacion(Base):
     folder_id = Column("folder_id", String(255), primary_key=True)
     number = Column("number", String(255), primary_key=True)
     concept = Column("concept", Text)
-    date = Column("date", Text) 
-    capital = Column(Numeric(precision=20, scale=4))
-    interest = Column(Numeric(precision=20, scale=4))
-    down_payment = Column(Numeric(precision=20, scale=4))
-    total = Column(Numeric(precision=20, scale=4))
-    penalized_amount = Column(Numeric(precision=20, scale=4))
+    date = Column("date", Text)
+    capital = Column("capital",Text)
+    interest = Column("interest", Text)
+    down_payment = Column("down_payment", Text)
+    total = Column("total", Text)
+    penalized_amount = Column("penalized_amount", Text)
+    # capital = Column(Numeric(precision=20, scale=4))
+    # interest = Column(Numeric(precision=20, scale=4))
+    # down_payment = Column(Numeric(precision=20, scale=4))
+    # total = Column(Numeric(precision=20, scale=4))
+    # penalized_amount = Column(Numeric(precision=20, scale=4))
     
 
 class Cliente(Base):
@@ -214,7 +219,7 @@ class Cliente(Base):
     mc_legal_representative_public_notary = Column("mc_legal_representative_public_notary", Text)
     mc_legal_representative_notary_number = Column("mc_legal_representative_notary_number", Float)
     mc_legal_representative_electronic_folio = Column("mc_legal_representative_electronic_folio", Float)
-  
+
     
 
 

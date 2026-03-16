@@ -217,7 +217,7 @@ class CobranzaService:
             f"{fecha_hoy}.pdf"
         )
         ruta = (
-            f"Komunah/"
+            f"Komunah/PlantillasMovil/Categorias/"
             f"{self._normalizar_fragmento(categoria, 'general')}/"
             f"{self._normalizar_fragmento(cliente, 'Cliente')}"
         )
