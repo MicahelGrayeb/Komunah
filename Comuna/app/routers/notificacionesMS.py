@@ -282,16 +282,20 @@ class FirebaseRepository:
     def obtener_config_recordatorios(self, empresa_id: str):
         """Trae los días de recordatorio desde Firebase."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
-        resp = requests.get(url, headers=self.headers, timeout=5)
-        if resp.status_code != 200:
-           return {"dias_1": 3, "dias_2": 1, "hora": 10, "minuto": 0}    
-        f = resp.json().get("fields", {})
-        return {
-            "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
-            "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
-            "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
-            "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
-        }
+        defaults = {"dias_1": 3, "dias_2": 1, "hora": 10, "minuto": 0}
+        try:
+            resp = requests.get(url, headers=self.headers, timeout=5)
+            if resp.status_code != 200:
+                return defaults
+            f = resp.json().get("fields", {})
+            return {
+                "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
+                "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
+                "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
+                "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
+            }
+        except Exception:
+            return defaults
     
     def actualizar_config_recordatorios(self, empresa_id: str, datos: dict):
         """Recibe un diccionario y parchea solo los campos presentes en él."""
@@ -737,14 +741,13 @@ class NotificationUseCase:
             data_sql = extraer_datos(row, db)
             
 
+            if not data_sql:
+                self.repo.registrar_log_falla(empresa_id, f"El folio {row} no trajo info de SQL", "DATOS_SQL")
+                continue
+
             if data_sql.get("{sys.etapa_activa}") == "0":
                 motivo = data_sql.get("{sys.bloqueo_motivo}", "Bloqueo por configuración de Etapa/Proyecto")
-
                 self.repo.registrar_log_falla(empresa_id, f"Folio {row} saltado: {motivo}", "BLOQUEO_ADMINISTRATIVO")
-                continue
-            
-            if not data_sql:
-                self.repo.registrar_log_falla(empresa_id, f"El folio {row[0]} no trajo info de SQL", "DATOS_SQL")
                 continue
             
             for i in range(1, 7):
@@ -790,7 +793,6 @@ class NotificationUseCase:
                     if res_mail.status_code not in [200, 201, 202]:
                         self.repo.registrar_log_falla(empresa_id, f"Email falló ({res_mail.status_code}) para {email}", "MAIL_PROVIDER")
                     resultado_envio["email"] = f"Status: {res_mail.status_code} | {res_mail.text[:100]}"
-                        
 
 
                 if not sistema_wa_ok:
@@ -825,10 +827,8 @@ class NotificationUseCase:
                         texto_completo = texto_completo.replace(v_nombre, f"{{{{{idx}}}}}")
 
                     res_wa = self.gateway.enviar_whatsapp(num_wa, p_wa["id_respond"], p_wa["lenguaje"], parametros_dinamicos, texto_cuerpo=texto_completo)
-                    
                     if res_wa.status_code not in [200, 201, 202]:
                         self.repo.registrar_log_falla(empresa_id, f"WhatsApp falló ({res_wa.status_code}) para {phone}", "WA_PROVIDER")
-                    
                     resultado_envio["wa"] = f"Status: {res_wa.status_code}"
 
                 reporte_detallado.append(resultado_envio)
@@ -1692,7 +1692,8 @@ def api_disparar_barrido(
     dias: int, 
     categoria: str,  
     tipo: str = "normal",
-    db: Session = Depends(get_db), user: dict = Depends(es_usuario)
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
 ):
     """Barrido Automático Genérico: Email (Firebase) + WhatsApp (Respond.io)."""
     repo = FirebaseRepository()
