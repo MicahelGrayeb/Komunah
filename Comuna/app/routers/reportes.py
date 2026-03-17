@@ -767,13 +767,17 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
     try:
         busqueda = f"%{anio}%" if anio else None
         
-        query = text("""
+        # Definimos la subconsulta de conteo filtrada para reusarla
+        # Solo cuenta registros donde NO sea el propietario principal
+        subquery_count = "(SELECT COUNT(*) FROM notificaciones_gestion_clientes WHERE folio = v.FOLIO AND (es_propietario_principal = 0 OR es_propietario_principal IS NULL))"
+
+        query = text(f"""
             -- 1. Fila del TITULAR
             SELECT 
                 v.FOLIO as FOLIO,
                 v.CLIENTE as CLIENTE,
                 '' as DETALLES,
-                (SELECT COUNT(*) FROM notificaciones_gestion_clientes WHERE folio = v.FOLIO) as `NÚMERO DE COPROPIETARIO`,
+                {subquery_count} as `NÚMERO DE COPROPIETARIO`,
                 COALESCE(v.`TELÉFONO`, '') as TELEFONO,
                 COALESCE(v.`CORREO ELECTRÓNICO`, '') as CORREO,
                 v.`METROS CUADRADOS` as M2,
@@ -796,7 +800,7 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
                 v.FOLIO as FOLIO,
                 gc.client_name as CLIENTE,
                 '' as DETALLES,
-                (SELECT COUNT(*) FROM notificaciones_gestion_clientes WHERE folio = v.FOLIO) as `NÚMERO DE COPROPIETARIO`,
+                {subquery_count} as `NÚMERO DE COPROPIETARIO`,
                 COALESCE(gc.telefono, '') as TELEFONO,
                 COALESCE(gc.email, '') as CORREO,
                 v.`METROS CUADRADOS` as M2,
