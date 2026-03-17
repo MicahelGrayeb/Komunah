@@ -151,7 +151,7 @@ class Amortizacion(Base):
     
     folder_id = Column("folder_id", String(255), primary_key=True)
     number = Column("number", String(255), primary_key=True)
-    concept = Column("concept", Text)
+    concept = Column("concept", Text, primary_key=True)
     date = Column("date", Text)
     capital = Column("capital",Text)
     interest = Column("interest", Text)

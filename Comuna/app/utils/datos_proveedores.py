@@ -7,6 +7,7 @@ from typing import List
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import logging
+from sqlalchemy import text, func
 
 logger = logging.getLogger(__name__)
 
@@ -102,13 +103,17 @@ def get_komunah_data(folio_ref: str, db: Session):
     pagado_parcial = 0.0
     if p_act and hasattr(p_act, 'total') and p_act.total is not None:
         monto_val = float(p_act.total)
-        p_v_hoy = db.query(Pago).filter(
+        # Diccionario para mapear conceptos de amortizaciones a conceptos de pagos en SQL
+        tradu_sql = {"financing": "Parcialidad", "down_payment": "Enganche", "initial_payment": "Apartado", "last_payment": "Último pago"}
+        conc_traducido = tradu_sql.get(p_act.concept, p_act.concept)
+        
+        res_suma = db.query(func.sum(Pago.monto_pagado)).filter(
             Pago.folio_venta == int(folio_ref), 
             Pago.numero_pago == p_act.number,
+            Pago.concepto_pago == conc_traducido,
             Pago.estatus == 'active' 
-        ).first()
-        if p_v_hoy:
-            pagado_parcial = float(p_v_hoy.monto_pagado or 0)
+        ).scalar()
+        pagado_parcial = float(res_suma or 0)
     saldo_actual_vigente = monto_val - pagado_parcial
     # Mapeo manual con etiquetas estandarizadas
     data.update({
@@ -154,24 +159,33 @@ def get_komunah_data(folio_ref: str, db: Session):
         # SQLAlchemy nativo falla con ValueError al hacer el type-cast.
         # Intentamos ORM primero; si falla, caemos a SQL crudo que no castea tipos.
         try:
+            logger.info("[DATOS_KOMUNAH] Paso: consultar cliente | client_id=%s", c_id_limpio)
             cliente_db = db.query(Cliente).filter(Cliente.client_id == c_id_limpio).first()
         except ValueError:
             from types import SimpleNamespace
-            row = db.execute(
+            row_raw = db.execute(
                 text("SELECT * FROM clientes WHERE client_id = :id"),
                 {"id": c_id_limpio}
             ).mappings().first()
-            if row:
-                cliente_db = SimpleNamespace(**{k: (None if v == '' else v) for k, v in dict(row).items()})
-            else:
-                cliente_db = None
+            cliente_db = SimpleNamespace(**{k: (None if v == '' else v) for k, v in dict(row_raw).items()}) if row_raw else None
+        except Exception as e:
+            logger.exception(
+                "[DATOS_KOMUNAH] Error consultando clientes por client_id=%s | folio=%s | error=%s",
+                c_id_limpio, folio_ref, str(e),
+            )
+            cliente_db = None
 
         if cliente_db:
-            prefijo = f"c{i}." 
-            for col in inspect(Cliente).mapper.column_attrs:   # clase, no instancia
-                val_c = getattr(cliente_db, col.key, None)
-                if val_c is not None: 
-                    data[f"{{{prefijo}{col.key.lower()}}}"] = str(val_c)
+            prefijo = f"c{i}."
+            if hasattr(cliente_db, '_sa_instance_state'):
+                for col in inspect(cliente_db).mapper.column_attrs:
+                    val_c = getattr(cliente_db, col.key)
+                    if val_c is not None:
+                        data[f"{{{prefijo}{col.key.lower()}}}"] = str(val_c)
+            else:
+                for key, val_c in vars(cliente_db).items():
+                    if val_c is not None:
+                        data[f"{{{prefijo}{key.lower()}}}"] = str(val_c)
         
         try:
             logger.info("[DATOS_KOMUNAH] Paso: consultar gestion cliente | folio=%s | client_id=%s", folio_ref, c_id_limpio)
@@ -209,6 +223,11 @@ def get_komunah_data(folio_ref: str, db: Session):
     ven_saldo_vencido = float(cv.total_vencido_sin_pen or 0) if cv else 0.0
     saldo_total_vencido = float(cv.total_vencido_con_pen or 0) if cv else 0.0
     ven_penalizacion_acumulada = saldo_total_vencido - ven_saldo_vencido
+    if saldo_total_vencido <= 0:
+        ven_meses_atraso = 0
+        ven_saldo_vencido = 0.0
+        ven_penalizacion_acumulada = 0.0
+        fecha_mas_antigua = None
 
     ven_monto_mes_puro = 0.0       
     ven_monto_mes_pendiente = 0.0  
@@ -217,13 +236,17 @@ def get_komunah_data(folio_ref: str, db: Session):
 
 
     for amt in amortizaciones:
-        p_v = db.query(Pago).filter(
+        # Suma TODOS los abonos activos de esta letra Y CONCEPTO (fix crítico: Enganche 1 vs Parcialidad 1)
+        tradu_sql = {"financing": "Parcialidad", "down_payment": "Enganche", "initial_payment": "Apartado", "last_payment": "Último pago"}
+        conc_amt = tradu_sql.get(amt.concept, amt.concept)
+        
+        pagado = float(db.query(func.sum(Pago.monto_pagado)).filter(
             Pago.folio_venta == int(folio_ref), 
             Pago.numero_pago == amt.number,
+            Pago.concepto_pago == conc_amt,
             Pago.estatus == 'active' 
-        ).first()
+        ).scalar() or 0)
         
-        pagado = float(p_v.monto_pagado or 0) if p_v else 0.0
         total_deberia = float(amt.total or 0)
         esta_pendiente = pagado < total_deberia
 
@@ -236,7 +259,7 @@ def get_komunah_data(folio_ref: str, db: Session):
         if p_act and amt.number == p_act.number:
             ven_monto_mes_puro = total_deberia 
             ven_penalizacion_mes_actual = float(amt.penalized_amount or 0)
-            ven_monto_mes_pendiente = (total_deberia - pagado)
+            ven_monto_mes_pendiente = float(total_deberia - pagado)
 
 
     dias_atraso = (hoy_dt.replace(tzinfo=None) - fecha_mas_antigua).days if fecha_mas_antigua else 0
@@ -275,28 +298,46 @@ def get_folios_a_notificar_komunah(db: Session, fecha: str):
             WHERE a.date = :f
             AND CAST(ce.etapa_activo AS DECIMAL(10,4)) > 0
             AND CAST(ce.proyecto_activo AS DECIMAL(10,4)) > 0
-            AND v.ESTADO DEL EXPEDIENTE IN ('Incidencias', 'Contrato Firmado', 'Firma', 'Firma de Testigos', 'Firmado por Cliente')
+            AND v.`ESTADO DEL EXPEDIENTE` IN ('Incidencias', 'Contrato Firmado', 'Firma', 'Firma de Testigos', 'Firmado por Cliente', 'Agenda Escritura')
             
-            -- NUEVA INCLUSIÓN: Comparamos el total de la amortización ACTUAL contra la suma REAL de sus abonos válidos
+            -- INCLUSIÓN: amortización actual no está liquidada (filtrando por concepto para no mezclar Enganche con Parcialidad)
             AND a.total > (
-                SELECT IFNULL(SUM(p.Monto pagado), 0)
+                SELECT IFNULL(SUM(p.`Monto pagado`), 0)
                 FROM pagos p
-                WHERE p.Folio de la venta = a.folder_id
-                    AND p.Número de pago = a.number
-                    AND IFNULL(p.Estatus, '') != 'canceled'
+                WHERE p.`Folio de la venta` = a.folder_id
+                    AND p.`Número de pago` = a.number
+                    AND p.`Concepto de pago` = (
+                        CASE a.concept 
+                            WHEN 'financing' THEN 'Parcialidad'
+                            WHEN 'down_payment' THEN 'Enganche'
+                            WHEN 'initial_payment' THEN 'Apartado'
+                            WHEN 'last_payment' THEN 'Último pago'
+                            ELSE a.concept 
+                        END
+                    )
+                    AND IFNULL(p.`Estatus`, '') != 'canceled'
             )
             
-            -- EXCLUSIÓN: no tiene letras anteriores con deuda REAL (sumando todos sus abonos)
+            -- EXCLUSIÓN: no tiene letras anteriores con deuda REAL (sumando todos sus abonos por concepto)
             AND NOT EXISTS (
                 SELECT 1 FROM amortizaciones a2
                 WHERE a2.folder_id = a.folder_id
                 AND a2.date < a.date
                 AND a2.total > (
-                    SELECT IFNULL(SUM(px.Monto pagado), 0)
+                    SELECT IFNULL(SUM(px.`Monto pagado`), 0)
                     FROM pagos px
-                    WHERE px.Folio de la venta = a2.folder_id
-                        AND px.Número de pago = a2.number
-                        AND IFNULL(px.Estatus, '') != 'canceled'
+                    WHERE px.`Folio de la venta` = a2.folder_id
+                        AND px.`Número de pago` = a2.number
+                        AND px.`Concepto de pago` = (
+                            CASE a2.concept 
+                                WHEN 'financing' THEN 'Parcialidad'
+                                WHEN 'down_payment' THEN 'Enganche'
+                                WHEN 'initial_payment' THEN 'Apartado'
+                                WHEN 'last_payment' THEN 'Último pago'
+                                ELSE a2.concept 
+                            END
+                        )
+                        AND IFNULL(px.`Estatus`, '') != 'canceled'
                 )
             );
     """)
@@ -320,14 +361,24 @@ def get_folios_deudores_komunah(db: Session, fecha: str):
         -- INCLUSIÓN: tiene al menos una letra anterior con deuda REAL
         AND EXISTS (
             SELECT 1 FROM amortizaciones a2
-            WHERE a2.folder_id = a.folder_id
+            WHERE a2.folder_id = a.folder_id 
             AND a2.date < a.date
             AND a2.total > (
-                SELECT IFNULL(SUM(px.`Monto pagado`), 0)
-                FROM pagos px
-                WHERE px.`Folio de la venta` = a2.folder_id
-                  AND px.`Número de pago` = a2.number
-                  AND IFNULL(px.Estatus, '') != 'canceled'
+                -- Debe existir al menos una letra vencida cuya suma de pagos sea menor al total
+                SELECT IFNULL(SUM(p2.`Monto pagado`), 0)
+                FROM pagos p2
+                WHERE p2.`Folio de la venta` = a2.folder_id
+                  AND p2.`Número de pago` = a2.number
+                  AND p2.`Concepto de pago` = (
+                        CASE a2.concept 
+                            WHEN 'financing' THEN 'Parcialidad'
+                            WHEN 'down_payment' THEN 'Enganche'
+                            WHEN 'initial_payment' THEN 'Apartado'
+                            WHEN 'last_payment' THEN 'Último pago'
+                            ELSE a2.concept 
+                        END
+                  )
+                  AND IFNULL(p2.Estatus, '') != 'canceled'
             )
         )
     """)
