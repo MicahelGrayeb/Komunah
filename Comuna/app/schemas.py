@@ -518,6 +518,7 @@ class ReporteExpedientesDetalladoResponse(BaseModel):
     detalles: Any = Field(alias="DETALLES", default="")
     # Cambiamos el alias aquí:
     copropietario: int = Field(alias="NÚMERO DE COPROPIETARIO") 
+    es_titular: bool = Field(alias="ES TITULAR")
     telefono: Optional[Any] = Field(alias="TELEFONO", default="")
     correo: Optional[Any] = Field(alias="CORREO", default="")
     m2: Optional[Any] = Field(alias="M2")
