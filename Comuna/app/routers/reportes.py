@@ -761,3 +761,69 @@ def get_escriturados_juridico(
         return recordatorios
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en escriturados jurídico: {str(e)}")
+
+@router.get("/expedientes-detallado", response_model=List[schemas.ReporteExpedientesDetalladoResponse])
+def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
+    try:
+        busqueda = f"%{anio}%" if anio else None
+        
+        query = text("""
+            -- 1. Fila del TITULAR
+            SELECT 
+                v.FOLIO as FOLIO,
+                v.CLIENTE as CLIENTE,
+                '' as DETALLES,
+                (SELECT COUNT(*) FROM notificaciones_gestion_clientes WHERE folio = v.FOLIO) as `NÚMERO DE COPROPIETARIO`,
+                COALESCE(v.`TELÉFONO`, '') as TELEFONO,
+                COALESCE(v.`CORREO ELECTRÓNICO`, '') as CORREO,
+                v.`METROS CUADRADOS` as M2,
+                v.DESARROLLO as PROYECTO,
+                v.ETAPA as CLUSTER,
+                v.NÚMERO as LOTE,
+                v.ASESOR as ASESOR,
+                v.`ESTADO DEL EXPEDIENTE` as `ESTATUS PIPELINE`,
+                v.`FECHA DE INICIO DE OPERACIÓN` as `INICIO OPERACIONES`,
+                v.`PLAZO DE FINANCIAMIENTO` as PLAZO,
+                v.`PRECIO FINAL` as `PRECIO TOTAL`
+            FROM ventas v
+            WHERE (:anio_val IS NULL OR v.`FECHA DE INICIO DE OPERACIÓN` LIKE :busqueda_anio)
+              AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
+
+            UNION ALL
+
+            -- 2. Filas de COPROPIETARIOS
+            SELECT 
+                v.FOLIO as FOLIO,
+                gc.client_name as CLIENTE,
+                '' as DETALLES,
+                (SELECT COUNT(*) FROM notificaciones_gestion_clientes WHERE folio = v.FOLIO) as `NÚMERO DE COPROPIETARIO`,
+                COALESCE(gc.telefono, '') as TELEFONO,
+                COALESCE(gc.email, '') as CORREO,
+                v.`METROS CUADRADOS` as M2,
+                v.DESARROLLO as PROYECTO,
+                v.ETAPA as CLUSTER,
+                v.NÚMERO as LOTE,
+                v.ASESOR as ASESOR,
+                v.`ESTADO DEL EXPEDIENTE` as `ESTATUS PIPELINE`,
+                v.`FECHA DE INICIO DE OPERACIÓN` as `INICIO OPERACIONES`,
+                v.`PLAZO DE FINANCIAMIENTO` as PLAZO,
+                v.`PRECIO FINAL` as `PRECIO TOTAL`
+            FROM ventas v
+            INNER JOIN notificaciones_gestion_clientes gc ON v.FOLIO = gc.folio
+            WHERE (:anio_val_2 IS NULL OR v.`FECHA DE INICIO DE OPERACIÓN` LIKE :busqueda_anio_2)
+              AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
+              AND (gc.es_propietario_principal = 0 OR gc.es_propietario_principal IS NULL)
+            
+            ORDER BY FOLIO ASC, TELEFONO DESC 
+        """)
+
+        params = {
+            "anio_val": anio, "busqueda_anio": busqueda,
+            "anio_val_2": anio, "busqueda_anio_2": busqueda
+        }
+
+        result = db.execute(query, params).mappings().all()
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en reporte detallado: {str(e)}")

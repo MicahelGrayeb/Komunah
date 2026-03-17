@@ -146,10 +146,14 @@ class FirebaseRepository:
             elif key in ["tags_departamento"]:
                 fields[key] = {"arrayValue": {"values": [{"stringValue": str(v)} for v in value]}}
             elif key == "documentos_adjuntos":
-                mapeo = self._get_juridico_mapping_multiple(empresa_id, value)
-                if mapeo:
-                    fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                if isinstance(value, dict):
+                    fire_map = {k: {"stringValue": str(v)} for k, v in value.items()}
                     fields[key] = {"mapValue": {"fields": fire_map}}
+                else:
+                    mapeo = self._get_juridico_mapping_multiple(empresa_id, value)
+                    if mapeo:
+                        fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                        fields[key] = {"mapValue": {"fields": fire_map}}
             else:
                 fields[key] = {"stringValue": str(value)}
         
@@ -228,7 +232,7 @@ class FirebaseRepository:
                 num = int(match.group(1))
                 if num > max_num: max_num = num
         return f"{prefijo}-{str(max_num + 1).zfill(4)}-WA"
-
+#holaaaaa
     def actualizar_plantilla_wa(self, empresa_id: str, doc_id: str, p: PlantillaWAUpdate):
         fields = {}
         mask = []
@@ -241,10 +245,15 @@ class FirebaseRepository:
             elif key == "variables": 
                 fields[key] = {"arrayValue": {"values": [{"stringValue": str(v)} for v in value]}}
             elif key == "documento_adjunto_id":
-                mapeo = self._get_juridico_mapping_multiple(empresa_id, value if isinstance(value, list) else [value])
-                if mapeo:
-                    fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                if isinstance(value, dict):
+                    fire_map = {k: {"stringValue": str(v)} for k, v in value.items()}
                     fields[key] = {"mapValue": {"fields": fire_map}}
+                else:
+                    ids = value if isinstance(value, list) else [value]
+                    mapeo = self._get_juridico_mapping_multiple(empresa_id, ids)
+                    if mapeo:
+                        fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                        fields[key] = {"mapValue": {"fields": fire_map}}
             else: 
                 fields[key] = {"stringValue": str(value)}
         
@@ -1493,10 +1502,14 @@ def api_crear_plantilla(empresa_id: str, p: PlantillaBase, user: dict = Depends(
     }}
 
     if p.documentos_adjuntos:
-        mapeo = repo._get_juridico_mapping_multiple(empresa_id, p.documentos_adjuntos)
-        if mapeo:
-            fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+        if isinstance(p.documentos_adjuntos, dict):
+            fire_map = {k: {"stringValue": str(v)} for k, v in p.documentos_adjuntos.items()}
             payload["fields"]["documentos_adjuntos"] = {"mapValue": {"fields": fire_map}}
+        else:
+            mapeo = repo._get_juridico_mapping_multiple(empresa_id, p.documentos_adjuntos)
+            if mapeo:
+                fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                payload["fields"]["documentos_adjuntos"] = {"mapValue": {"fields": fire_map}}
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     
@@ -1595,7 +1608,7 @@ def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
                 for v in fields.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])
             ],
             "html": fields.get("html", {}).get("stringValue", ""),
-            "documentos_adjuntos": list(fields.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).keys()) or [],
+            "documentos_adjuntos": {k: v.get("stringValue") for k, v in fields.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).items()},
         })
     return resultado
 
@@ -1619,7 +1632,7 @@ def api_get_detalle_plantilla(empresa_id: str, doc_id: str, user: dict = Depends
         "activo": f.get("activo", {}).get("booleanValue") is True or f.get("activo", {}).get("stringValue") == "true",
         "static": f.get("static", {}).get("booleanValue", False),
         "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
-        "documentos_adjuntos": list(f.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).keys()) or []
+        "documentos_adjuntos": {k: v.get("stringValue") for k, v in f.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).items()}
     }
 
 #endregion
@@ -1897,10 +1910,15 @@ def api_crear_plantilla_wa(empresa_id: str, p: PlantillaWABase, user: dict = Dep
     }}
 
     if p.documento_adjunto_id:
-        mapeo = repo._get_juridico_mapping_multiple(empresa_id, p.documento_adjunto_id if isinstance(p.documento_adjunto_id, list) else [p.documento_adjunto_id])
-        if mapeo:
-            fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+        if isinstance(p.documento_adjunto_id, dict):
+            fire_map = {k: {"stringValue": str(v)} for k, v in p.documento_adjunto_id.items()}
             payload["fields"]["documento_adjunto_id"] = {"mapValue": {"fields": fire_map}}
+        else:
+            ids = p.documento_adjunto_id if isinstance(p.documento_adjunto_id, list) else [p.documento_adjunto_id]
+            mapeo = repo._get_juridico_mapping_multiple(empresa_id, ids)
+            if mapeo:
+                fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                payload["fields"]["documento_adjunto_id"] = {"mapValue": {"fields": fire_map}}
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     
@@ -1970,7 +1988,7 @@ def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
             "mensaje": f.get("mensaje", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False),
             "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])],
-            "documento_adjunto_id": list(f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).keys()) or []
+            "documento_adjunto_id": {k: v.get("stringValue") for k, v in f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).items()}
         })
     return resultado
 
@@ -1993,7 +2011,7 @@ def api_get_detalle_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depe
         "mensaje": f.get("mensaje", {}).get("stringValue", ""),
         "activo": f.get("activo", {}).get("booleanValue", False),
         "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])],
-        "documento_adjunto_id": list(f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).keys()) or []
+        "documento_adjunto_id": {k: v.get("stringValue") for k, v in f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).items()}
     }
 
 #endregion

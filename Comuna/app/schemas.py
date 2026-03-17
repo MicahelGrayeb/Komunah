@@ -290,7 +290,7 @@ class PlantillaBase(BaseModel):
     activo: StrictBool
     tags_departamento: List[str] = []
     static: bool = False
-    documentos_adjuntos: Optional[List[str]] = []
+    documentos_adjuntos: Optional[Any] = {}
 
 class PlantillaUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -511,4 +511,25 @@ class JuridicoUpdate(BaseModel):
     html: Optional[str] = None
     activo: Optional[bool] = None
     tags_departamento: Optional[List[str]] = None
-    
+
+class ReporteExpedientesDetalladoResponse(BaseModel):
+    folio: Any = Field(alias="FOLIO")
+    cliente: Any = Field(alias="CLIENTE")
+    detalles: Any = Field(alias="DETALLES", default="")
+    # Cambiamos el alias aquí:
+    copropietario: int = Field(alias="NÚMERO DE COPROPIETARIO") 
+    telefono: Optional[Any] = Field(alias="TELEFONO", default="")
+    correo: Optional[Any] = Field(alias="CORREO", default="")
+    m2: Optional[Any] = Field(alias="M2")
+    proyecto: Any = Field(alias="PROYECTO")
+    cluster: Any = Field(alias="CLUSTER")
+    lote: Any = Field(alias="LOTE")
+    asesor: Any = Field(alias="ASESOR")
+    estatus_pipeline: Any = Field(alias="ESTATUS PIPELINE")
+    inicio_operaciones: Any = Field(alias="INICIO OPERACIONES")
+    plazo: Any = Field(alias="PLAZO")
+    precio_total: Any = Field(alias="PRECIO TOTAL")
+
+    class Config:
+        populate_by_name = True
+        from_attributes = True
