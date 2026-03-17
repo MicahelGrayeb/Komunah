@@ -616,11 +616,12 @@ class StaticEmailFolioUseCase:
             asunto_listo = cleaner._limpiar(f_email.get("asunto", {}).get("stringValue", ""), data_sql, nombre, email, phone)
             html_listo = cleaner._limpiar(f_email.get("html", {}).get("stringValue", ""), data_sql, nombre, email, phone)
 
-            # "to": [{"email": email, "name": nombre}],
+            
             res = self.gateway.enviar_email({
                 "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": f"Notificaciones {empresa_id.capitalize()}"},
-                "to": [{"email": "brandon.avila@techmaleon.mx", "name": nombre}],
-                "cc": [{"email": "cmezquita@techmaleon.mx"}],
+                "to": [{"email": email, "name": nombre}],
+                # "to": [{"email": "brandon.avila@techmaleon.mx", "name": nombre}],
+                # "cc": [{"email": "cmezquita@techmaleon.mx"}],
                 "subject": asunto_listo,
                 "html": html_listo,
                 "attachments": [{
