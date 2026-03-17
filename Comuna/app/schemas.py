@@ -299,8 +299,9 @@ class PlantillaUpdate(BaseModel):
     categoria: Optional[str] = None
     activo: Optional[StrictBool] = None
     tags_departamento: Optional[List[str]] = None
-    documentos_adjuntos: Optional[List[str]] = None
+    documentos_adjuntos: Optional[List[str]] = []
     #[id:nombre, id:nombre, id:nombre]
+    
 class ConfigUpdate(BaseModel):
     proyecto_activo: Optional[bool] = None
     email_enabled: Optional[bool] = None
@@ -315,7 +316,7 @@ class PlantillaWABase(BaseModel):
     variables: List[str]    # Ej: ["{cliente}", "{cl.monto}"]
     mensaje: str            # Texto para previsualizar
     activo: bool = False
-    documento_adjunto_id:Optional[List[str]] = None 
+    documento_adjunto_id: Optional[List[str]] = [] 
     #[id:nombre]
 
 class PlantillaWAUpdate(BaseModel):
@@ -326,12 +327,11 @@ class PlantillaWAUpdate(BaseModel):
     variables: Optional[List[str]] = None
     mensaje: Optional[str] = None
     activo: Optional[bool] = None
-    documento_adjunto_id: Optional[List[str]] = None
+    documento_adjunto_id: Optional[List[str]] = []
     
 class WhatsAppManualSchema(BaseModel):
     folio: str
     categoria: str
-    categoriaDocumento: Optional[str] = None
     
     
 class UsuarioUpdate(BaseModel):
@@ -353,7 +353,6 @@ class GlobalMassiveUpdate(BaseModel):
 class EmailFolioSchema(BaseModel):
     folio: str
     categoria: str
-    categoriaDocumento: Optional[str] = None
 
 class RemitenteCreate(BaseModel):
     remitente: EmailStr
