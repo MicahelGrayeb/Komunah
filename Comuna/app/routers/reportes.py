@@ -767,17 +767,17 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
     try:
         busqueda = f"%{anio}%" if anio else None
         
-        # Definimos la subconsulta de conteo filtrada para reusarla
-        # Solo cuenta registros donde NO sea el propietario principal
+        # Subconsulta corregida para no contar de más (solo copros reales)
         subquery_count = "(SELECT COUNT(*) FROM notificaciones_gestion_clientes WHERE folio = v.FOLIO AND (es_propietario_principal = 0 OR es_propietario_principal IS NULL))"
 
         query = text(f"""
-            -- 1. Fila del TITULAR
+            -- 1. Fila del TITULAR (Es Propietario Principal)
             SELECT 
                 v.FOLIO as FOLIO,
                 v.CLIENTE as CLIENTE,
                 '' as DETALLES,
                 {subquery_count} as `NÚMERO DE COPROPIETARIO`,
+                1 as `ES TITULAR`, -- Marcamos como Verdadero
                 COALESCE(v.`TELÉFONO`, '') as TELEFONO,
                 COALESCE(v.`CORREO ELECTRÓNICO`, '') as CORREO,
                 v.`METROS CUADRADOS` as M2,
@@ -795,12 +795,13 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
 
             UNION ALL
 
-            -- 2. Filas de COPROPIETARIOS
+            -- 2. Filas de COPROPIETARIOS (No son Propietarios Principales)
             SELECT 
                 v.FOLIO as FOLIO,
                 gc.client_name as CLIENTE,
                 '' as DETALLES,
                 {subquery_count} as `NÚMERO DE COPROPIETARIO`,
+                0 as `ES TITULAR`, -- Marcamos como Falso
                 COALESCE(gc.telefono, '') as TELEFONO,
                 COALESCE(gc.email, '') as CORREO,
                 v.`METROS CUADRADOS` as M2,
@@ -818,7 +819,7 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
               AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
               AND (gc.es_propietario_principal = 0 OR gc.es_propietario_principal IS NULL)
             
-            ORDER BY FOLIO ASC, TELEFONO DESC 
+            ORDER BY FOLIO ASC, `ES TITULAR` DESC 
         """)
 
         params = {
