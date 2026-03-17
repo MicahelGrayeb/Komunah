@@ -1,4 +1,4 @@
-﻿import os
+import os
 import requests
 import re
 import base64
@@ -133,36 +133,33 @@ class FirebaseRepository:
         return requests.delete(url, headers=self.headers, timeout=10)
 
     def actualizar_plantilla(self, empresa_id: str, doc_id: str, p: PlantillaUpdate):
-        """Actualiza campos específicos usando updateMask."""
+        """Actualiza campos específicos usando updateMask de manera dinámica."""
         fields = {}
         mask = []
-        if p.nombre: 
-            fields["nombre"] = {"stringValue": p.nombre}
-            mask.append("nombre")
-        if p.asunto: 
-            fields["asunto"] = {"stringValue": p.asunto}
-            mask.append("asunto")
-        if p.html: 
-            fields["html"] = {"stringValue": p.html}
-            mask.append("html")
-        if p.categoria: 
-            fields["categoria"] = {"stringValue": p.categoria}
-            mask.append("categoria")
-        if p.activo is not None: 
-            fields["activo"] = {"booleanValue": bool(p.activo)}
-            mask.append("activo")
-        if p.tags_departamento is not None:
-
-            fields["tags_departamento"] = {
-                "arrayValue": {
-                    "values": [{"stringValue": tag} for tag in p.tags_departamento]
-                }
-            }
-            mask.append("tags_departamento")
+        # exclude_unset es vital para no mandar defaults fortuitos
+        data = p.dict(exclude_unset=True)
+        for key, value in data.items():
+            if value is None: continue 
+            mask.append(key)
+            if key in ["activo", "static"]:
+                fields[key] = {"booleanValue": bool(value)}
+            elif key in ["tags_departamento"]:
+                fields[key] = {"arrayValue": {"values": [{"stringValue": str(v)} for v in value]}}
+            elif key == "documentos_adjuntos":
+                mapeo = self._get_juridico_mapping_multiple(empresa_id, value)
+                if mapeo:
+                    fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                    fields[key] = {"mapValue": {"fields": fire_map}}
+            else:
+                fields[key] = {"stringValue": str(value)}
         
-        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
-        url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}?{query_params}"
-        return requests.patch(url, json={"fields": fields}, headers=self.headers, timeout=10)   
+        if not mask: 
+            print(f"DEBUG - No hay campos para actualizar en {doc_id}")
+            return None 
+
+        params = [("updateMask.fieldPaths", m) for m in mask]
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
+        return requests.patch(url, json={"fields": fields}, params=params, headers=self.headers, timeout=10)
 
     def actualizar_configuracion(self, empresa_id: str, c: ConfigUpdate):
         fields = {}
@@ -235,16 +232,29 @@ class FirebaseRepository:
     def actualizar_plantilla_wa(self, empresa_id: str, doc_id: str, p: PlantillaWAUpdate):
         fields = {}
         mask = []
-        data = p.dict(exclude_none=True)
+        data = p.dict(exclude_unset=True)
         for key, value in data.items():
+            if value is None: continue
             mask.append(key)
-            if key == "activo": fields[key] = {"booleanValue": bool(value)}
+            if key == "activo": 
+                fields[key] = {"booleanValue": bool(value)}
             elif key == "variables": 
-                fields[key] = {"arrayValue": {"values": [{"stringValue": v} for v in value]}}
-            else: fields[key] = {"stringValue": str(value)}
-        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
-        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}?{query_params}"
-        return requests.patch(url, json={"fields": fields}, headers=self.headers, timeout=10)
+                fields[key] = {"arrayValue": {"values": [{"stringValue": str(v)} for v in value]}}
+            elif key == "documento_adjunto_id":
+                mapeo = self._get_juridico_mapping_multiple(empresa_id, value if isinstance(value, list) else [value])
+                if mapeo:
+                    fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                    fields[key] = {"mapValue": {"fields": fire_map}}
+            else: 
+                fields[key] = {"stringValue": str(value)}
+        
+        if not mask:
+            print(f"DEBUG - No hay campos para actualizar en {doc_id} (WA)")
+            return None
+
+        params = [("updateMask.fieldPaths", m) for m in mask]
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
+        return requests.patch(url, json={"fields": fields}, params=params, headers=self.headers, timeout=10)
     
     def registrar_log_falla(self, empresa_id: str, mensaje: str, contexto: str):
         """Almacena fallas agrupadas en empresas/{id}/logs_fallas."""
@@ -363,6 +373,23 @@ class FirebaseRepository:
         query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}?{query_params}"
         return requests.patch(url, json={"fields": fields}, headers=self.headers, timeout=10)
+
+    def _get_juridico_mapping_single(self, empresa_id: str, doc_id: str):
+        """Busca un solo ID en jurídico y devuelve {ID: Nombre}."""
+        if not doc_id or not isinstance(doc_id, str): return None
+        doc = self.obtener_un_doc_completo_juridico(empresa_id, doc_id)
+        if not doc: return {doc_id: "N/A"}
+        nombre = doc.get("fields", {}).get("nombre", {}).get("stringValue", "N/A")
+        return {doc_id: nombre}
+
+    def _get_juridico_mapping_multiple(self, empresa_id: str, ids: List[str]):
+        """Busca varios IDs y devuelve un diccionario {ID: Nombre}."""
+        resultado = {}
+        for doc_id in (ids or []):
+            mapping = self._get_juridico_mapping_single(empresa_id, doc_id)
+            if mapping:
+                resultado.update(mapping)
+        return resultado if resultado else None
 
 class NotificationGateway:
     """Maneja la comunicación pura con MailerSend."""
@@ -1395,6 +1422,12 @@ def api_crear_plantilla(empresa_id: str, p: PlantillaBase, user: dict = Depends(
             "arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}
         }
     }}
+
+    if p.documentos_adjuntos:
+        mapeo = repo._get_juridico_mapping_multiple(empresa_id, p.documentos_adjuntos)
+        if mapeo:
+            fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+            payload["fields"]["documentos_adjuntos"] = {"mapValue": {"fields": fire_map}}
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     
@@ -1415,7 +1448,7 @@ def api_actualizar_plantilla(empresa_id: str, doc_id: str, datos: PlantillaUpdat
     res = repo.actualizar_plantilla(empresa_id, doc_id, datos)
     
     if res is None:
-        raise HTTPException(status_code=400, detail="Nada que actualizar.")
+        return {"status": "actualizada", "id": doc_id, "mensaje": "No se detectaron cambios"}
     
     if res.status_code == 200 and datos.activo is True:
         categoria_real = datos.categoria
@@ -1493,6 +1526,7 @@ def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
                 for v in fields.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])
             ],
             "html": fields.get("html", {}).get("stringValue", ""),
+            "documentos_adjuntos": list(fields.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).keys()) or [],
         })
     return resultado
 
@@ -1515,7 +1549,8 @@ def api_get_detalle_plantilla(empresa_id: str, doc_id: str, user: dict = Depends
         "categoria": f.get("categoria", {}).get("stringValue", ""),
         "activo": f.get("activo", {}).get("booleanValue") is True or f.get("activo", {}).get("stringValue") == "true",
         "static": f.get("static", {}).get("booleanValue", False),
-        "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])]
+        "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
+        "documentos_adjuntos": list(f.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).keys()) or []
     }
 
 #endregion
@@ -1725,6 +1760,12 @@ def api_crear_plantilla_wa(empresa_id: str, p: PlantillaWABase, user: dict = Dep
         "activo": {"booleanValue": bool(p.activo)},
         "variables": {"arrayValue": {"values": [{"stringValue": v} for v in p.variables]}}
     }}
+
+    if p.documento_adjunto_id:
+        mapeo = repo._get_juridico_mapping_multiple(empresa_id, p.documento_adjunto_id if isinstance(p.documento_adjunto_id, list) else [p.documento_adjunto_id])
+        if mapeo:
+            fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+            payload["fields"]["documento_adjunto_id"] = {"mapValue": {"fields": fire_map}}
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     
@@ -1744,7 +1785,9 @@ def api_patch_wa(empresa_id: str, doc_id: str, datos: PlantillaWAUpdate, user: d
     
     res = repo.actualizar_plantilla_wa(empresa_id, doc_id, datos)
     
-  
+    if res is None:
+        return {"status": "actualizada", "id": doc_id, "mensaje": "Sin cambios realizados"}
+
     if res.status_code == 200 and datos.activo is True:
         doc_actual = repo.obtener_un_doc_completo_wa(empresa_id, doc_id)
         if doc_actual:
@@ -1791,7 +1834,8 @@ def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
             "lenguaje": f.get("lenguaje", {}).get("stringValue", ""),
             "mensaje": f.get("mensaje", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False),
-            "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])]
+            "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])],
+            "documento_adjunto_id": list(f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).keys()) or []
         })
     return resultado
 
@@ -1813,7 +1857,8 @@ def api_get_detalle_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depe
         "lenguaje": f.get("lenguaje", {}).get("stringValue", ""),
         "mensaje": f.get("mensaje", {}).get("stringValue", ""),
         "activo": f.get("activo", {}).get("booleanValue", False),
-        "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])]
+        "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])],
+        "documento_adjunto_id": list(f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).keys()) or []
     }
 
 #endregion
