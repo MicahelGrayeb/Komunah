@@ -1,4 +1,4 @@
-import os
+﻿import os
 import requests
 import re
 import base64
@@ -648,7 +648,7 @@ class NotificationUseCase:
         self.repo = repo
         self.gateway = gateway
 
-    def ejecutar_barrido_automatico(self, empresa_id: str, dias: int, categoria: str, db: Session, tipo: str = "normal", simular: bool = False):
+    async def ejecutar_barrido_automatico(self, empresa_id: str, dias: int, categoria: str, db: Session, tipo: str = "normal", simular: bool = False):
         pack_empresa = PROVIDERS.get(empresa_id, {})
         extraer_datos = pack_empresa.get("get")
         if not extraer_datos:
@@ -725,10 +725,10 @@ class NotificationUseCase:
             raise
         
         reporte_detallado = []
+        pdf_service = GenerarPDFUseCase(self.repo)
 
         for row in registros:
             data_sql = extraer_datos(row, db)
-            
 
             if not data_sql:
                 self.repo.registrar_log_falla(empresa_id, f"El folio {row} no trajo info de SQL", "DATOS_SQL")
@@ -738,7 +738,47 @@ class NotificationUseCase:
                 motivo = data_sql.get("{sys.bloqueo_motivo}", "Bloqueo por configuración de Etapa/Proyecto")
                 self.repo.registrar_log_falla(empresa_id, f"Folio {row} saltado: {motivo}", "BLOQUEO_ADMINISTRATIVO")
                 continue
-            
+
+            # --- GENERACIÓN DE PDFs POR FOLIO (una sola vez por folio, no por integrante) ---
+
+            # PDFs para EMAIL: si la plantilla tiene documentos_adjuntos, los generamos dinámicamente
+            adjuntos_email_dinamicos = []
+            if p_email and sistema_email_ok:
+                hijos_email = p_email.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {})
+                if hijos_email:
+                    for doc_id in hijos_email.keys():
+                        try:
+                            pdf_gen = await pdf_service.generar_pdf_desde_plantilla(empresa_id, doc_id, str(row), db)
+                            adjuntos_email_dinamicos.append({"content": pdf_gen["content"], "filename": pdf_gen["filename"]})
+                        except Exception:
+                            self.repo.registrar_log_falla(empresa_id, f"Folio {row}: falló generación de PDF adjunto '{doc_id}' para email.", "PDF_GEN")
+                            continue
+                else:
+                    # Fallback: adjuntos por URL estáticos (comportamiento anterior)
+                    adjuntos_raw = p_email.get("adjuntos_url", {}).get("arrayValue", {}).get("values", [])
+                    for adj in adjuntos_raw:
+                        info_archivo = self._descargar_a_base64(adj.get("stringValue"))
+                        if info_archivo:
+                            adjuntos_email_dinamicos.append(info_archivo)
+
+            # PDF para WHATSAPP: si la plantilla tiene documento_adjunto_id, lo generamos y subimos al bucket
+            link_wa_doc = None
+            nom_wa_doc = None
+            if p_wa_raw and sistema_wa_ok:
+                hijos_wa = p_wa_raw["fields"].get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {})
+                if hijos_wa:
+                    pid_wa = list(hijos_wa.keys())[0]
+                    try:
+                        pdf_wa = await pdf_service.generar_pdf_desde_plantilla(empresa_id, pid_wa, str(row), db)
+                        link_wa_doc = GenerarPDFUseCase._subir_pdf_a_bucket(
+                            base64.b64decode(pdf_wa["content"]),
+                            f"Komunah/AutoWA/{row}",
+                            pdf_wa["filename"]
+                        )
+                        nom_wa_doc = pdf_wa["filename"]
+                    except Exception:
+                        self.repo.registrar_log_falla(empresa_id, f"Folio {row}: falló generación de PDF para WhatsApp.", "PDF_GEN")
+
             for i in range(1, 7):
                 nombre = data_sql.get(f"{{c{i}.client_name}}")
                 if not nombre: continue
@@ -749,7 +789,6 @@ class NotificationUseCase:
                 acepta_wa_lote = str(data_sql.get(f"{{g{i}.permite_whatsapp_lote}}")) in ["1", "True"]
     
                 resultado_envio = {"cliente": nombre, "folio": row, "email": "n/a", "wa": "n/a"}
-                
                         
                 if not sistema_email_ok:
                     self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Switch Global OFF.", "GLOBAL_OFF")
@@ -764,30 +803,21 @@ class NotificationUseCase:
                     self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: No tiene correo registrado.", "DATA_MISSING")
                     resultado_envio["email"] = "NO_DATA"
                 else:
-                    lista_adjuntos = []
-                    adjuntos_raw = p_email.get("adjuntos_url", {}).get("arrayValue", {}).get("values", [])
-                    for adj in adjuntos_raw:
-                        url_archivo = adj.get("stringValue")
-                        info_archivo = self._descargar_a_base64(url_archivo)
-                        if info_archivo:
-                            lista_adjuntos.append(info_archivo)
-                        
                     if simular:
-                        res_status = "SIMULADO_OK"
+                        res_status = f"SIMULADO_OK ({len(adjuntos_email_dinamicos)} PDFs listos)"
                     else:
                         res_mail = self.gateway.enviar_email({
                             "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": f"Notificaciones {empresa_id}"},
                             "to": [{"email": email, "name": nombre}],
                             "subject": self._limpiar(p_email["asunto"]["stringValue"], data_sql, nombre, email, phone),
                             "html": self._limpiar(p_email["html"]["stringValue"], data_sql, nombre, email, phone),
-                            "attachments": lista_adjuntos
+                            "attachments": adjuntos_email_dinamicos
                         })
                         if res_mail.status_code not in [200, 201, 202]:
                             self.repo.registrar_log_falla(empresa_id, f"Email falló ({res_mail.status_code}) para {email}", "MAIL_PROVIDER")
                         res_status = f"Status: {res_mail.status_code} | {res_mail.text[:100]}"
                     
                     resultado_envio["email"] = res_status
-
 
                 if not sistema_wa_ok:
                     self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Switch Global OFF en Firebase.", "GLOBAL_OFF")
@@ -802,7 +832,6 @@ class NotificationUseCase:
                     self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Falta número de teléfono.", "DATA_MISSING")
                     resultado_envio["wa"] = "NO_PHONE"
                 else:
-
                     parametros_dinamicos = []
                     for var_nombre in p_wa["variables"]:
                         if var_nombre in ["{cl.cliente}", "{cliente}", "{v.cliente}"]:
@@ -821,9 +850,14 @@ class NotificationUseCase:
                         texto_completo = texto_completo.replace(v_nombre, f"{{{{{idx}}}}}")
 
                     if simular:
-                        res_wa_status = "SIMULADO_OK"
+                        res_wa_status = f"SIMULADO_OK (PDF: {nom_wa_doc if nom_wa_doc else 'Sin adjunto'})"
                     else:
-                        res_wa = self.gateway.enviar_whatsapp(num_wa, p_wa["id_respond"], p_wa["lenguaje"], parametros_dinamicos, texto_cuerpo=texto_completo)
+                        res_wa = self.gateway.enviar_whatsapp(
+                            num_wa, p_wa["id_respond"], p_wa["lenguaje"], parametros_dinamicos,
+                            texto_cuerpo=texto_completo,
+                            header_document_link=link_wa_doc,
+                            header_document_filename=nom_wa_doc
+                        )
                         if res_wa.status_code not in [200, 201, 202]:
                             self.repo.registrar_log_falla(empresa_id, f"WhatsApp falló ({res_wa.status_code}) para {phone}", "WA_PROVIDER")
                         res_wa_status = f"Status: {res_wa.status_code}"
@@ -1660,7 +1694,7 @@ async def api_enviar_ambos_manual(empresa_id: str, datos: EmailFolioSchema, simu
     return await use_case.ejecutar_envio_dual(empresa_id, datos_wa, datos, db, simular=simular)
 
 @router.post("/auto-notificar/{empresa_id}", tags=["Motor Notificaciones"])
-def api_disparar_barrido(
+async def api_disparar_barrido(
     empresa_id: str, 
     dias: int, 
     categoria: str,  
@@ -1669,11 +1703,16 @@ def api_disparar_barrido(
     db: Session = Depends(get_db),
     user: dict = Depends(es_usuario)
 ):
-    """Barrido Automático Genérico: Email (Firebase) + WhatsApp (Respond.io)."""
+    """
+    Barrido Automático Inteligente:
+    1. Busca folios por fecha.
+    2. Genera los PDFs vinculados dinámicamente desde Firebase (documentos_adjuntos / documento_adjunto_id).
+    3. Simula o Envía según el parámetro 'simular'.
+    """
     repo = FirebaseRepository()
     gateway = NotificationGateway()
     use_case = NotificationUseCase(repo, gateway)
-    return use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo, simular=simular)
+    return await use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo, simular=simular)
 
 #endregion
 

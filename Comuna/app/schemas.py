@@ -332,6 +332,7 @@ class WhatsAppManualSchema(BaseModel):
     folio: str
     categoria: str
     categoriaDocumento: Optional[str] = None
+    simular: bool = False
     
     
 class UsuarioUpdate(BaseModel):
@@ -354,6 +355,7 @@ class EmailFolioSchema(BaseModel):
     folio: str
     categoria: str
     categoriaDocumento: Optional[str] = None
+    simular: bool = False
 
 class RemitenteCreate(BaseModel):
     remitente: EmailStr
