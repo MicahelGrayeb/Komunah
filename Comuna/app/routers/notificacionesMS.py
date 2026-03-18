@@ -1,4 +1,4 @@
-﻿import os
+import os
 import requests
 import re
 import base64
@@ -1804,10 +1804,13 @@ def api_consultar_documentos_folio(
     # Extraer el propietario principal
     propietario = data_sql.get("{cl.cliente}") or (nombres_clientes[0] if nombres_clientes else "Cliente")
 
+    # Filtrar al propietario de la lista de clientes para evitar redundancia
+    clientes_restantes = [c for c in nombres_clientes if c != propietario]
+
     return {
         "folio": folio,
         "propietario": propietario,
-        "clientes": nombres_clientes,
+        "clientes": clientes_restantes,
         "categorias": resultado_categorias,
         "total_documentos": total_documentos
     }
