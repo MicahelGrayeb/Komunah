@@ -1714,6 +1714,104 @@ async def api_disparar_barrido(
     use_case = NotificationUseCase(repo, gateway)
     return await use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo, simular=simular)
 
+@router.get("/documentos-folio/{empresa_id}/{folio}", tags=["Consulta Documentos"])
+def api_consultar_documentos_folio(
+    empresa_id: str,
+    folio: str,
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
+):
+    """
+    Consulta los documentos generados en el bucket de GCS para todos los clientes de un folio.
+    Devuelve archivos agrupados por categoría con links de descarga (signed URLs, 1h).
+    Busca en: Komunah/PlantillasMovil/Categorias/{categoria}/{nombre_cliente}/
+    """
+    pack_empresa = PROVIDERS.get(empresa_id, {})
+    extraer_datos = pack_empresa.get("get")
+    if not extraer_datos:
+        raise HTTPException(status_code=400, detail=f"Empresa '{empresa_id}' no configurada.")
+
+    data_sql = extraer_datos(folio, db)
+    if not data_sql:
+        raise HTTPException(status_code=404, detail=f"El folio {folio} no existe o no tiene datos en SQL.")
+
+    # Extraer nombres de clientes del folio (c1 a c6)
+    nombres_clientes = []
+    for i in range(1, 7):
+        nombre = data_sql.get(f"{{c{i}.client_name}}")
+        if nombre and str(nombre).strip() not in ["", "None", "NULL"]:
+            nombres_clientes.append(str(nombre).strip())
+
+    if not nombres_clientes:
+        raise HTTPException(status_code=404, detail=f"El folio {folio} no tiene clientes asociados.")
+
+    # Conectar con GCS (fallback para diferentes formas de levantar el contenedor)
+    cred_path = os.getenv("STORAGE_CREDENTIALS_PATH") or "/app/serviceAccountKeySTORAGE.json"
+    if not os.path.exists(cred_path):
+        # Intentar ruta relativa (cuando se corre fuera de Docker)
+        cred_path = "serviceAccountKeySTORAGE.json"
+    if not os.path.exists(cred_path):
+        raise HTTPException(status_code=500, detail="No se encontró el archivo de credenciales de Storage.")
+
+    storage_client = storage.Client.from_service_account_json(cred_path)
+    bucket = storage_client.bucket(BUCKET_NAME)
+
+    base_prefix = "Komunah/PlantillasMovil/Categorias/"
+
+    # 1. Listar todas las categorías disponibles
+    categorias_iter = bucket.list_blobs(prefix=base_prefix, delimiter="/")
+    list(categorias_iter)  # forzar iteración para llenar prefixes
+    categorias = [p.replace(base_prefix, "").rstrip("/") for p in categorias_iter.prefixes]
+
+    resultado_categorias = {}
+    total_documentos = 0
+
+    # 2. Para cada categoría, buscar carpetas de los clientes del folio
+    for cat in categorias:
+        for nombre_cliente in nombres_clientes:
+            prefix_cliente = f"{base_prefix}{cat}/{nombre_cliente}/"
+            blobs = list(bucket.list_blobs(prefix=prefix_cliente))
+
+            if not blobs:
+                continue
+
+            archivos = []
+            for blob in blobs:
+                # Saltar "carpetas" vacías
+                if blob.name.endswith("/"):
+                    continue
+
+                nombre_archivo = blob.name.split("/")[-1]
+                signed_url = blob.generate_signed_url(
+                    version="v4",
+                    expiration=timedelta(hours=1),
+                    method="GET"
+                )
+
+                archivos.append({
+                    "nombre": nombre_archivo,
+                    "tamaño_kb": round((blob.size or 0) / 1024, 1),
+                    "fecha_creacion": blob.time_created.isoformat() if blob.time_created else None,
+                    "url_descarga": signed_url
+                })
+
+            if archivos:
+                if cat not in resultado_categorias:
+                    resultado_categorias[cat] = {}
+                resultado_categorias[cat][nombre_cliente] = archivos
+                total_documentos += len(archivos)
+
+    # Extraer el propietario principal
+    propietario = data_sql.get("{cl.cliente}") or (nombres_clientes[0] if nombres_clientes else "Cliente")
+
+    return {
+        "folio": folio,
+        "propietario": propietario,
+        "clientes": nombres_clientes,
+        "categorias": resultado_categorias,
+        "total_documentos": total_documentos
+    }
+
 #endregion
 
 #region CRUD Plantillas para WhatsApp
@@ -2009,9 +2107,7 @@ def api_marcar_falla_como_leida(empresa_id: str, log_id: str, user: dict = Depen
     requests.patch(url, json={"fields": {"leido": {"booleanValue": True}}}, headers=repo.headers)
     return {"status": "ok", "msj": "Notificación apagada"}
 
-#endregion
 
-#region Endpoint de Envío Masivo por Cluster
 
 EJEMPLO_FINAL = {
     "clusters": ["Planta Baja", "Etapa 1"],

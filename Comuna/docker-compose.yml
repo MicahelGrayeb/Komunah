@@ -52,6 +52,7 @@ services:
       - DATABASE_URL=mysql+mysqlconnector://root:root@db:3306/comunah_replica_db
     volumes:
       - ./serviceAccountKey.json:/app/serviceAccountKey.json
+      - ./serviceAccountKeySTORAGE.json:/app/serviceAccountKeySTORAGE.json
 
 volumes:
   db_data:
