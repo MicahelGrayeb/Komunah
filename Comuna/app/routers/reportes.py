@@ -766,9 +766,17 @@ def get_escriturados_juridico(
 def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     try:
         busqueda = f"%{anio}%" if anio else None
-        
-        # Subconsulta corregida para no contar de más (solo copros reales)
-        subquery_count = "(SELECT COUNT(*) FROM notificaciones_gestion_clientes WHERE folio = v.FOLIO AND (es_propietario_principal = 0 OR es_propietario_principal IS NULL))"
+
+        # Subconsulta: solo copropietarios reales, excluyendo al titular por flag y por nombre
+        subquery_count = """
+        (
+            SELECT COUNT(*)
+            FROM notificaciones_gestion_clientes ngc
+            WHERE ngc.folio = v.FOLIO
+                AND (ngc.es_propietario_principal = 0 OR ngc.es_propietario_principal IS NULL)
+                AND TRIM(LOWER(COALESCE(ngc.client_name, ''))) <> TRIM(LOWER(COALESCE(v.CLIENTE, '')))
+        )
+        """
 
         query = text(f"""
             -- 1. Fila del TITULAR (Es Propietario Principal)
@@ -791,7 +799,7 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
                 v.`PRECIO FINAL` as `PRECIO TOTAL`
             FROM ventas v
             WHERE (:anio_val IS NULL OR v.`FECHA DE INICIO DE OPERACIÓN` LIKE :busqueda_anio)
-              AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
+                AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
 
             UNION ALL
 
@@ -818,6 +826,7 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
             WHERE (:anio_val_2 IS NULL OR v.`FECHA DE INICIO DE OPERACIÓN` LIKE :busqueda_anio_2)
               AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
               AND (gc.es_propietario_principal = 0 OR gc.es_propietario_principal IS NULL)
+                            AND TRIM(LOWER(COALESCE(gc.client_name, ''))) <> TRIM(LOWER(COALESCE(v.CLIENTE, '')))
             
             ORDER BY FOLIO ASC, `ES TITULAR` DESC 
         """)

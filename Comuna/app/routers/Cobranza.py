@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
 from google.cloud import storage
 from datetime import date, timedelta
+from typing import Optional
 
 load_dotenv()
 
@@ -30,6 +31,7 @@ class CobranzaStatusUpdate(BaseModel):
     id_empresa: str
     id: str
     status: str
+    observacionesPago: Optional[str] = None
 
 
 class StatusPagoUpdate(BaseModel):
@@ -87,10 +89,18 @@ class CobranzaService:
             raise HTTPException(status_code=500, detail="Error al obtener comprobante")
         return resp.json()
 
-    def actualizar_status(self, comprobante_id: str, nuevo_status: str):
+    def actualizar_status(self, comprobante_id: str, nuevo_status: str, observaciones_pago: Optional[str] = None):
         self._validar_config()
-        url = f"{self.base_url}/ComprobantePago/{comprobante_id}?updateMask.fieldPaths=Status"
-        body = {"fields": {"Status": {"stringValue": nuevo_status}}}
+        mask_paths = ["Status"]
+        body_fields = {"Status": {"stringValue": nuevo_status}}
+
+        if observaciones_pago is not None:
+            mask_paths.append("observacionesPago")
+            body_fields["observacionesPago"] = {"stringValue": str(observaciones_pago)}
+
+        mask_query = "&".join([f"updateMask.fieldPaths={m}" for m in mask_paths])
+        url = f"{self.base_url}/ComprobantePago/{comprobante_id}?{mask_query}"
+        body = {"fields": body_fields}
         resp = requests.patch(url, json=body, headers=self.headers, timeout=10)
 
         if resp.status_code == 404:
@@ -171,7 +181,7 @@ class CobranzaService:
 
         return blob.generate_signed_url(version="v4", expiration=timedelta(hours=1), method="GET")
 
-    def generar_y_subir_pdf(self, id_empresa: str, comprobante_id: str, db: Session):
+    def generar_y_subir_pdf(self, id_empresa: str, comprobante_id: str, db: Session, status_pago: str):
         comprobante_doc = self.obtener_comprobante(comprobante_id)
         comprobante_fields = comprobante_doc.get("fields", {})
         comprobante_limpio = {k: self._clean_firestore_value(v) for k, v in comprobante_fields.items()}
@@ -183,7 +193,7 @@ class CobranzaService:
         plantilla = self.obtener_plantilla_juridico(id_empresa, "KO-0009")
         p_fields = plantilla.get("fields", {})
         html_raw = p_fields.get("html", {}).get("stringValue", "")
-        categoria = p_fields.get("categoria", {}).get("stringValue", "general")
+        categoria = p_fields.get("categoria", {}).get("stringValue", "")
         if not html_raw:
             raise HTTPException(status_code=400, detail="La plantilla KO-0009 no contiene html")
 
@@ -194,7 +204,6 @@ class CobranzaService:
         html_final = self.reemplazar_etiquetas(html_raw, data_sql)
         pdf_bytes = self.generar_pdf_bytes(html_final)
 
-        parcialidad = self.obtener_parcialidad_por_folio(folio, db)
         cliente = (
             data_sql.get("{c1.client_name}")
             or data_sql.get("{cliente}")
@@ -212,14 +221,23 @@ class CobranzaService:
         fecha_hoy = date.today().isoformat()
         nombre_pdf = (
             f"{self._normalizar_fragmento(folio, 'SinFolio')}_"
-            f"{self._normalizar_fragmento(parcialidad, '0')}_"
             f"{self._normalizar_fragmento(lote, 'SinLote')}_"
             f"{fecha_hoy}.pdf"
         )
+
+        status_normalizado = str(status_pago or "").strip().lower()
+        if status_normalizado == "aceptado":
+            carpeta_status = "Aceptados"
+        elif status_normalizado == "rechazado":
+            carpeta_status = "Rechazados"
+        else:
+            raise HTTPException(status_code=400, detail="Status inválido. Use 'Aceptado' o 'Rechazado'.")
+
         ruta = (
             f"Komunah/PlantillasMovil/Categorias/"
-            f"{self._normalizar_fragmento(categoria, 'general')}/"
-            f"{self._normalizar_fragmento(cliente, 'Cliente')}"
+            f"{self._normalizar_fragmento(categoria, 'categoria')}/"
+            f"{self._normalizar_fragmento(cliente, 'Cliente')}/"
+            f"{carpeta_status}"
         )
 
         url_descarga = self.subir_a_bucket(pdf_bytes, ruta, nombre_pdf)
@@ -227,7 +245,6 @@ class CobranzaService:
             "folio": folio,
             "categoria": categoria,
             "cliente": cliente,
-            "parcialidad": parcialidad,
             "lote": lote,
             "ruta": ruta,
             "filename": nombre_pdf,
@@ -236,7 +253,7 @@ class CobranzaService:
 
 
 @router.get("/comprobantes")
-def obtener_comprobantes():
+def obtener_comprobantes(user: dict = Depends(es_usuario)):
     """Obtiene y limpia todos los documentos de la colección ComprobantePago en un solo paso."""
     try:
         url = f"{_base_url}/ComprobantePago"
@@ -275,7 +292,7 @@ def obtener_comprobantes():
 
 
 @router.post("/actualizarStatusPagos")
-def actualizar_status_pagos(payload: CobranzaStatusUpdate, db: Session = Depends(get_db)):
+def actualizar_status_pagos(payload: CobranzaStatusUpdate, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     """Actualiza status de comprobante y genera/sube PDF jurídico KO-0009."""
     try:
         service = CobranzaService()
@@ -283,15 +300,19 @@ def actualizar_status_pagos(payload: CobranzaStatusUpdate, db: Session = Depends
         nuevo_status = payload.status.strip()
         if not nuevo_status:
             raise HTTPException(status_code=400, detail="El campo status es obligatorio")
+        if nuevo_status.lower() not in ["aceptado", "rechazado"]:
+            raise HTTPException(status_code=400, detail="Status inválido. Use 'Aceptado' o 'Rechazado'.")
 
-        service.actualizar_status(payload.id, nuevo_status)
-        pdf_info = service.generar_y_subir_pdf(payload.id_empresa, payload.id, db)
+        observaciones = payload.observacionesPago.strip() if payload.observacionesPago is not None else None
+        service.actualizar_status(payload.id, nuevo_status, observaciones)
+        pdf_info = service.generar_y_subir_pdf(payload.id_empresa, payload.id, db, nuevo_status)
 
         return {
             "status": "success",
             "id": payload.id,
             "id_empresa": payload.id_empresa,
             "nuevo_status": nuevo_status,
+            "observacionesPago": observaciones,
             "pdf": pdf_info,
         }
     except HTTPException:
