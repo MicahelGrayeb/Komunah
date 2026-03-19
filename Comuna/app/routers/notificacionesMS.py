@@ -317,21 +317,24 @@ class FirebaseRepository:
             return defaults
     
     def obtener_config_recordatorios_seguro(self, empresa_id: str):
-        """Retorna None si Firebase falla, para que el sync job no reprograme con defaults."""
+        """Retorna None si Firebase falla después de 2 intentos."""
+        import time as _time
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
-        try:
-            resp = requests.get(url, headers=self.headers, timeout=5)
-            if resp.status_code != 200:
-                return None
-            f = resp.json().get("fields", {})
-            return {
-                "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
-                "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
-                "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
-                "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
-            }
-        except Exception:
-            return None
+        for intento in range(2):
+            try:
+                resp = requests.get(url, headers=self.headers, timeout=10)
+                if resp.status_code == 200:
+                    f = resp.json().get("fields", {})
+                    return {
+                        "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
+                        "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
+                        "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
+                        "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
+                    }
+            except Exception:
+                if intento == 0:
+                    _time.sleep(3)
+        return None
     
     def actualizar_config_recordatorios(self, empresa_id: str, datos: dict):
         """Recibe un diccionario y parchea solo los campos presentes en él."""
