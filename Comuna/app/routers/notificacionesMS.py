@@ -643,38 +643,19 @@ class StaticEmailFolioUseCase:
 
         reporte = []
 
-        # --- AUTO-GENERACIÓN DE ADJUNTOS ---
-        adjuntos_finales, nombres_adjuntos = [], []
-        docs_vinculados = f_email.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {})
-        for doc_id in docs_vinculados.keys():
-            try:
-                pdf_res = await pdf_service.generar_pdf_desde_plantilla(empresa_id, doc_id, str(datos.folio), db)
-                adjuntos_finales.append({"content": pdf_res["content"], "filename": pdf_res["filename"]})
-                nombres_adjuntos.append(pdf_res["filename"])
-            except: continue
-
-        reporte = []
         for i in range(1, 7):
             nombre = data_sql.get(f"{{c{i}.client_name}}")
             email = data_sql.get(f"{{g{i}.email}}")
-            if not nombre or not email: continue
+            phone = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "").replace("-", "")
 
-            if not simular:
-                cleaner = NotificationUseCase(self.repo, self.gateway)
-                res = self.gateway.enviar_email({
-                    "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": "Notificaciones"},
-                    "to": [{"email": email, "name": nombre}],
-                    "subject": cleaner._limpiar(f_email["asunto"]["stringValue"], data_sql, nombre, email, ""),
-                    "html": cleaner._limpiar(f_email["html"]["stringValue"], data_sql, nombre, email, ""),
-                    "attachments": adjuntos_finales
-                })
-                status = res.status_code
-            else:
-                status = "SIMULADO_OK"
+            if not nombre or not email:
+                continue
 
-            reporte.append({"cliente": nombre, "email": email, "status": status})
+            cleaner = NotificationUseCase(self.repo, self.gateway)
+            asunto_listo = cleaner._limpiar(f_email.get("asunto", {}).get("stringValue", ""), data_sql, nombre, email, phone)
+            html_listo = cleaner._limpiar(f_email.get("html", {}).get("stringValue", ""), data_sql, nombre, email, phone)
 
-            
+
             res = self.gateway.enviar_email({
                 "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": f"Notificaciones {empresa_id.capitalize()}"},
                 "to": [{"email": email, "name": nombre}],
