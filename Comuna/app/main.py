@@ -59,20 +59,22 @@ if not firebase_admin._apps:
 def sincronizar_horario_cron(scheduler_instancia):
     """
     Revisa Firebase cada 60 segundos. 
-    Compara la hora actual del Job con la de Firebase usando strings.
+    Solo reprograma si Firebase responde correctamente (ignora defaults).
     """
     def verificar_y_actualizar():
         try:
             repo = FirebaseRepository()
-            config = repo.obtener_config_recordatorios("komunah")
+            config = repo.obtener_config_recordatorios_seguro("komunah")
+            
+            # Si Firebase no respondió bien, NO reprogramar
+            if config is None:
+                return
             
             nueva_h = int(config.get("hora", 10))
             nueva_m = int(config.get("minuto", 0))
 
             job = scheduler_instancia.get_job(JOB_ID_BARRIDO)
             if job:
-                # Comparamos como texto para evitar el error de 'BaseField'
-                # fields[5] es la hora, fields[6] es el minuto
                 hora_actual_str = str(job.trigger.fields[5])
                 min_actual_str = str(job.trigger.fields[6])
 
@@ -88,7 +90,6 @@ def sincronizar_horario_cron(scheduler_instancia):
         except Exception as e:
             logger.error(f"❌ Error en sincronización: {e}")
 
-    # Mantenemos el intervalo de 1 minuto
     scheduler_instancia.add_job(verificar_y_actualizar, 'interval', minutes=1, id="sync_config_job")
 
         
