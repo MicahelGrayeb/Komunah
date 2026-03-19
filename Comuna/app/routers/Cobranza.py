@@ -112,7 +112,7 @@ class CobranzaService:
             logger.exception(f"Firebase error {resp.status_code}: {resp.text}")
             raise HTTPException(status_code=500, detail="Error al actualizar status")
 
-    def obtener_plantilla_juridico(self, id_empresa: str, plantilla_id: str = "KO-0009"):
+    def obtener_plantilla_juridico(self, id_empresa: str, plantilla_id: str = "KO-0005"):
         self._validar_config()
         url = f"{self.base_url}/empresas/{id_empresa}/plantillas_juridico/{plantilla_id}"
         resp = requests.get(url, headers=self.headers, timeout=10)
@@ -166,13 +166,28 @@ class CobranzaService:
             browser.close()
         return pdf_bytes
 
-    def subir_a_bucket(self, pdf_bytes: bytes, ruta_carpeta: str, nombre_archivo: str) -> str:
+    def _obtener_bucket(self):
         cred_path = os.getenv("STORAGE_CREDENTIALS_PATH")
         if not cred_path:
             raise HTTPException(status_code=500, detail="Falta STORAGE_CREDENTIALS_PATH")
-
         storage_client = storage.Client.from_service_account_json(cred_path)
-        bucket = storage_client.bucket(_bucket_name)
+        return storage_client.bucket(_bucket_name)
+
+    def _obtener_siguiente_id_archivo(self, ruta_carpeta: str) -> str:
+        bucket = self._obtener_bucket()
+        prefix = f"{ruta_carpeta}/"
+        max_id = 0
+
+        for blob in bucket.list_blobs(prefix=prefix):
+            nombre = blob.name.rsplit("/", 1)[-1]
+            match = re.match(r"^(\d+)_", nombre)
+            if match:
+                max_id = max(max_id, int(match.group(1)))
+
+        return f"{max_id + 1:02d}"
+
+    def subir_a_bucket(self, pdf_bytes: bytes, ruta_carpeta: str, nombre_archivo: str) -> str:
+        bucket = self._obtener_bucket()
         ruta_completa = f"{ruta_carpeta}/{nombre_archivo}"
         blob = bucket.blob(ruta_completa)
 
@@ -190,12 +205,12 @@ class CobranzaService:
         if not folio:
             raise HTTPException(status_code=400, detail="El comprobante no contiene folio")
 
-        plantilla = self.obtener_plantilla_juridico(id_empresa, "KO-0009")
+        plantilla = self.obtener_plantilla_juridico(id_empresa, "KO-0005")
         p_fields = plantilla.get("fields", {})
         html_raw = p_fields.get("html", {}).get("stringValue", "")
         categoria = p_fields.get("categoria", {}).get("stringValue", "")
         if not html_raw:
-            raise HTTPException(status_code=400, detail="La plantilla KO-0009 no contiene html")
+            raise HTTPException(status_code=400, detail="La plantilla KO-0005 no contiene html")
 
         data_sql = get_komunah_data(folio, db)
         if not data_sql:
@@ -219,11 +234,6 @@ class CobranzaService:
         )
 
         fecha_hoy = date.today().isoformat()
-        nombre_pdf = (
-            f"{self._normalizar_fragmento(folio, 'SinFolio')}_"
-            f"{self._normalizar_fragmento(lote, 'SinLote')}_"
-            f"{fecha_hoy}.pdf"
-        )
 
         status_normalizado = str(status_pago or "").strip().lower()
         if status_normalizado == "aceptado":
@@ -238,6 +248,14 @@ class CobranzaService:
             f"{self._normalizar_fragmento(categoria, 'categoria')}/"
             f"{self._normalizar_fragmento(cliente, 'Cliente')}/"
             f"{carpeta_status}"
+        )
+
+        siguiente_id = self._obtener_siguiente_id_archivo(ruta)
+        nombre_pdf = (
+            f"{siguiente_id}_"
+            f"{self._normalizar_fragmento(folio, 'SinFolio')}_"
+            f"{self._normalizar_fragmento(lote, 'SinLote')}_"
+            f"{fecha_hoy}.pdf"
         )
 
         url_descarga = self.subir_a_bucket(pdf_bytes, ruta, nombre_pdf)
@@ -293,7 +311,7 @@ def obtener_comprobantes(user: dict = Depends(es_usuario)):
 
 @router.post("/actualizarStatusPagos")
 def actualizar_status_pagos(payload: CobranzaStatusUpdate, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
-    """Actualiza status de comprobante y genera/sube PDF jurídico KO-0009."""
+    """Actualiza status de comprobante y genera/sube PDF jurídico KO-0005."""
     try:
         service = CobranzaService()
 
