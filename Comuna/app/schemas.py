@@ -353,7 +353,8 @@ class GlobalMassiveUpdate(BaseModel):
 class EmailFolioSchema(BaseModel):
     folio: str
     categoria: str
-
+    simular: bool = False
+    
 class RemitenteCreate(BaseModel):
     remitente: EmailStr
 
