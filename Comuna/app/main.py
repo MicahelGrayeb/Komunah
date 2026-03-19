@@ -124,6 +124,7 @@ app.add_middleware(
 
 def tarea_diaria_notificaciones():  
     """Lógica del Cron Job."""
+    import asyncio
     db = SessionLocal()
     try:
         logger.info("⏰ Cron Job: Iniciando proceso de barrido automático...")
@@ -133,10 +134,15 @@ def tarea_diaria_notificaciones():
         
         config = repo.obtener_config_recordatorios("komunah")
         
-        use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago", db, "normal")
-        use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago Vencido", db, "deudores")
-        use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago", db, "normal")
-        use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago Vencido", db, "deudores")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago", db, "normal"))
+            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago Vencido", db, "deudores"))
+            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago", db, "normal"))
+            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago Vencido", db, "deudores"))
+        finally:
+            loop.close()
             
         logger.info("✅ Cron Job: Proceso finalizado con éxito.")
     except Exception as e:
