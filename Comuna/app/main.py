@@ -13,7 +13,7 @@ import logging
 from zoneinfo import ZoneInfo
 from .services.sync_service import AutoSyncManager
 
-
+      
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)    
 
@@ -122,6 +122,22 @@ app.add_middleware(
     allow_headers=["*"],
 ) 
 
+def _ejecutar_con_reintentos(loop, coro_func, label, max_intentos=3):
+    """Ejecuta una coroutine con reintentos ante errores de red."""
+    import time as _time
+    for intento in range(1, max_intentos + 1):
+        try:
+            resultado = loop.run_until_complete(coro_func())
+            logger.info(f"✅ {label} completado (intento {intento})")
+            return resultado
+        except Exception as e:
+            logger.warning(f"⚠️ {label} falló intento {intento}/{max_intentos}: {str(e)[:120]}")
+            if intento < max_intentos:
+                _time.sleep(5)
+            else:
+                logger.error(f"❌ {label} falló después de {max_intentos} intentos")
+    return None
+
 def tarea_diaria_notificaciones():  
     """Lógica del Cron Job."""
     import asyncio
@@ -133,14 +149,23 @@ def tarea_diaria_notificaciones():
         use_case = NotificationUseCase(repo, gateway)
         
         config = repo.obtener_config_recordatorios("komunah")
+        logger.info(f"📋 Config: dias_1={config['dias_1']}, dias_2={config['dias_2']}, hora={config['hora']}:{config['minuto']}")
         
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago", db, "normal"))
-            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago Vencido", db, "deudores"))
-            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago", db, "normal"))
-            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago Vencido", db, "deudores"))
+            _ejecutar_con_reintentos(loop, 
+                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago", db, "normal"),
+                "Barrido dias_1 normal")
+            _ejecutar_con_reintentos(loop, 
+                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago Vencido", db, "deudores"),
+                "Barrido dias_1 deudores")
+            _ejecutar_con_reintentos(loop, 
+                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago", db, "normal"),
+                "Barrido dias_2 normal")
+            _ejecutar_con_reintentos(loop, 
+                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago Vencido", db, "deudores"),
+                "Barrido dias_2 deudores")
         finally:
             loop.close()
             
