@@ -31,7 +31,6 @@ import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 from argparse import Namespace
 from ..models import Venta, Cliente, Amortizacion
-from mailersend import MailerSendClient
 from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
@@ -429,6 +428,16 @@ class NotificationGateway:
         }
         
         return requests.post(url, headers=headers, json=payload, timeout=10)
+
+    @staticmethod
+    def enviar_email_bulk(payloads: List[dict]):
+        api_key = os.getenv("MAILERSEND_API_KEY")
+        url = "https://api.mailersend.com/v1/bulk-email"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        return requests.post(url, headers=headers, json=payloads, timeout=20)
     
     @staticmethod
     def enviar_whatsapp(
@@ -613,13 +622,13 @@ class StaticWAUseCase:
                     f"WhatsApp Manual falló ({res.status_code}) para {nombre} en folio {datos.folio}", 
                     "WA_PROVIDER_ERROR"
                 )
-                status = res.status_code
-            else:
-                status = "SIMULADO_OK"
 
-            reporte.append({"cliente": nombre, "status": status})
-
-        return {"folio": datos.folio, "modo": "SIMULACION" if simular else "REAL", "archivo": nombre_pdf, "detalles": reporte}
+            reporte.append({"cliente": nombre, "telefono": num_wa, "status": res.status_code})
+        return {
+            "folio": datos.folio,
+            "categoria": datos.categoria,
+            "detalles": reporte
+        }
 
 class StaticEmailFolioUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
@@ -947,11 +956,40 @@ class NotificationUseCase:
     
 
     def _limpiar(self, texto, vars, nombre, email_persona, tel_persona):
-        texto = texto.replace("{cliente}", nombre)
-        texto = texto.replace("{email_cliente}", str(email_persona))
-        texto = texto.replace("{telefono_cliente}", str(tel_persona))
-        for t, v in vars.items(): texto = texto.replace(t, str(v))
-        return re.sub(r'\{[v|cl|p|c]\.[^}]+\}', '', texto)
+        if not texto:
+            return texto
+
+        data = dict(vars or {})
+        # Soporte case-insensitive para etiquetas del HTML.
+        for k, v in list(data.items()):
+            data[str(k).lower()] = v
+
+        # Variables generales fijas del diccionario maestro.
+        data["{cliente}"] = nombre or data.get("{cliente}") or data.get("{cl.cliente}") or ""
+        data["{email_cliente}"] = str(email_persona or data.get("{email_cliente}") or data.get("{g1.email}") or "")
+        data["{telefono_cliente}"] = str(tel_persona or data.get("{telefono_cliente}") or data.get("{g1.telefono}") or "")
+
+        etiquetas_en_texto = set(re.findall(r"\{[^}]+\}", texto))
+        for tag in etiquetas_en_texto:
+            valor = data.get(tag)
+            if valor is None:
+                valor = data.get(tag.lower())
+            if valor is not None:
+                texto = texto.replace(tag, str(valor))
+
+        pendientes = set(re.findall(r"\{[^}]+\}", texto))
+        conocidas_no_resueltas = [
+            t for t in pendientes
+            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
+        ]
+        if conocidas_no_resueltas:
+            logger.info(
+                "[CLUSTER] Etiquetas conocidas sin valor en _limpiar | total=%s | muestra=%s",
+                len(conocidas_no_resueltas),
+                conocidas_no_resueltas[:8],
+            )
+
+        return re.sub(r"\{[^}]+\}", "", texto)
 
     def _descargar_a_base64(self, url: str):
         """Descarga un archivo de internet y lo convierte al formato que pide MailerSend."""
@@ -984,10 +1022,15 @@ class StaticEmailClusterUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
         self.repo = repo
         self.gateway = gateway
-        # Inicializamos el cliente de MailerSend para el envío masivo
-        self.ms = MailerSendClient()
 
     def ejecutar_proceso_cluster(self, empresa_id: str, datos: Any, db: Session):
+        logger.info(
+            "[CLUSTER] Inicio ejecutar_proceso_cluster | empresa=%s | clusters=%s | pipeline_status=%s | simular=%s",
+            empresa_id,
+            getattr(datos, "clusters", []),
+            getattr(datos, "pipeline_status", []),
+            getattr(datos, "simular", None),
+        )
         pack_empresa = PROVIDERS.get(empresa_id, {})
         buscador_dinamico = pack_empresa.get("get_folios_por_cluster")
         
@@ -995,7 +1038,9 @@ class StaticEmailClusterUseCase:
             raise HTTPException(status_code=400, detail="Empresa no configurada.")
 
         # 1. Obtener folios (Filtra por Cluster, Pipeline o Ambos)
+        logger.info("[CLUSTER] Consultando folios por cluster/pipeline")
         folios_brutos = buscador_dinamico(datos.clusters, datos.pipeline_status, db)
+        logger.info("[CLUSTER] Folios encontrados=%s", len(folios_brutos or []))
         
         # Normalizar exclusiones
         excluir_folios = {str(f).strip() for f in (datos.excluir_folios or [])}
@@ -1005,20 +1050,56 @@ class StaticEmailClusterUseCase:
         reporte_global = []
         conteo = {"exitosos": 0, "bloqueados_sys": 0, "omitidos_user": 0, "excluidos_manual": 0}
         procesador = NotificationUseCase(self.repo, self.gateway)
+        ids_documentos = [str(doc_id).strip() for doc_id in (getattr(datos, "array_documentos", []) or []) if str(doc_id).strip()]
+        logger.info("[CLUSTER] Documentos dinamicos solicitados=%s", len(ids_documentos))
 
         # Preparar la cola para el envío masivo
         cola_bulk_moderna = []
 
         for f in folios_brutos:
             f_str = str(f).strip()
+            logger.info("[CLUSTER] Procesando folio=%s", f_str)
             if f_str in excluir_folios:
+                logger.info("[CLUSTER] Folio excluido manualmente=%s", f_str)
                 conteo["excluidos_manual"] += 1
                 continue
 
+            logger.info("[CLUSTER] Consultando datos SQL para folio=%s", f_str)
             data_sql = get_komunah_data(f_str, db)
             if data_sql.get("{sys.etapa_activa}") == "0":
+                logger.info("[CLUSTER] Folio bloqueado por sys.etapa_activa=0 | folio=%s", f_str)
                 conteo["bloqueados_sys"] += 1
                 continue
+
+            adjuntos_dinamicos = []
+            if ids_documentos:
+                try:
+                    logger.info("[CLUSTER] Generando PDFs dinamicos | folio=%s | cantidad=%s", f_str, len(ids_documentos))
+                    pdf_service = GenerarPDFUseCase(self.repo)
+                    adjuntos_pdf = asyncio.run(
+                        pdf_service.generar_pdfs_desde_plantillas(
+                            empresa_id=empresa_id,
+                            ids_plantillas=ids_documentos,
+                            folio=f_str,
+                            db=db,
+                            subir_bucket=False,
+                        )
+                    )
+                    adjuntos_dinamicos = [
+                        {
+                            "content": adjunto["content"],
+                            "filename": adjunto["filename"],
+                        }
+                        for adjunto in adjuntos_pdf
+                    ]
+                    logger.info("[CLUSTER] PDFs generados correctamente | folio=%s | cantidad=%s", f_str, len(adjuntos_dinamicos))
+                except Exception as e:
+                    logger.exception("[CLUSTER] Error generando PDFs dinamicos | folio=%s | error=%s", f_str, str(e))
+                    self.repo.registrar_log_falla(
+                        empresa_id,
+                        f"Folio {f_str}: falló generación de PDF en envío cluster ({str(e)})",
+                        "PDF_GEN_CLUSTER",
+                    )
 
             clientes_lote = []
             for i in range(1, 7): # Mapeo dinámico c1 a c6
@@ -1034,6 +1115,7 @@ class StaticEmailClusterUseCase:
 
                 if not nombre or not email: continue
                 if nombre.lower().strip() in excluir_nombres or email.lower().strip() in excluir_emails:
+                    logger.info("[CLUSTER] Cliente excluido manualmente | folio=%s | cliente=%s | email=%s", f_str, nombre, email)
                     conteo["excluidos_manual"] += 1
                     continue
 
@@ -1043,18 +1125,25 @@ class StaticEmailClusterUseCase:
 
                 # Si es envío REAL y tiene permiso, armamos el objeto para la cola
                 if not datos.simular and permiso:
+                    adjuntos_finales = list(datos.adjuntos) if datos.adjuntos else []
+                    if adjuntos_dinamicos:
+                        adjuntos_finales.extend(adjuntos_dinamicos)
+
                     email_obj = {
                         "from": {"email": datos.remitente, "name": f"Notificaciones {empresa_id.capitalize()}"},
-                        "to": [{"email": email, "name": nombre}],
+                        "to": [{"email": "brandon.avila@techmaleon.mx", "name": nombre}],
+                        # "to": [{"email": email, "name": nombre}],
                         "subject": asunto_final,
                         "html": html_final,
-                        "attachments": datos.adjuntos if datos.adjuntos else [],
+                        "attachments": adjuntos_finales,
                         "reply_to": {"email": datos.reply_to} if datos.reply_to else None
                     }
                     cola_bulk_moderna.append(email_obj)
                     conteo["exitosos"] += 1
                 elif datos.simular:
                     conteo["exitosos"] += 1
+                else:
+                    logger.info("[CLUSTER] Cliente omitido por permiso de lote OFF | folio=%s | cliente=%s", f_str, nombre)
 
                 clientes_lote.append({"cliente": nombre, "email": email, "status": "OK"})
 
@@ -1063,10 +1152,33 @@ class StaticEmailClusterUseCase:
 
         
         if not datos.simular and cola_bulk_moderna:
+            logger.info("[CLUSTER] Iniciando envio bulk | correos=%s", len(cola_bulk_moderna))
             for i in range(0, len(cola_bulk_moderna), 500):
                 bloque = cola_bulk_moderna[i:i + 500]
-                self.ms.emails.send_bulk(bloque)
+                logger.info("[CLUSTER] Enviando bloque bulk | inicio=%s | tamano_bloque=%s", i, len(bloque))
+                try:
+                    res_bulk = self.gateway.enviar_email_bulk(bloque)
+                    if res_bulk.status_code not in [200, 201, 202]:
+                        raise RuntimeError(f"Bulk HTTP falló ({res_bulk.status_code}): {res_bulk.text[:200]}")
+                except Exception as e:
+                    logger.warning(
+                        "[CLUSTER] Bulk HTTP falló, aplicando fallback a envio individual | error=%s",
+                        str(e),
+                    )
+                    for payload in bloque:
+                        res = self.gateway.enviar_email(payload)
+                        if res.status_code not in [200, 201, 202]:
+                            destino = payload.get("to", [{}])[0].get("email", "N/A")
+                            self.repo.registrar_log_falla(
+                                empresa_id,
+                                f"Email cluster falló ({res.status_code}) para {destino}",
+                                "MAIL_PROVIDER_CLUSTER",
+                            )
+                        time.sleep(0.1)
                 time.sleep(0.5)
+            logger.info("[CLUSTER] Envio bulk finalizado")
+
+        logger.info("[CLUSTER] Fin ejecutar_proceso_cluster | modo=%s | resumen=%s", "SIMULACION" if datos.simular else "REAL", conteo)
 
         return {"modo": "SIMULACION" if datos.simular else "REAL", "resumen": conteo, "detalles": reporte_global}
     
@@ -1083,11 +1195,70 @@ class GenerarPDFUseCase:
         return re.sub(r"[\\/:*?\"<>|]", "_", texto)
 
     @staticmethod
+    def _normalizar_variables_para_html(variables: dict) -> dict:
+        """Prepara variables para reemplazo robusto en HTML (incluye aliases del diccionario maestro)."""
+        base = dict(variables or {})
+
+        # Mapa case-insensitive para tolerar diferencias de mayúsculas/minúsculas en plantillas.
+        for k, v in list(base.items()):
+            base[str(k).lower()] = v
+
+        # Variables generales fijas del diccionario maestro.
+        if "{cliente}" not in base:
+            base["{cliente}"] = (
+                base.get("{cl.cliente}")
+                or base.get("{v.cliente}")
+                or base.get("{c1.client_name}")
+                or ""
+            )
+
+        if "{email_cliente}" not in base:
+            base["{email_cliente}"] = (
+                base.get("{g1.email}")
+                or base.get("{c1.email}")
+                or base.get("{v.correo_electronico}")
+                or ""
+            )
+
+        if "{telefono_cliente}" not in base:
+            base["{telefono_cliente}"] = (
+                base.get("{g1.telefono}")
+                or base.get("{c1.main_phone}")
+                or base.get("{v.telefono}")
+                or ""
+            )
+
+        return base
+
+    @staticmethod
     def _reemplazar_etiquetas(texto: str, variables: dict):
         if not texto:
             return texto
-        for tag, valor in variables.items():
-            texto = texto.replace(tag, str(valor))
+
+        vars_html = GenerarPDFUseCase._normalizar_variables_para_html(variables)
+        etiquetas_en_html = set(re.findall(r"\{[^}]+\}", texto))
+
+        for tag in etiquetas_en_html:
+            valor = vars_html.get(tag)
+            if valor is None:
+                valor = vars_html.get(tag.lower())
+            if valor is not None:
+                texto = texto.replace(tag, str(valor))
+
+        # Visibilidad de etiquetas conocidas no resueltas (según prefijos del diccionario maestro).
+        pendientes = set(re.findall(r"\{[^}]+\}", texto))
+        conocidas_no_resueltas = [
+            t for t in pendientes
+            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
+        ]
+        if conocidas_no_resueltas:
+            muestra = conocidas_no_resueltas[:8]
+            logger.info(
+                "[PDF_GENERADOR] Etiquetas conocidas sin valor | total=%s | muestra=%s",
+                len(conocidas_no_resueltas),
+                muestra,
+            )
+
         return re.sub(r"\{[^}]+\}", "", texto)
 
     @staticmethod
@@ -1973,7 +2144,7 @@ EJEMPLO_FINAL = {
     "asunto": "Aviso de Cobranza - Lote {v.numero}",
     "contenido_html": "<h1>Hola {cl.cliente}</h1><p>Tu saldo es {cl.monto_a_pagar}</p>",
     "reply_to": "pagos@komunah.mx",
-    "simular": True,
+    "simular": False,
     "excluir_folios": ["1975"],
     "excluir_emails": ["test@test.com"],
     "excluir_clientes": ["Nombre a Excluir"]
@@ -1990,26 +2161,51 @@ async def api_proceso_cluster(
     db: Session = Depends(get_db), 
     user: dict = Depends(es_admin)
 ):
+    logger.info("[CLUSTER_API] Entrada api_proceso_cluster | empresa=%s", empresa_id)
     try:
         data_dict = json.loads(datos_json)
+        logger.info("[CLUSTER_API] JSON parseado correctamente | keys=%s", list(data_dict.keys()))
         datos_validados = EmailClusterSchema(**data_dict)
+        logger.info("[CLUSTER_API] Payload validado con EmailClusterSchema")
     except Exception as e:
+        logger.exception("[CLUSTER_API] Error parseando/validando JSON | empresa=%s | error=%s", empresa_id, str(e))
         raise HTTPException(status_code=400, detail=f"Error en formato JSON: {str(e)}")
+
+    array_documentos_raw = data_dict.get("arrayDocumentos", [])
+    array_documentos = []
+    if isinstance(array_documentos_raw, str):
+        array_documentos = [
+            part.strip()
+            for part in re.split(r"[,;]", array_documentos_raw)
+            if part.strip()
+        ]
+    elif isinstance(array_documentos_raw, list):
+        for item in array_documentos_raw:
+            for part in re.split(r"[,;]", str(item)):
+                part_limpio = part.strip()
+                if part_limpio:
+                    array_documentos.append(part_limpio)
 
     adjuntos = []
     if archivos:
+        logger.info("[CLUSTER_API] Archivos recibidos=%s", len(archivos))
         for f in archivos:
             if f.filename:
                 adjuntos.append({
                     "content": base64.b64encode(await f.read()).decode(),
                     "filename": f.filename
                 })
+    logger.info("[CLUSTER_API] Adjuntos normalizados=%s | arrayDocumentos=%s", len(adjuntos), len(array_documentos))
 
     config_final = datos_validados.dict()
     config_final['adjuntos'] = adjuntos
+    config_final['array_documentos'] = array_documentos
 
+    logger.info("[CLUSTER_API] Ejecutando caso de uso de cluster")
     use_case = StaticEmailClusterUseCase(FirebaseRepository(), NotificationGateway())
-    return use_case.ejecutar_proceso_cluster(empresa_id, Namespace(**config_final), db)
+    resultado = use_case.ejecutar_proceso_cluster(empresa_id, Namespace(**config_final), db)
+    logger.info("[CLUSTER_API] Fin api_proceso_cluster | empresa=%s | modo=%s", empresa_id, resultado.get("modo"))
+    return resultado
 
 #endregion
 

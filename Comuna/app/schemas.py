@@ -382,7 +382,7 @@ class EmailClusterSchema(BaseModel):
     asunto: str
     contenido_html: str
     reply_to: Optional[str] = None
-    simular: bool = True
+    simular: bool = False
     excluir_folios: Optional[List[str]] = []
     excluir_emails: Optional[List[str]] = []
     excluir_clientes: Optional[List[str]] = []
