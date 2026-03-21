@@ -41,6 +41,8 @@ def get_komunah_data(folio_ref: str, db: Session):
             "{cl.cliente}": "",
             "{cl.num}": "",
             "{cl.fecha}": "",
+            "{cl.fecha_pago_corta}": "",
+            "{cl.dias_para_pago}": "",
             "{cl.concepto}": "",
             "{cl.proyecto}": ""
         })
@@ -115,6 +117,29 @@ def get_komunah_data(folio_ref: str, db: Session):
         ).scalar()
         pagado_parcial = float(res_suma or 0)
     saldo_actual_vigente = monto_val - pagado_parcial
+
+    # --- CÁLCULO DE DÍAS RESTANTES (Dentro de get_komunah_data) ---
+    dias_para_vencer = 0
+    fecha_pago_humanizada = ""
+    hoy_dt = datetime.now(ZoneInfo("America/Mexico_City"))
+    
+    if p_act and hasattr(p_act, 'date') and p_act.date:
+        try:
+            # Convertimos la fecha del pago (str) a objeto datetime
+            fecha_vencimiento = datetime.strptime(str(p_act.date), '%Y-%m-%d').date()
+            fecha_hoy = hoy_dt.date()
+            
+            # Calculamos la diferencia
+            delta = (fecha_vencimiento - fecha_hoy).days
+            dias_para_vencer = delta
+            
+            # Formateamos la fecha para que se vea pro (ej. 15 de Marzo)
+            meses = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
+                     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+            fecha_pago_humanizada = f"{fecha_vencimiento.day} de {meses[fecha_vencimiento.month - 1]}"
+        except Exception as e:
+            logger.error(f"[DATOS_KOMUNAH] Error calculando dias_para_vencer: {e}")
+
     # Mapeo manual con etiquetas estandarizadas
     data.update({
         "{cl.unidad}": str(getattr(venta, 'numero', "")),
@@ -123,6 +148,8 @@ def get_komunah_data(folio_ref: str, db: Session):
         "{cl.cliente}": str(getattr(venta, 'cliente', "")),
         "{cl.num}": str(getattr(p_act, 'number', "")) if p_act else "",
         "{cl.fecha}": str(getattr(p_act, 'date', "")) if p_act else "",
+        "{cl.fecha_pago_corta}": fecha_pago_humanizada,
+        "{cl.dias_para_pago}": dias_para_vencer,
         "{cl.concepto}": str(getattr(p_act, 'concept', "")) if p_act else "",
         "{cl.proyecto}": str(getattr(venta, 'desarrollo', ""))
     })
@@ -212,7 +239,7 @@ def get_komunah_data(folio_ref: str, db: Session):
                 
                 if val_g is not None:
                     data[f"{{{prefijo_g}{col.key.lower()}}}"] = str(val_g)       
-    hoy_dt = datetime.now(ZoneInfo("America/Mexico_City")) 
+    # hoy_dt ya fue definido arriba para cl. y ven.
     hoy_str = hoy_dt.strftime('%Y-%m-%d')
     from ..models import Cartera
     # Buscamos el resumen oficial en la tabla Cartera para este folio
@@ -446,7 +473,18 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
     if vars_p: catalogo.append({"categoria": "Detalle de Pagos y Mensualidad (p.)", "variables": vars_p})
 
     # 4. Datos Formateados (cl.)
-    vars_cl = procesar_manual(["{cl.unidad}", "{cl.monto}", "{cl.monto_a_pagar}", "{cl.cliente}", "{cl.num}", "{cl.fecha}", "{cl.concepto}", "{cl.proyecto}"])
+    vars_cl = procesar_manual([
+        "{cl.unidad}", 
+        "{cl.monto}", 
+        "{cl.monto_a_pagar}", 
+        "{cl.cliente}", 
+        "{cl.num}", 
+        "{cl.fecha}", 
+        "{cl.fecha_pago_corta}", 
+        "{cl.dias_para_pago}", 
+        "{cl.concepto}", 
+        "{cl.proyecto}"
+    ])
     if vars_cl: catalogo.append({"categoria": "Datos Formateados para el Cliente (cl.)", "variables": vars_cl})
 
     # 5. Control (sys.)

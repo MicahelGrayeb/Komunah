@@ -70,6 +70,7 @@ class AutoSyncManager:
                 query = f"SELECT * FROM `{self.project_id}.{self.dataset_id}.{t}`"
                 
                 df_temp = self.estandarizar_fechas(self.client.query(query).to_dataframe())
+                df_temp = self.limpiar_moneda(df_temp)
                 
                 if t == 'ventas':
                     df_ventas_ref = df_temp.copy()
@@ -102,6 +103,25 @@ class AutoSyncManager:
 
         except Exception as e:
             logger.error(f"❌ Error crítico en ejecución: {e}")
+    
+    def limpiar_moneda(self, df):
+        """Limpia $, comas y porcentajes para que SQL los acepte como números."""
+        keywords = ['monto', 'total', 'saldo', 'pagado', 'pagar', 'días', 'dias', 'vigente', '%', 'cartera']
+        
+        columnas_a_limpiar = [
+            col for col in df.columns 
+            if any(x in col.lower() for x in keywords)
+        ]
+        
+        for col in columnas_a_limpiar:
+            if df[col].dtype == 'object': 
+                # Quitamos $, comas, espacios y %
+                df[col] = df[col].astype(str).str.replace(r'[\$,%\s]', '', regex=True).str.replace(',', '')
+                # Limpiamos nulos de texto
+                df[col] = df[col].replace(['null', 'None', 'nan', 'NaN', ''], '0')
+                # Convertimos a número real
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        return df
 
     def _escribir_tabla_individual(self, name, df):
         """Escribe usando el método estándar (más compatible con el túnel SSH)."""
