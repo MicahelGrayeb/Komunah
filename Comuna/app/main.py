@@ -62,12 +62,18 @@ def sincronizar_horario_cron(scheduler_instancia):
     Solo reprograma si Firebase responde correctamente (ignora defaults).
     """
     def verificar_y_actualizar():
+        import time as _time_sync
+        inicio = _time_sync.time()
         try:
+            logger.info("🕒 SYNC: Iniciando verificación de configuración en Firebase...")
             repo = FirebaseRepository()
             config = repo.obtener_config_recordatorios_seguro("komunah")
             
+            duracion = _time_sync.time() - inicio
+            
             # Si Firebase no respondió bien, NO reprogramar
             if config is None:
+                logger.warning(f"⚠️ SYNC: Firebase no respondió tras {duracion:.2f}s, saltando verificación.")
                 return
             
             nueva_h = int(config.get("hora", 10))
@@ -78,17 +84,24 @@ def sincronizar_horario_cron(scheduler_instancia):
                 hora_actual_str = str(job.trigger.fields[5])
                 min_actual_str = str(job.trigger.fields[6])
 
+                logger.info(f"🔍 SYNC: Cron actual={hora_actual_str}:{min_actual_str} | Firebase={nueva_h}:{nueva_m:02d} (t={duracion:.2f}s)")
+
                 if hora_actual_str != str(nueva_h) or min_actual_str != str(nueva_m):
-                    logger.info(f"🔄 SYNC: Cambio detectado en Firebase ({nueva_h}:{nueva_m}). Ajustando Cron...")
+                    logger.info(f"🔄 SYNC: Cambio detectado en Firebase ({nueva_h}:{nueva_m:02d}). Ajustando Cron...")
                     scheduler_instancia.reschedule_job(
                         JOB_ID_BARRIDO, 
                         trigger='cron', 
                         hour=nueva_h, 
                         minute=nueva_m
                     )
-                    logger.info("✅ Cron reprogramado exitosamente.")
+                    logger.info(f"✅ Cron reprogramado exitosamente a {nueva_h}:{nueva_m:02d}.")
+                else:
+                    logger.info(f"✅ SYNC: Sin cambios, horario correcto (t={duracion:.2f}s).")
+            else:
+                logger.warning(f"⚠️ SYNC: No se encontró el job '{JOB_ID_BARRIDO}' en el scheduler.")
         except Exception as e:
-            logger.error(f"❌ Error en sincronización: {e}")
+            duracion = _time_sync.time() - inicio
+            logger.error(f"❌ Error en sincronización tras {duracion:.2f}s: {e}")
 
     scheduler_instancia.add_job(verificar_y_actualizar, 'interval', minutes=1, id="sync_config_job")
 

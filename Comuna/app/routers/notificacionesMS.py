@@ -69,35 +69,60 @@ class FirebaseRepository:
         self.base_url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents"
         self.headers = {"X-Goog-Api-Key": self.api_key, "Content-Type": "application/json"}
 
+    def _peticion_segura(self, method: str, url: str, **kwargs):
+        """Maneja reintentos y logging detallado para peticiones a Firebase."""
+        max_retries = 3
+        timeout = kwargs.pop('timeout', 10)
+        
+        for i in range(max_retries):
+            try:
+                resp = requests.request(method, url, timeout=timeout, **kwargs)
+                if resp.status_code == 200:
+                    return resp
+                
+                # Si no es 200, logueamos el aviso y reintentamos si aplica
+                logger.warning(f"⚠️ Firebase API ({method}) devolvió status {resp.status_code} para {url}. Intento {i+1}/{max_retries}")
+                if i < max_retries - 1:
+                    time.sleep(2 ** i) # Backoff exponencial: 1s, 2s, 4s...
+            
+            except requests.exceptions.Timeout:
+                logger.warning(f"⏰ Timeout ({timeout}s) en Firebase API ({method}) para {url}. Intento {i+1}/{max_retries}")
+                if i < max_retries - 1:
+                    time.sleep(2 ** i)
+            
+            except requests.exceptions.RequestException as e:
+                logger.error(f"❌ Error de red/petición en Firebase API: {str(e)}. Intento {i+1}/{max_retries}")
+                if i < max_retries - 1:
+                    time.sleep(2 ** i)
+                    
+        return None
+
     def obtener_config_empresa(self, empresa_id: str):
-        """lógica  de switches."""
+        """Lógica de switches con reintentos."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/general"
-        try:
-            resp = requests.get(url, headers=self.headers, timeout=5)
-            if resp.status_code != 200: 
-                return {"proyecto": True, "email": True, "whatsapp": True}
-            f = resp.json().get("fields", {})
-            return {
-                "proyecto": f.get("proyecto_activo", {}).get("booleanValue", True),
-                "email": f.get("email_enabled", {}).get("booleanValue", True),
-                "whatsapp": f.get("whatsapp_enabled", {}).get("booleanValue", True)
-            }
-        except:
-            return {"proyecto": True, "email": True, "whatsapp": True}
+        defaults = {"proyecto": True, "email": True, "whatsapp": True}
+        
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
+        if not resp:
+            return defaults
+            
+        f = resp.json().get("fields", {})
+        return {
+            "proyecto": f.get("proyecto_activo", {}).get("booleanValue", True),
+            "email": f.get("email_enabled", {}).get("booleanValue", True),
+            "whatsapp": f.get("whatsapp_enabled", {}).get("booleanValue", True)
+        }
 
     def obtener_plantilla_segura(self, empresa_id: str, slug: str):
+        """Trae el HTML de una plantilla con reintentos."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{slug}"
-        try:
-            response = requests.get(url, headers=self.headers, timeout=10)
-           
-            if response.status_code != 200:
-                print(f"DEBUG FIREBASE - Error {response.status_code}: {response.text}")
-                return None 
-            data = response.json()
-            return data.get("fields", {}).get("html", {}).get("stringValue", "")
-        except Exception as e:
-            print(f"DEBUG FIREBASE - Excepción: {e}")
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        
+        if not resp:
             return None
+            
+        data = resp.json()
+        return data.get("fields", {}).get("html", {}).get("stringValue", "")
 
     def query_categoria(self, empresa_id: str, categoria: str, coleccion: str = "plantillas"): 
         url = f"{self.base_url}/empresas/{empresa_id}:runQuery" 
@@ -113,30 +138,23 @@ class FirebaseRepository:
                 }
             }
         }
-        response = requests.post(url, json=query, headers=self.headers, timeout=10)
-    
-        if response.status_code != 200:
-            print(f"--- ERROR DE FIREBASE ---")
-            print(f"Status: {response.status_code}")
-            print(f"Respuesta: {response.text}")
-            return []
-        return requests.post(url, json=query, headers=self.headers, timeout=10).json()
+        resp = self._peticion_segura("POST", url, json=query, headers=self.headers, timeout=10)
+        return resp.json() if resp else []
 
     def patch_activo_status(self, doc_path: str, status: bool):
         url = f"https://firestore.googleapis.com/v1/{doc_path}?updateMask.fieldPaths=activo"
         payload = {"fields": {"activo": {"booleanValue": status}}}
-        return requests.patch(url, json=payload, headers=self.headers, timeout=10)
+        return self._peticion_segura("PATCH", url, json=payload, headers=self.headers, timeout=10)
     
     def eliminar_plantilla(self, empresa_id: str, doc_id: str):
         """Elimina físicamente el documento."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
-        return requests.delete(url, headers=self.headers, timeout=10)
+        return self._peticion_segura("DELETE", url, headers=self.headers, timeout=10)
 
     def actualizar_plantilla(self, empresa_id: str, doc_id: str, p: PlantillaUpdate):
         """Actualiza campos específicos usando updateMask de manera dinámica."""
         fields = {}
         mask = []
-        # exclude_unset es vital para no mandar defaults fortuitos
         data = p.dict(exclude_unset=True)
         for key, value in data.items():
             if value is None: continue 
@@ -158,12 +176,11 @@ class FirebaseRepository:
                 fields[key] = {"stringValue": str(value)}
         
         if not mask: 
-            print(f"DEBUG - No hay campos para actualizar en {doc_id}")
             return None 
 
         params = [("updateMask.fieldPaths", m) for m in mask]
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
-        return requests.patch(url, json={"fields": fields}, params=params, headers=self.headers, timeout=10)
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, params=params, headers=self.headers, timeout=10)
 
     def actualizar_configuracion(self, empresa_id: str, c: ConfigUpdate):
         fields = {}
@@ -177,13 +194,13 @@ class FirebaseRepository:
 
         query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/general?{query_params}"
-        return requests.patch(url, json={"fields": fields}, headers=self.headers, timeout=10)
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
     
     def listar_todas_plantillas(self, empresa_id: str):
         """Para el GET de la lista completa."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas"
-        resp = requests.get(url, headers=self.headers, timeout=10)
-        return resp.json().get("documents", []) if resp.status_code == 200 else []
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json().get("documents", []) if resp else []
 
     def generar_siguiente_id(self, empresa_id: str):
         """Busca el máximo y usa 4 dígitos para que quepan hasta 9,999 plantillas."""
@@ -206,19 +223,19 @@ class FirebaseRepository:
     def obtener_un_doc_completo(self, empresa_id: str, doc_id: str):
         """Para el GET de edición (trae todos los campos)."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
-        resp = requests.get(url, headers=self.headers, timeout=10)
-        return resp.json() if resp.status_code == 200 else None
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json() if resp else None
     
     def obtener_un_doc_completo_wa(self, empresa_id: str, doc_id: str):
         """Busca un solo documento en la colección de WhatsApp."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
-        resp = requests.get(url, headers=self.headers, timeout=10)
-        return resp.json() if resp.status_code == 200 else None
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json() if resp else None
     
     def listar_plantillas_wa(self, empresa_id: str):
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_whatsapp"
-        resp = requests.get(url, headers=self.headers, timeout=10)
-        return resp.json().get("documents", []) if resp.status_code == 200 else []
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json().get("documents", []) if resp else []
 
     def generar_siguiente_id_wa(self, empresa_id: str):
         docs = self.listar_plantillas_wa(empresa_id)
@@ -258,12 +275,11 @@ class FirebaseRepository:
                 fields[key] = {"stringValue": str(value)}
         
         if not mask:
-            print(f"DEBUG - No hay campos para actualizar en {doc_id} (WA)")
             return None
 
         params = [("updateMask.fieldPaths", m) for m in mask]
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
-        return requests.patch(url, json={"fields": fields}, params=params, headers=self.headers, timeout=10)
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, params=params, headers=self.headers, timeout=10)
     
     def registrar_log_falla(self, empresa_id: str, mensaje: str, contexto: str):
         """Almacena fallas agrupadas en empresas/{id}/logs_fallas."""
@@ -271,9 +287,9 @@ class FirebaseRepository:
         url = f"{self.base_url}/empresas/{empresa_id}/logs_fallas/{error_id}"
         ahora = datetime.now(ZoneInfo("America/Mexico_City")).isoformat()
 
-        resp = requests.get(url, headers=self.headers) # <-- CORREGIDO
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
         
-        if resp.status_code == 200:
+        if resp and resp.status_code == 200:
             fields = resp.json().get("fields", {})
             conteo = int(fields.get("contador", {}).get("integerValue", 0)) + 1
             payload = {
@@ -284,7 +300,7 @@ class FirebaseRepository:
                 }
             }
             mask = "updateMask.fieldPaths=contador&updateMask.fieldPaths=ultima_vez&updateMask.fieldPaths=leido"
-            requests.patch(f"{url}?{mask}", json=payload, headers=self.headers) 
+            self._peticion_segura("PATCH", f"{url}?{mask}", json=payload, headers=self.headers, timeout=5) 
         else:
             payload = {
                 "fields": {
@@ -296,49 +312,46 @@ class FirebaseRepository:
                     "fecha_inicial": {"stringValue": ahora}
                 }
             }
-            requests.patch(url, json=payload, headers=self.headers) 
+            self._peticion_segura("PATCH", url, json=payload, headers=self.headers, timeout=5) 
 
     def obtener_config_recordatorios(self, empresa_id: str):
-        """Trae los días de recordatorio desde Firebase."""
+        """Trae los días de recordatorio desde Firebase con reintentos."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
         defaults = {"dias_1": 3, "dias_2": 1, "hora": 10, "minuto": 0}
-        try:
-            resp = requests.get(url, headers=self.headers, timeout=5)
-            if resp.status_code != 200:
-                return defaults
-            f = resp.json().get("fields", {})
-            return {
-                "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
-                "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
-                "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
-                "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
-            }
-        except Exception:
+        
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
+        if not resp:
             return defaults
+            
+        f = resp.json().get("fields", {})
+        return {
+            "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
+            "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
+            "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
+            "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
+        }
     
     def obtener_config_recordatorios_seguro(self, empresa_id: str):
-        """Retorna None si Firebase falla, para que el sync job no reprograme con defaults."""
+        """Retorna None si Firebase falla tras reintentos, para que el sync job no reprograme con defaults."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
-        try:
-            resp = requests.get(url, headers=self.headers, timeout=5)
-            if resp.status_code != 200:
-                return None
-            f = resp.json().get("fields", {})
-            return {
-                "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
-                "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
-                "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
-                "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
-            }
-        except Exception:
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
+        
+        if not resp:
             return None
+            
+        f = resp.json().get("fields", {})
+        return {
+            "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
+            "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
+            "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
+            "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
+        }
     
     def actualizar_config_recordatorios(self, empresa_id: str, datos: dict):
         """Recibe un diccionario y parchea solo los campos presentes en él."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
         fields = {}
         mask = []
-
 
         mapeo = {
             "dias_1": "recordatorio_1",
@@ -359,18 +372,18 @@ class FirebaseRepository:
         query_params = "&".join(mask)
         full_url = f"{url}?{query_params}"
         
-        return requests.patch(full_url, json={"fields": fields}, headers=self.headers, timeout=10)
+        return self._peticion_segura("PATCH", full_url, json={"fields": fields}, headers=self.headers, timeout=10)
     
     # --- CRUD JURÍDICO (SIN ASUNTO) ---
     def listar_plantillas_juridico(self, empresa_id: str):
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico"
-        resp = requests.get(url, headers=self.headers, timeout=10)
-        return resp.json().get("documents", []) if resp.status_code == 200 else []
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json().get("documents", []) if resp else []
 
     def obtener_un_doc_completo_juridico(self, empresa_id: str, doc_id: str):
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
-        resp = requests.get(url, headers=self.headers, timeout=10)
-        return resp.json() if resp.status_code == 200 else None
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json() if resp else None
 
     def generar_siguiente_id_juridico(self, empresa_id: str):
         docs = self.listar_plantillas_juridico(empresa_id)
@@ -398,7 +411,7 @@ class FirebaseRepository:
         if not mask: return None
         query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}?{query_params}"
-        return requests.patch(url, json={"fields": fields}, headers=self.headers, timeout=10)
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
 
     def _get_juridico_mapping_single(self, empresa_id: str, doc_id: str):
         """Busca un solo ID en jurídico y devuelve {ID: Nombre}."""
