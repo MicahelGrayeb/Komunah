@@ -1044,7 +1044,7 @@ class StaticEmailClusterUseCase:
         self.repo = repo
         self.gateway = gateway
 
-    def ejecutar_proceso_cluster(self, empresa_id: str, datos: Any, db: Session):
+    async def ejecutar_proceso_cluster(self, empresa_id: str, datos: Any, db: Session):
         logger.info(
             "[CLUSTER] Inicio ejecutar_proceso_cluster | empresa=%s | clusters=%s | pipeline_status=%s | simular=%s",
             empresa_id,
@@ -1097,14 +1097,12 @@ class StaticEmailClusterUseCase:
                 try:
                     logger.info("[CLUSTER] Generando PDFs dinamicos | folio=%s | cantidad=%s", f_str, len(ids_documentos))
                     pdf_service = GenerarPDFUseCase(self.repo)
-                    adjuntos_pdf = asyncio.run(
-                        pdf_service.generar_pdfs_desde_plantillas(
-                            empresa_id=empresa_id,
-                            ids_plantillas=ids_documentos,
-                            folio=f_str,
-                            db=db,
-                            subir_bucket=True,
-                        )
+                    adjuntos_pdf = await pdf_service.generar_pdfs_desde_plantillas(
+                        empresa_id=empresa_id,
+                        ids_plantillas=ids_documentos,
+                        folio=f_str,
+                        db=db,
+                        subir_bucket=True,
                     )
                     adjuntos_dinamicos = [
                         {
@@ -1152,8 +1150,7 @@ class StaticEmailClusterUseCase:
 
                     email_obj = {
                         "from": {"email": datos.remitente, "name": f"Notificaciones {empresa_id.capitalize()}"},
-                        "to": [{"email": "brandon.avila@techmaleon.mx", "name": nombre}],
-                        # "to": [{"email": email, "name": nombre}],
+                        "to": [{"email": email, "name": nombre}],
                         "subject": asunto_final,
                         "html": html_final,
                         "attachments": adjuntos_finales,
@@ -2377,7 +2374,7 @@ async def api_proceso_cluster(
 
     logger.info("[CLUSTER_API] Ejecutando caso de uso de cluster")
     use_case = StaticEmailClusterUseCase(FirebaseRepository(), NotificationGateway())
-    resultado = use_case.ejecutar_proceso_cluster(empresa_id, Namespace(**config_final), db)
+    resultado = await use_case.ejecutar_proceso_cluster(empresa_id, Namespace(**config_final), db)
     logger.info("[CLUSTER_API] Fin api_proceso_cluster | empresa=%s | modo=%s", empresa_id, resultado.get("modo"))
     return resultado
 
