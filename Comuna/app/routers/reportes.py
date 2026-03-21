@@ -762,6 +762,8 @@ def get_escriturados_juridico(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en escriturados jurídico: {str(e)}")
 
+# ENDPOINTS DE REPORTES DE EXPEDIENTES PARA RESPOND.IO (TITULARES Y COPROPIETARIOS)
+
 @router.get("/expedientes-detallado", response_model=List[schemas.ReporteExpedientesDetalladoResponse])
 def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     try:

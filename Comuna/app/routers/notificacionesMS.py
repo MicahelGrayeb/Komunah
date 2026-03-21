@@ -26,6 +26,7 @@ from ..database import get_db
 from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 import json, time
+import mimetypes
 from typing import List, Optional, Union, Any
 import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
@@ -555,9 +556,12 @@ class StaticWAUseCase:
         if not data_sql: raise HTTPException(status_code=404, detail="Folio no hallado")
 
         # 1. Obtener Plantilla WA
-        docs_wa = self.repo.query_categoria(empresa_id, datos.categoria, "plantillas_whatsapp")
-        p_wa_raw = next((d["document"] for d in docs_wa if "document" in d 
-                        and (d["document"]["fields"].get("activo", {}).get("booleanValue") is True)), None)
+        p_wa_raw = UtilsNotifications._buscar_documento_plantilla(
+            self.repo,
+            empresa_id,
+            datos.categoria,
+            "plantillas_whatsapp",
+        )
         
         if not p_wa_raw: raise HTTPException(status_code=400, detail="No hay plantilla WA activa")
         f_wa = p_wa_raw["fields"]
@@ -580,6 +584,15 @@ class StaticWAUseCase:
                 adjunto_pdf = adjuntos_pdf[0]
 
         link_documento = adjunto_pdf.get("url_descarga") if adjunto_pdf else None
+        nombre_documento_wa = adjunto_pdf.get("filename") if adjunto_pdf else None
+        if not link_documento:
+            archivo_subido = UtilsNotifications._obtener_primer_archivo_subido_como_link(
+                f_wa,
+                f"Komunah/StaticWA/{datos.folio}",
+            )
+            if archivo_subido:
+                link_documento = archivo_subido.get("url_descarga")
+                nombre_documento_wa = archivo_subido.get("filename")
 
         config_plantilla = {
             "id_respond": f_wa.get("id_respond", {}).get("stringValue"),
@@ -613,7 +626,7 @@ class StaticWAUseCase:
                 parametros_finales,
                 texto_cuerpo=texto_listo,
                 header_document_link=link_documento,
-                header_document_filename=adjunto_pdf.get("filename") if adjunto_pdf else None,
+                header_document_filename=nombre_documento_wa,
             )
 
             if res.status_code not in [200, 201, 202]:
@@ -641,9 +654,12 @@ class StaticEmailFolioUseCase:
         pack_empresa = PROVIDERS.get(empresa_id, {})
         data_sql = pack_empresa.get("get")(datos.folio, db)
 
-        docs_email = self.repo.query_categoria(empresa_id, datos.categoria, "plantillas")
-        p_email_raw = next((d["document"] for d in docs_email if "document" in d 
-                        and (d["document"]["fields"].get("activo", {}).get("booleanValue") is True)), None)
+        p_email_raw = UtilsNotifications._buscar_documento_plantilla(
+            self.repo,
+            empresa_id,
+            datos.categoria,
+            "plantillas",
+        )
         
         if not p_email_raw: raise HTTPException(status_code=400, detail="Sin plantilla activa")
         f_email = p_email_raw["fields"]
@@ -656,7 +672,7 @@ class StaticEmailFolioUseCase:
                     ids_plantillas=ids_documentos,
                     folio=str(datos.folio),
                     db=db,
-                    subir_bucket=False,
+                    subir_bucket=True,
                 )
             )
             lista_adjuntos = [
@@ -666,6 +682,8 @@ class StaticEmailFolioUseCase:
                 }
                 for adjunto in adjuntos_pdf
             ]
+
+        lista_adjuntos.extend(UtilsNotifications._obtener_adjuntos_archivos_subidos(f_email))
 
         reporte = []
 
@@ -733,45 +751,24 @@ class NotificationUseCase:
         sistema_email_ok = config.get("email")
         sistema_wa_ok = config.get("whatsapp")
 
-        def _activo(fields: dict) -> bool:
-            raw = fields.get("activo", {})
-            if "booleanValue" in raw:
-                return raw.get("booleanValue") is True
-            return str(raw.get("stringValue", "")).lower() == "true"
-
-        def _norm_categoria(valor: str) -> str:
-            return str(valor or "").strip().lower()
-        
         if not config.get("proyecto"):
             self.repo.registrar_log_falla(empresa_id, f"Barrido cancelado: Proyecto desactivado en configuración global", "AUTO_BARRIDO")
             return {"status": "off", "msj": "Proyecto desactivado"}
-        
-        docs_email = self.repo.query_categoria(empresa_id, categoria, "plantillas")
-        p_email = next((d["document"]["fields"] for d in docs_email if "document" in d 
-                        and _activo(d["document"]["fields"])), None)
 
-        if not p_email:
-            cat_objetivo = _norm_categoria(categoria)
-            docs_email_all = self.repo.listar_todas_plantillas(empresa_id)
-            p_email = next((
-                d.get("fields", {}) for d in docs_email_all
-                if _norm_categoria(d.get("fields", {}).get("categoria", {}).get("stringValue", "")) == cat_objetivo
-                and _activo(d.get("fields", {}))
-            ), None)
+        p_email_raw = UtilsNotifications._buscar_documento_plantilla(
+            self.repo,
+            empresa_id,
+            categoria,
+            "plantillas",
+        )
+        p_email = p_email_raw.get("fields", {}) if p_email_raw else None
 
-        docs_wa = self.repo.query_categoria(empresa_id, categoria, "plantillas_whatsapp")
-        
-        p_wa_raw = next((d["document"] for d in docs_wa if "document" in d 
-                        and _activo(d["document"]["fields"])), None)
-
-        if not p_wa_raw:
-            cat_objetivo = _norm_categoria(categoria)
-            docs_wa_all = self.repo.listar_plantillas_wa(empresa_id)
-            p_wa_raw = next((
-                {"fields": d.get("fields", {})} for d in docs_wa_all
-                if _norm_categoria(d.get("fields", {}).get("categoria", {}).get("stringValue", "")) == cat_objetivo
-                and _activo(d.get("fields", {}))
-            ), None)
+        p_wa_raw = UtilsNotifications._buscar_documento_plantilla(
+            self.repo,
+            empresa_id,
+            categoria,
+            "plantillas_whatsapp",
+        )
         
         if config.get("email") and not p_email:
             self.repo.registrar_log_falla(empresa_id, f"Email activado pero no hay plantilla activa para '{categoria}'", "AUTO_BARRIDO")
@@ -835,6 +832,8 @@ class NotificationUseCase:
                         if info_archivo:
                             adjuntos_email_dinamicos.append(info_archivo)
 
+                adjuntos_email_dinamicos.extend(UtilsNotifications._obtener_adjuntos_archivos_subidos(p_email))
+
             # PDF para WHATSAPP: si la plantilla tiene documento_adjunto_id, lo generamos y subimos al bucket
             link_wa_doc = None
             nom_wa_doc = None
@@ -852,6 +851,15 @@ class NotificationUseCase:
                         nom_wa_doc = pdf_wa["filename"]
                     except Exception:
                         self.repo.registrar_log_falla(empresa_id, f"Folio {row}: falló generación de PDF para WhatsApp.", "PDF_GEN")
+
+                if not link_wa_doc:
+                    archivo_subido_wa = UtilsNotifications._obtener_primer_archivo_subido_como_link(
+                        p_wa_raw["fields"],
+                        f"Komunah/AutoWA/{row}",
+                    )
+                    if archivo_subido_wa:
+                        link_wa_doc = archivo_subido_wa.get("url_descarga")
+                        nom_wa_doc = archivo_subido_wa.get("filename")
 
             for i in range(1, 7):
                 nombre = data_sql.get(f"{{c{i}.client_name}}")
@@ -1082,7 +1090,7 @@ class StaticEmailClusterUseCase:
                             ids_plantillas=ids_documentos,
                             folio=f_str,
                             db=db,
-                            subir_bucket=False,
+                            subir_bucket=True,
                         )
                     )
                     adjuntos_dinamicos = [
@@ -1411,23 +1419,30 @@ class GenerarPDFUseCase:
         return html_con_filas, totales
 
     def _obtener_plantillas_por_categoria(self, empresa_id: str, categoria: str):
-        docs = self.repo.listar_plantillas_juridico(empresa_id)
-        candidatos = []
-        for d in docs:
-            fields = d.get("fields", {})
-            if fields.get("categoria", {}).get("stringValue", "") == categoria:
-                candidatos.append(d)
-
-        if not candidatos:
-            raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica para categoría '{categoria}'.")
-
-        return next(
-            (
-                d for d in candidatos
-                if d.get("fields", {}).get("activo", {}).get("booleanValue") is True
-            ),
-            candidatos[0],
+        doc_activo = UtilsNotifications._buscar_documento_plantilla(
+            self.repo,
+            empresa_id,
+            categoria,
+            "plantillas_juridico",
+            solo_activas=True,
+            fallback_listado=True,
         )
+        if doc_activo:
+            return doc_activo
+
+        doc_cualquiera = UtilsNotifications._buscar_documento_plantilla(
+            self.repo,
+            empresa_id,
+            categoria,
+            "plantillas_juridico",
+            solo_activas=False,
+            fallback_listado=True,
+        )
+        if doc_cualquiera:
+            return doc_cualquiera
+
+        if not doc_cualquiera:
+            raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica para categoría '{categoria}'.")
 
     @staticmethod
     def _subir_pdf_a_bucket(pdf_bytes: bytes, ruta_carpeta: str, nombre_archivo: str) -> str:
@@ -1445,14 +1460,7 @@ class GenerarPDFUseCase:
 
         return blob.generate_signed_url(version="v4", expiration=timedelta(hours=1), method="GET")
 
-    async def generar_pdf_por_categoria(
-        self,
-        empresa_id: str,
-        categoria: str,
-        folio: str,
-        db: Session,
-        subir_bucket: bool = False,
-    ):
+    async def generar_pdf_por_categoria(self, empresa_id: str, categoria: str, folio: str, db: Session, subir_bucket: bool = False):
         logger.info(
             "[PDF_GENERADOR] Entrada generar_pdf_por_categoria | empresa=%s | categoria=%s | folio=%s | subir_bucket=%s",
             empresa_id,
@@ -1466,7 +1474,7 @@ class GenerarPDFUseCase:
 
             logger.info("[PDF_GENERADOR] Paso: obtener proveedor de datos")
             pack_empresa = PROVIDERS.get(empresa_id, {})
-            extraer_datos = pack_empresa.get("get_sin_clientes")
+            extraer_datos = pack_empresa.get("get")
             if not extraer_datos:
                 raise HTTPException(status_code=400, detail="Empresa no configurada.")
 
@@ -1497,6 +1505,7 @@ class GenerarPDFUseCase:
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas y generar PDF")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
             nombre_plantilla = fields.get("categoria", {}).get("stringValue", "documento")
+            tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
             nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')} - {self._normalizar_fragmento(cliente, 'Cliente')}.pdf"
 
             async with async_playwright() as p:
@@ -1506,13 +1515,14 @@ class GenerarPDFUseCase:
                 await page.emulate_media(media="screen")
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(format="A4", print_background=True)
+                pdf_bytes = await page.pdf(format=tamanoDocumento, print_background=True)
                 await browser.close()
 
             respuesta = {
                 "filename": nombre_pdf,
                 "content": base64.b64encode(pdf_bytes).decode("utf-8"),
                 "content_type": "application/pdf",
+                "tamanoDocumento": tamanoDocumento
             }
 
             if subir_bucket:
@@ -1581,7 +1591,7 @@ class GenerarPDFUseCase:
 
         nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
         nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')}.pdf"
-
+        tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
         logger.info("[PDF_GENERADOR] Paso: render PDF con Playwright")
         async with async_playwright() as p:
             browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -1590,7 +1600,7 @@ class GenerarPDFUseCase:
             await page.emulate_media(media="screen")
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(400)
-            pdf_bytes = await page.pdf(format="A4", print_background=True)
+            pdf_bytes = await page.pdf(format=tamanoDocumento, print_background=True)
             await browser.close()
 
         respuesta = {
@@ -1598,6 +1608,7 @@ class GenerarPDFUseCase:
             "filename": nombre_pdf,
             "content": base64.b64encode(pdf_bytes).decode("utf-8"),
             "content_type": "application/pdf",
+            "tamanoDocumento": tamanoDocumento
         }
 
         if subir_bucket:
@@ -1653,7 +1664,7 @@ class GenerarPDFUseCase:
                 id_plantilla=id_plantilla,
                 folio=folio,
                 db=db,
-                subir_bucket=False,
+                subir_bucket=True,
             )
         except HTTPException:
             logger.exception(
@@ -1673,6 +1684,131 @@ class GenerarPDFUseCase:
             )
             raise HTTPException(status_code=500, detail=f"Error en generar_pdf_desde_plantilla (folio={folio}, plantilla={id_plantilla}): {str(e)}")
 
+class UtilsNotifications:
+    @staticmethod
+    async def _normalizar_payload_y_archivos(
+        model_cls,
+        datos_modelo=None,
+        datos_json: Optional[str] = None,
+        archivos: Optional[List[UploadFile]] = None,
+        allow_empty_payload: bool = False,
+    ):
+        if datos_json:
+            try:
+                data = json.loads(datos_json)
+                payload = model_cls(**data)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"datos_json inválido: {str(exc)}") from exc
+        elif datos_modelo is not None:
+            payload = datos_modelo
+        else:
+            if allow_empty_payload:
+                payload = model_cls()
+            else:
+                raise HTTPException(status_code=400, detail="Debes enviar un body JSON o datos_json (multipart/form-data).")
+
+        archivos_map = {}
+        archivos_meta = {}
+        if archivos:
+            for f in archivos:
+                if f and f.filename:
+                    contenido = await f.read()
+                    archivos_map[f.filename] = base64.b64encode(contenido).decode("utf-8")
+                    mime_type = f.content_type or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
+                    archivos_meta[f.filename] = {
+                        "mime_type": mime_type,
+                        "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
+                    }
+
+        return payload, archivos_map, archivos_meta
+
+    @staticmethod
+    def _obtener_adjuntos_archivos_subidos(fields: dict) -> List[dict]:
+        archivos_map = fields.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {})
+        adjuntos = []
+        for nombre_archivo, nodo in archivos_map.items():
+            contenido_b64 = nodo.get("stringValue")
+            if contenido_b64:
+                adjuntos.append({"content": contenido_b64, "filename": nombre_archivo})
+        return adjuntos
+
+    @staticmethod
+    def _obtener_primer_archivo_subido_como_link(fields: dict, carpeta_bucket: str) -> Optional[dict]:
+        adjuntos = UtilsNotifications._obtener_adjuntos_archivos_subidos(fields)
+        if not adjuntos:
+            return None
+
+        primer_adjunto = adjuntos[0]
+        try:
+            url_descarga = GenerarPDFUseCase._subir_pdf_a_bucket(
+                base64.b64decode(primer_adjunto["content"]),
+                carpeta_bucket,
+                primer_adjunto["filename"],
+            )
+            return {"url_descarga": url_descarga, "filename": primer_adjunto["filename"]}
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalizar_categoria(valor: str) -> str:
+        return str(valor or "").strip().lower()
+
+    @staticmethod
+    def _es_plantilla_activa(fields: dict) -> bool:
+        raw = fields.get("activo", {})
+        if "booleanValue" in raw:
+            return raw.get("booleanValue") is True
+        return str(raw.get("stringValue", "")).strip().lower() == "true"
+
+    @staticmethod
+    def _listar_documentos_por_coleccion(repo: FirebaseRepository, empresa_id: str, coleccion: str) -> List[dict]:
+        if coleccion == "plantillas":
+            return repo.listar_todas_plantillas(empresa_id)
+        if coleccion == "plantillas_whatsapp":
+            return repo.listar_plantillas_wa(empresa_id)
+        if coleccion == "plantillas_juridico":
+            return repo.listar_plantillas_juridico(empresa_id)
+        return []
+
+    @staticmethod
+    def _buscar_documento_plantilla(
+        repo: FirebaseRepository,
+        empresa_id: str,
+        categoria: str,
+        coleccion: str,
+        solo_activas: bool = True,
+        fallback_listado: bool = True,
+    ) -> Optional[dict]:
+        categoria_objetivo = UtilsNotifications._normalizar_categoria(categoria)
+        if not categoria_objetivo:
+            return None
+
+        docs_query = repo.query_categoria(empresa_id, categoria, coleccion)
+        for item in docs_query:
+            doc = item.get("document")
+            if not doc:
+                continue
+            fields = doc.get("fields", {})
+            if UtilsNotifications._normalizar_categoria(fields.get("categoria", {}).get("stringValue", "")) != categoria_objetivo:
+                continue
+            if solo_activas and not UtilsNotifications._es_plantilla_activa(fields):
+                continue
+            return doc
+
+        if not fallback_listado:
+            return None
+
+        docs_all = UtilsNotifications._listar_documentos_por_coleccion(repo, empresa_id, coleccion)
+        for doc in docs_all:
+            fields = doc.get("fields", {})
+            if UtilsNotifications._normalizar_categoria(fields.get("categoria", {}).get("stringValue", "")) != categoria_objetivo:
+                continue
+            if solo_activas and not UtilsNotifications._es_plantilla_activa(fields):
+                continue
+            return doc
+
+        return None
+
 #region CRUD Plantillas para correo
 
 @router_crud.get("/{empresa_id}/conteo/{categoria}")
@@ -1683,7 +1819,20 @@ def api_contar_plantillas(empresa_id: str, categoria: str,user: dict = Depends(e
     return {"categoria": categoria, "total": total}
 
 @router_crud.post("/{empresa_id}", status_code=201)
-def api_crear_plantilla(empresa_id: str, p: PlantillaBase, user: dict = Depends(es_admin)):
+async def api_crear_plantilla(
+    empresa_id: str,
+    p: Optional[PlantillaBase] = Body(default=None),
+    datos_json: Optional[str] = Form(default=None),
+    archivos: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(es_admin),
+):
+    p, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=PlantillaBase,
+        datos_modelo=p,
+        datos_json=datos_json,
+        archivos=archivos,
+    )
+
     repo = FirebaseRepository()
     
     nombre_id = repo.generar_siguiente_id(empresa_id)
@@ -1712,6 +1861,28 @@ def api_crear_plantilla(empresa_id: str, p: PlantillaBase, user: dict = Depends(
             if mapeo:
                 fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
                 payload["fields"]["documentos_adjuntos"] = {"mapValue": {"fields": fire_map}}
+
+    if archivos_map:
+        payload["fields"]["archivos_subidos"] = {
+            "mapValue": {
+                "fields": {k: {"stringValue": v} for k, v in archivos_map.items()}
+            }
+        }
+        payload["fields"]["archivos_subidos_meta"] = {
+            "mapValue": {
+                "fields": {
+                    k: {
+                        "mapValue": {
+                            "fields": {
+                                "mime_type": {"stringValue": v["mime_type"]},
+                                "tipo_visual": {"stringValue": v["tipo_visual"]},
+                            }
+                        }
+                    }
+                    for k, v in archivos_meta.items()
+                }
+            }
+        }
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     
@@ -1721,17 +1892,73 @@ def api_crear_plantilla(empresa_id: str, p: PlantillaBase, user: dict = Depends(
     return {"status": "creada", "id": nombre_id, "nombre": p.nombre}
     
 @router_crud.patch("/{empresa_id}/{doc_id}")
-def api_actualizar_plantilla(empresa_id: str, doc_id: str, datos: PlantillaUpdate, user: dict = Depends(es_admin)):
+async def api_actualizar_plantilla(
+    empresa_id: str,
+    doc_id: str,
+    datos: Optional[PlantillaUpdate] = Body(default=None),
+    datos_json: Optional[str] = Form(default=None),
+    archivos: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(es_admin),
+):
+    datos, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=PlantillaUpdate,
+        datos_modelo=datos,
+        datos_json=datos_json,
+        archivos=archivos,
+        allow_empty_payload=True,
+    )
 
     campos = datos.dict(exclude_unset=True)
-    if not campos or (len(campos) == 1 and "static" in campos):
+    if (not campos or (len(campos) == 1 and "static" in campos)) and not archivos_map:
         raise HTTPException(status_code=400, detail="No enviaste campos válidos para actualizar.")
     repo = FirebaseRepository()
-    
 
-    res = repo.actualizar_plantilla(empresa_id, doc_id, datos)
+    res = None
+    if campos:
+        res = repo.actualizar_plantilla(empresa_id, doc_id, datos)
+
+    if archivos_map:
+        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
+        payload_files = {
+            "fields": {
+                "archivos_subidos": {
+                    "mapValue": {
+                        "fields": {k: {"stringValue": v} for k, v in archivos_map.items()}
+                    }
+                },
+                "archivos_subidos_meta": {
+                    "mapValue": {
+                        "fields": {
+                            k: {
+                                "mapValue": {
+                                    "fields": {
+                                        "mime_type": {"stringValue": v["mime_type"]},
+                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
+                                    }
+                                }
+                            }
+                            for k, v in archivos_meta.items()
+                        }
+                    }
+                }
+            }
+        }
+        res_files = requests.patch(
+            url,
+            json=payload_files,
+            params=[
+                ("updateMask.fieldPaths", "archivos_subidos"),
+                ("updateMask.fieldPaths", "archivos_subidos_meta"),
+            ],
+            headers=repo.headers,
+            timeout=10,
+        )
+        if res_files.status_code != 200:
+            raise HTTPException(status_code=res_files.status_code, detail=res_files.text)
     
     if res is None:
+        if archivos_map:
+            return {"status": "actualizada", "id": doc_id, "mensaje": "Archivos actualizados"}
         return {"status": "actualizada", "id": doc_id, "mensaje": "No se detectaron cambios"}
     
     if res.status_code == 200 and datos.activo is True:
@@ -1825,6 +2052,13 @@ def api_get_detalle_plantilla(empresa_id: str, doc_id: str, user: dict = Depends
         raise HTTPException(status_code=404, detail="Esa plantilla no existe en Firebase")
         
     f = doc.get("fields", {})
+    archivos_subidos_meta = {
+        k: {
+            "mime_type": v.get("mapValue", {}).get("fields", {}).get("mime_type", {}).get("stringValue", "application/octet-stream"),
+            "tipo_visual": v.get("mapValue", {}).get("fields", {}).get("tipo_visual", {}).get("stringValue", "file"),
+        }
+        for k, v in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
+    }
     return {
         "id": doc["name"].split("/")[-1],
         "nombre": f.get("nombre", {}).get("stringValue", ""),
@@ -1834,7 +2068,9 @@ def api_get_detalle_plantilla(empresa_id: str, doc_id: str, user: dict = Depends
         "activo": f.get("activo", {}).get("booleanValue") is True or f.get("activo", {}).get("stringValue") == "true",
         "static": f.get("static", {}).get("booleanValue", False),
         "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
-        "documentos_adjuntos": {k: v.get("stringValue") for k, v in f.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).items()}
+        "documentos_adjuntos": {k: v.get("stringValue") for k, v in f.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).items()},
+        "archivos_subidos": {k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()},
+        "archivos_subidos_meta": archivos_subidos_meta,
     }
 
 #endregion
@@ -1960,13 +2196,25 @@ async def api_enviar_estatico(
             ids_plantillas=array_documentos,
             folio=str(d.get("folio", "")),
             db=db,
-            subir_bucket=False,
+            subir_bucket=True,
         )
         for adjunto_pdf in adjuntos_pdf:
             adjuntos_procesados.append({
                 "content": adjunto_pdf["content"],
                 "filename": adjunto_pdf["filename"],
             })
+
+    categoria = d.get("categoria")
+    if categoria:
+        repo = FirebaseRepository()
+        p_email_raw = UtilsNotifications._buscar_documento_plantilla(
+            repo,
+            empresa_id,
+            categoria,
+            "plantillas",
+        )
+        if p_email_raw:
+            adjuntos_procesados.extend(UtilsNotifications._obtener_adjuntos_archivos_subidos(p_email_raw.get("fields", {})))
 
     from argparse import Namespace
     datos_finales = Namespace(
@@ -2036,107 +2284,6 @@ async def api_disparar_barrido(
     use_case = NotificationUseCase(repo, gateway)
     return await use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo, simular=simular)
 
-@router.get("/documentos-folio/{empresa_id}/{folio}", tags=["Consulta Documentos"])
-def api_consultar_documentos_folio(
-    empresa_id: str,
-    folio: str,
-    db: Session = Depends(get_db),
-    user: dict = Depends(es_usuario)
-):
-    """
-    Consulta los documentos generados en el bucket de GCS para todos los clientes de un folio.
-    Devuelve archivos agrupados por categoría con links de descarga (signed URLs, 1h).
-    Busca en: Komunah/PlantillasMovil/Categorias/{categoria}/{nombre_cliente}/
-    """
-    pack_empresa = PROVIDERS.get(empresa_id, {})
-    extraer_datos = pack_empresa.get("get")
-    if not extraer_datos:
-        raise HTTPException(status_code=400, detail=f"Empresa '{empresa_id}' no configurada.")
-
-    data_sql = extraer_datos(folio, db)
-    if not data_sql:
-        raise HTTPException(status_code=404, detail=f"El folio {folio} no existe o no tiene datos en SQL.")
-
-    # Extraer nombres de clientes del folio (c1 a c6)
-    nombres_clientes = []
-    for i in range(1, 7):
-        nombre = data_sql.get(f"{{c{i}.client_name}}")
-        if nombre and str(nombre).strip() not in ["", "None", "NULL"]:
-            nombres_clientes.append(str(nombre).strip())
-
-    if not nombres_clientes:
-        raise HTTPException(status_code=404, detail=f"El folio {folio} no tiene clientes asociados.")
-
-    # Conectar con GCS (fallback para diferentes formas de levantar el contenedor)
-    cred_path = os.getenv("STORAGE_CREDENTIALS_PATH") or "/app/serviceAccountKeySTORAGE.json"
-    if not os.path.exists(cred_path):
-        # Intentar ruta relativa (cuando se corre fuera de Docker)
-        cred_path = "serviceAccountKeySTORAGE.json"
-    if not os.path.exists(cred_path):
-        raise HTTPException(status_code=500, detail="No se encontró el archivo de credenciales de Storage.")
-
-    storage_client = storage.Client.from_service_account_json(cred_path)
-    bucket = storage_client.bucket(BUCKET_NAME)
-
-    base_prefix = "Komunah/PlantillasMovil/Categorias/"
-
-    # 1. Listar todas las categorías disponibles
-    categorias_iter = bucket.list_blobs(prefix=base_prefix, delimiter="/")
-    list(categorias_iter)  # forzar iteración para llenar prefixes
-    categorias = [p.replace(base_prefix, "").rstrip("/") for p in categorias_iter.prefixes]
-
-    resultado_categorias = {}
-    total_documentos = 0
-
-    # 2. Para cada categoría, buscar carpetas de los clientes del folio
-    for cat in categorias:
-        for nombre_cliente in nombres_clientes:
-            prefix_cliente = f"{base_prefix}{cat}/{nombre_cliente}/"
-            blobs = list(bucket.list_blobs(prefix=prefix_cliente))
-
-            if not blobs:
-                continue
-
-            archivos = []
-            for blob in blobs:
-                # Saltar "carpetas" vacías
-                if blob.name.endswith("/"):
-                    continue
-
-                nombre_archivo = blob.name.split("/")[-1]
-                signed_url = blob.generate_signed_url(
-                    version="v4",
-                    expiration=timedelta(hours=1),
-                    method="GET"
-                )
-
-                archivos.append({
-                    "nombre": nombre_archivo,
-                    "tamaño_kb": round((blob.size or 0) / 1024, 1),
-                    "fecha_creacion": blob.time_created.isoformat() if blob.time_created else None,
-                    "url_descarga": signed_url
-                })
-
-            if archivos:
-                if cat not in resultado_categorias:
-                    resultado_categorias[cat] = {}
-                resultado_categorias[cat][nombre_cliente] = archivos
-                total_documentos += len(archivos)
-
-    # Extraer el propietario principal
-    propietario = data_sql.get("{cl.cliente}") or (nombres_clientes[0] if nombres_clientes else "Cliente")
-
-    # Filtrar al propietario de la lista de clientes para evitar redundancia
-    clientes_restantes = [c for c in nombres_clientes if c != propietario]
-
-    return {
-        "folio": folio,
-        "propietario": propietario,
-        "clientes": clientes_restantes,
-        "categorias": resultado_categorias,
-        "total_documentos": total_documentos
-    }
-
 EJEMPLO_FINAL = {
     "clusters": ["Planta Baja", "Etapa 1"],
     "pipeline_status": ["Contrato Firmado"], # <-- Nuevo filtro
@@ -2147,7 +2294,8 @@ EJEMPLO_FINAL = {
     "simular": False,
     "excluir_folios": ["1975"],
     "excluir_emails": ["test@test.com"],
-    "excluir_clientes": ["Nombre a Excluir"]
+    "excluir_clientes": ["Nombre a Excluir"],
+    "arrayDocumentos": ["KO-0009", "KO-0010"]  # Puede ser string CSV o lista
 }
 
 @router.post("/{empresa_id}/enviar-cluster")
@@ -2195,6 +2343,19 @@ async def api_proceso_cluster(
                     "content": base64.b64encode(await f.read()).decode(),
                     "filename": f.filename
                 })
+
+    categoria = data_dict.get("categoria")
+    if categoria:
+        repo = FirebaseRepository()
+        p_email_raw = UtilsNotifications._buscar_documento_plantilla(
+            repo,
+            empresa_id,
+            categoria,
+            "plantillas",
+        )
+        if p_email_raw:
+            adjuntos.extend(UtilsNotifications._obtener_adjuntos_archivos_subidos(p_email_raw.get("fields", {})))
+
     logger.info("[CLUSTER_API] Adjuntos normalizados=%s | arrayDocumentos=%s", len(adjuntos), len(array_documentos))
 
     config_final = datos_validados.dict()
@@ -2212,7 +2373,20 @@ async def api_proceso_cluster(
 #region CRUD Plantillas para WhatsApp
 
 @router_wa.post("/{empresa_id}", status_code=201)
-def api_crear_plantilla_wa(empresa_id: str, p: PlantillaWABase, user: dict = Depends(es_admin)):
+async def api_crear_plantilla_wa(
+    empresa_id: str,
+    p: Optional[PlantillaWABase] = Body(default=None),
+    datos_json: Optional[str] = Form(default=None),
+    archivos: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(es_admin),
+):
+    p, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=PlantillaWABase,
+        datos_modelo=p,
+        datos_json=datos_json,
+        archivos=archivos,
+    )
+
     repo = FirebaseRepository()
     
 
@@ -2241,6 +2415,28 @@ def api_crear_plantilla_wa(empresa_id: str, p: PlantillaWABase, user: dict = Dep
             if mapeo:
                 fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
                 payload["fields"]["documento_adjunto_id"] = {"mapValue": {"fields": fire_map}}
+
+    if archivos_map:
+        payload["fields"]["archivos_subidos"] = {
+            "mapValue": {
+                "fields": {k: {"stringValue": v} for k, v in archivos_map.items()}
+            }
+        }
+        payload["fields"]["archivos_subidos_meta"] = {
+            "mapValue": {
+                "fields": {
+                    k: {
+                        "mapValue": {
+                            "fields": {
+                                "mime_type": {"stringValue": v["mime_type"]},
+                                "tipo_visual": {"stringValue": v["tipo_visual"]},
+                            }
+                        }
+                    }
+                    for k, v in archivos_meta.items()
+                }
+            }
+        }
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     
@@ -2254,13 +2450,71 @@ def api_crear_plantilla_wa(empresa_id: str, p: PlantillaWABase, user: dict = Dep
     return {"status": "creada", "id": nombre_id}
 
 @router_wa.patch("/{empresa_id}/{doc_id}")
-def api_patch_wa(empresa_id: str, doc_id: str, datos: PlantillaWAUpdate, user: dict = Depends(es_admin)):
+async def api_patch_wa(
+    empresa_id: str,
+    doc_id: str,
+    datos: Optional[PlantillaWAUpdate] = Body(default=None),
+    datos_json: Optional[str] = Form(default=None),
+    archivos: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(es_admin),
+):
+    datos, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=PlantillaWAUpdate,
+        datos_modelo=datos,
+        datos_json=datos_json,
+        archivos=archivos,
+        allow_empty_payload=True,
+    )
+
     repo = FirebaseRepository()
-    
-    
-    res = repo.actualizar_plantilla_wa(empresa_id, doc_id, datos)
+
+    campos = datos.dict(exclude_unset=True)
+    res = None
+    if campos:
+        res = repo.actualizar_plantilla_wa(empresa_id, doc_id, datos)
+
+    if archivos_map:
+        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
+        payload_files = {
+            "fields": {
+                "archivos_subidos": {
+                    "mapValue": {
+                        "fields": {k: {"stringValue": v} for k, v in archivos_map.items()}
+                    }
+                },
+                "archivos_subidos_meta": {
+                    "mapValue": {
+                        "fields": {
+                            k: {
+                                "mapValue": {
+                                    "fields": {
+                                        "mime_type": {"stringValue": v["mime_type"]},
+                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
+                                    }
+                                }
+                            }
+                            for k, v in archivos_meta.items()
+                        }
+                    }
+                }
+            }
+        }
+        res_files = requests.patch(
+            url,
+            json=payload_files,
+            params=[
+                ("updateMask.fieldPaths", "archivos_subidos"),
+                ("updateMask.fieldPaths", "archivos_subidos_meta"),
+            ],
+            headers=repo.headers,
+            timeout=10,
+        )
+        if res_files.status_code != 200:
+            raise HTTPException(status_code=res_files.status_code, detail=res_files.text)
     
     if res is None:
+        if archivos_map:
+            return {"status": "actualizada", "id": doc_id, "mensaje": "Archivos actualizados"}
         return {"status": "actualizada", "id": doc_id, "mensaje": "Sin cambios realizados"}
 
     if res.status_code == 200 and datos.activo is True:
@@ -2323,6 +2577,13 @@ def api_get_detalle_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depe
         raise HTTPException(status_code=404, detail="Esa plantilla no existe.")
         
     f = doc.get("fields", {})
+    archivos_subidos_meta = {
+        k: {
+            "mime_type": v.get("mapValue", {}).get("fields", {}).get("mime_type", {}).get("stringValue", "application/octet-stream"),
+            "tipo_visual": v.get("mapValue", {}).get("fields", {}).get("tipo_visual", {}).get("stringValue", "file"),
+        }
+        for k, v in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
+    }
     return {
         "id": doc["name"].split("/")[-1],
         "nombre": f.get("nombre", {}).get("stringValue", ""),
@@ -2332,7 +2593,9 @@ def api_get_detalle_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depe
         "mensaje": f.get("mensaje", {}).get("stringValue", ""),
         "activo": f.get("activo", {}).get("booleanValue", False),
         "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])],
-        "documento_adjunto_id": {k: v.get("stringValue") for k, v in f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).items()}
+        "documento_adjunto_id": {k: v.get("stringValue") for k, v in f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).items()},
+        "archivos_subidos": {k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()},
+        "archivos_subidos_meta": archivos_subidos_meta,
     }
 
 #endregion
@@ -2539,6 +2802,8 @@ def api_obtener_config_recordatorios(
 
 #endregion
 
+#region Endpoint de Búsqueda de Expedientes para Searchbox
+
 @router.get("/busqueda-expedientes", response_model=List[SearchboxExpedienteResponse])
 def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     # 1. Filtramos activos: Diferente a 'Expirado' y 'Cancelado'
@@ -2597,6 +2862,7 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
 
     return resultado
 
+#endregion
 
 #region CRUD Plantillas para Jurídico
 
@@ -2611,6 +2877,7 @@ def listar_juridico(empresa_id: str, user: dict = Depends(es_admin)):
             "id": d["name"].split("/")[-1],
             "nombre": f.get("nombre", {}).get("stringValue", ""),
             "categoria": f.get("categoria", {}).get("stringValue", ""),
+            "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", "0"),
             "activo": f.get("activo", {}).get("booleanValue", False),
             "static": f.get("static", {}).get("booleanValue", False),
             "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
@@ -2629,6 +2896,7 @@ def api_get_detalle_juridico(empresa_id: str, doc_id: str, user: dict = Depends(
         "id": doc["name"].split("/")[-1],
         "nombre": f.get("nombre", {}).get("stringValue", ""),
         "categoria": f.get("categoria", {}).get("stringValue", ""),
+        "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", "0"),
         "html": f.get("html", {}).get("stringValue", ""),
         "activo": f.get("activo", {}).get("booleanValue", False),
         "static": f.get("static", {}).get("booleanValue", False),
@@ -2646,6 +2914,7 @@ def crear_plantilla_juridico(empresa_id: str, p: JuridicoBase, user: dict = Depe
         "nombre": {"stringValue": p.nombre},
         "categoria": {"stringValue": p.categoria},
         "html": {"stringValue": p.html},
+        "tamanoDocumento": {"stringValue": str(len(p.html))},
         "activo": {"booleanValue": bool(p.activo)},
         "static": {"booleanValue": False},
         "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}

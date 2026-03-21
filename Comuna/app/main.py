@@ -13,7 +13,6 @@ import logging
 from zoneinfo import ZoneInfo
 from .services.sync_service import AutoSyncManager
 
-      
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)    
 
@@ -26,7 +25,8 @@ from .routers import (
     login, 
     datos, 
     emails, 
-    notificaciones, 
+    notificaciones,
+    Documentos,
     notificaciones_estaticas,
     notificacionesMS,
     usuarios,
@@ -234,12 +234,13 @@ else:
     app.include_router(usuarios.router)
     app.include_router(datos.router)
     app.include_router(emails.router)
+    app.include_router(DashboardKomunah.router)
+    app.include_router(Documentos.router)
+    app.include_router(webhook.router)
+    app.include_router(Cobranza.router)
     app.include_router(notificaciones.router)
     app.include_router(notificaciones_estaticas.router)
     app.include_router(reportes.router)
-    app.include_router(webhook.router)
-    app.include_router(Cobranza.router)
-    app.include_router(DashboardKomunah.router)
     app.include_router(admin.router)
     app.include_router(debug_config.router)
 

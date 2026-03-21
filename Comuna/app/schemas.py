@@ -3,6 +3,7 @@ from typing import List, Any, Optional, Dict
 from pydantic import EmailStr
 from decimal import Decimal,ROUND_HALF_UP
 from pydantic import BaseModel
+from datetime import date
 
 class ConfigBase:
     from_attributes = True
@@ -503,6 +504,7 @@ class JuridicoBase(BaseModel):
     nombre: str
     categoria: str
     html: str
+    tamanoDocumento: str
     activo: bool = False
     tags_departamento: List[str] = []
 
@@ -532,6 +534,37 @@ class ReporteExpedientesDetalladoResponse(BaseModel):
     plazo: Any = Field(alias="PLAZO")
     precio_total: Any = Field(alias="PRECIO TOTAL")
 
-    class Config:
-        populate_by_name = True
-        from_attributes = True
+class Config:
+    populate_by_name = True
+    from_attributes = True
+
+class DocumentosSchema(BaseModel):
+    empresa_id: str
+    folio: str
+
+class DocumentosSchemaGeneracion(BaseModel):
+    empresa_id: str
+    folio: str
+    categoria: str
+
+class DocumentosFiltroSchema(BaseModel):
+    categoria: Optional[str] = None
+    cliente: Optional[str] = None
+    fecha_inicio: Optional[date] = None
+    fecha_fin: Optional[date] = None
+
+
+class DocumentoDescargaSchema(BaseModel):
+    blob_path: str
+
+
+class DocumentoGenerarSubirSchema(BaseModel):
+    categoria: str
+    cliente: str
+    nombre_archivo: str
+    contenido_base64: str
+    content_type: Optional[str] = "application/octet-stream"
+
+
+class DocumentoEliminarSchema(BaseModel):
+    blob_path: str
