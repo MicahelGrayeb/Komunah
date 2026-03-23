@@ -41,7 +41,7 @@ def get_komunah_data(folio_ref: str, db: Session):
             "{cl.cliente}": "",
             "{cl.num}": "",
             "{cl.fecha}": "",
-            "{cl.fecha_pago_corta}": "",
+            "{cl.fecha_pago}": "",
             "{cl.dias_para_pago}": "",
             "{cl.concepto}": "",
             "{cl.proyecto}": ""
@@ -148,7 +148,7 @@ def get_komunah_data(folio_ref: str, db: Session):
         "{cl.cliente}": str(getattr(venta, 'cliente', "")),
         "{cl.num}": str(getattr(p_act, 'number', "")) if p_act else "",
         "{cl.fecha}": str(getattr(p_act, 'date', "")) if p_act else "",
-        "{cl.fecha_pago_corta}": fecha_pago_humanizada,
+        "{cl.fecha_pago}": fecha_pago_humanizada,
         "{cl.dias_para_pago}": dias_para_vencer,
         "{cl.concepto}": str(getattr(p_act, 'concept', "")) if p_act else "",
         "{cl.proyecto}": str(getattr(venta, 'desarrollo', ""))
@@ -480,7 +480,7 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
         "{cl.cliente}", 
         "{cl.num}", 
         "{cl.fecha}", 
-        "{cl.fecha_pago_corta}", 
+        "{cl.fecha_pago}", 
         "{cl.dias_para_pago}", 
         "{cl.concepto}", 
         "{cl.proyecto}"
