@@ -1,4 +1,4 @@
-﻿from sqlalchemy import text, cast, BigInteger, func
+from sqlalchemy import text, cast, BigInteger, func
 from ..models import Venta, Cliente, Amortizacion, GestionClientes, ConfigEtapa, Pago, Cartera
 from ..services.pagos_utils import encontrar_pago_actual, encontrar_pago_actual_mes
 from sqlalchemy.inspection import inspect
@@ -133,10 +133,8 @@ def get_komunah_data(folio_ref: str, db: Session):
             delta = (fecha_vencimiento - fecha_hoy).days
             dias_para_vencer = delta
             
-            # Formateamos la fecha para que se vea pro (ej. 15 de Marzo)
-            meses = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
-                     "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
-            fecha_pago_humanizada = f"{fecha_vencimiento.day} de {meses[fecha_vencimiento.month - 1]}"
+            # Formateamos la fecha (ej. 15/03/2026)
+            fecha_pago_humanizada = fecha_vencimiento.strftime('%d/%m/%Y')
         except Exception as e:
             logger.error(f"[DATOS_KOMUNAH] Error calculando dias_para_vencer: {e}")
 
