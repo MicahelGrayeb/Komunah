@@ -614,6 +614,7 @@ class StaticWAUseCase:
             "variables": [v.get("stringValue") for v in f_wa.get("variables", {}).get("arrayValue", {}).get("values", [])]
         }
         reporte = []
+        wa_enviados_folio = set()
         for i in range(1, 7):
             nombre = data_sql.get(f"{{c{i}.client_name}}")
             telefono = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "").replace("-", "")
@@ -699,7 +700,7 @@ class StaticEmailFolioUseCase:
         lista_adjuntos.extend(UtilsNotifications._obtener_adjuntos_archivos_subidos(f_email))
 
         reporte = []
-
+        emails_enviados_folio = set()
         for i in range(1, 7):
             nombre = data_sql.get(f"{{c{i}.client_name}}")
             email = data_sql.get(f"{{g{i}.email}}")
@@ -707,6 +708,9 @@ class StaticEmailFolioUseCase:
 
             if not nombre or not email:
                 continue
+
+            if email in emails_enviados_folio: continue
+            emails_enviados_folio.add(email)
 
             cleaner = NotificationUseCase(self.repo, self.gateway)
             asunto_listo = cleaner._limpiar(f_email.get("asunto", {}).get("stringValue", ""), data_sql, nombre, email, phone)
@@ -874,6 +878,9 @@ class NotificationUseCase:
                         link_wa_doc = archivo_subido_wa.get("url_descarga")
                         nom_wa_doc = archivo_subido_wa.get("filename")
 
+            emails_enviados_folio = set()
+            wa_enviados_folio = set()
+
             for i in range(1, 7):
                 nombre = data_sql.get(f"{{c{i}.client_name}}")
                 if not nombre: continue
@@ -897,7 +904,10 @@ class NotificationUseCase:
                 elif not email:
                     self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: No tiene correo registrado.", "DATA_MISSING")
                     resultado_envio["email"] = "NO_DATA"
+                elif email in emails_enviados_folio:
+                    resultado_envio["email"] = "DUPLICADO_EN_ESTE_FOLIO"
                 else:
+                    emails_enviados_folio.add(email)
                     if simular:
                         res_status = f"SIMULADO_OK ({len(adjuntos_email_dinamicos)} PDFs listos)"
                     else:
@@ -926,7 +936,10 @@ class NotificationUseCase:
                 elif not phone:
                     self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Falta número de teléfono.", "DATA_MISSING")
                     resultado_envio["wa"] = "NO_PHONE"
+                elif phone in wa_enviados_folio:
+                    resultado_envio["wa"] = "DUPLICADO_EN_ESTE_FOLIO"
                 else:
+                    wa_enviados_folio.add(phone)
                     parametros_dinamicos = []
                     for var_nombre in p_wa["variables"]:
                         if var_nombre in ["{cl.cliente}", "{cliente}", "{v.cliente}"]:
