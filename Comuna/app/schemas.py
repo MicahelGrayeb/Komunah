@@ -354,7 +354,6 @@ class GlobalMassiveUpdate(BaseModel):
 class EmailFolioSchema(BaseModel):
     folio: str
     categoria: str
-    simular: bool = False
     
 class RemitenteCreate(BaseModel):
     remitente: EmailStr
@@ -514,6 +513,7 @@ class JuridicoUpdate(BaseModel):
     html: Optional[str] = None
     activo: Optional[bool] = None
     tags_departamento: Optional[List[str]] = None
+    tamanoDocumento: Optional[str] = None
 
 class ReporteExpedientesDetalladoResponse(BaseModel):
     folio: Any = Field(alias="FOLIO")

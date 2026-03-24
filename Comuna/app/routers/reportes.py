@@ -203,6 +203,8 @@ def get_reporte_detallado(anio: Optional[int] = None, db: Session = Depends(get_
             a.`FOLIO` as FOLIO, 
             a.`CLIENTE` as CLIENTE,
             a.`PROYECTO` as PROYECTO,
+            a.`ASESOR` as ASESOR,
+            a.`ESTADO` as ESTADO,
             a.`FASE` as FASE,
             a.`ETAPA` as ETAPA, 
             a.`UNIDAD` as UNIDAD, 
@@ -239,8 +241,8 @@ def get_reporte_detallado(anio: Optional[int] = None, db: Session = Depends(get_
             ) t WHERE rank_fecha = 1
         ) cv ON a.`FOLIO` = cv.`FOLIO`
         WHERE a.`FECHA DE PAGO` IS NOT NULL 
-          AND a.`FECHA DE PAGO` != ''
-          AND (:anio_val IS NULL OR a.`FECHA DE PAGO` LIKE :busqueda_anio)
+            AND a.`FECHA DE PAGO` != ''
+            AND (:anio_val IS NULL OR a.`FECHA DE PAGO` LIKE :busqueda_anio)
     """)
 
     try:

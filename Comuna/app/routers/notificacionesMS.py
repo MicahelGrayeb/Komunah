@@ -1045,12 +1045,12 @@ class StaticDualUseCase:
         self.repo = repo
         self.gateway = gateway
 
-    async def ejecutar_envio_dual(self, empresa_id: str, datos_wa: WhatsAppManualSchema, datos_email: EmailFolioSchema, db: Session, simular: bool = False):
+    async def ejecutar_envio_dual(self, empresa_id: str, datos_wa: WhatsAppManualSchema, datos_email: EmailFolioSchema, db: Session):
         motor_wa = StaticWAUseCase(self.repo, self.gateway)
         motor_email = StaticEmailFolioUseCase(self.repo, self.gateway)
-        res_wa = await motor_wa.ejecutar_envio_wa(empresa_id, datos_wa, db, simular=simular)
-        res_em = await motor_email.ejecutar_envio_email_folio(empresa_id, datos_email, db, simular=simular)
-        return {"folio": datos_email.folio, "status": "SIMULADO" if simular else "REAL", "whatsapp": res_wa["detalles"], "email": res_em["detalles"]}
+        res_wa = await motor_wa.ejecutar_envio_wa(empresa_id, datos_wa, db)
+        res_em = await motor_email.ejecutar_envio_email_folio(empresa_id, datos_email, db)
+        return {"folio": datos_email.folio, "status": "REAL", "whatsapp": res_wa["detalles"], "email": res_em["detalles"]}
 
 class StaticEmailClusterUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
@@ -2280,14 +2280,14 @@ async def api_enviar_estatico(
     return use_case.ejecutar_envio_manual(empresa_id, datos_finales, db)
 
 @router.post("/{empresa_id}/enviar-whatsapp")
-async def api_enviar_wa(empresa_id: str, datos: WhatsAppManualSchema, simular: bool = False, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
+async def api_enviar_wa(empresa_id: str, datos: WhatsAppManualSchema, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     use_case = StaticWAUseCase(FirebaseRepository(), NotificationGateway())
-    return await use_case.ejecutar_envio_wa(empresa_id, datos, db, simular=simular)
+    return await use_case.ejecutar_envio_wa(empresa_id, datos, db)
 
 @router.post("/{empresa_id}/enviar-email-folio")
-async def api_enviar_email(empresa_id: str, datos: EmailFolioSchema, simular: bool = False, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
+async def api_enviar_email(empresa_id: str, datos: EmailFolioSchema, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     use_case = StaticEmailFolioUseCase(FirebaseRepository(), NotificationGateway())
-    return await use_case.ejecutar_envio_email_folio(empresa_id, datos, db, simular=simular)
+    return await use_case.ejecutar_envio_email_folio(empresa_id, datos, db)
 
 @router.post("/{empresa_id}/enviar-dual")
 def api_enviar_ambos_manual(
@@ -2954,7 +2954,7 @@ def listar_juridico(empresa_id: str, user: dict = Depends(es_admin)):
             "id": d["name"].split("/")[-1],
             "nombre": f.get("nombre", {}).get("stringValue", ""),
             "categoria": f.get("categoria", {}).get("stringValue", ""),
-            "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", "0"),
+            "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False),
             "static": f.get("static", {}).get("booleanValue", False),
             "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
@@ -2973,7 +2973,7 @@ def api_get_detalle_juridico(empresa_id: str, doc_id: str, user: dict = Depends(
         "id": doc["name"].split("/")[-1],
         "nombre": f.get("nombre", {}).get("stringValue", ""),
         "categoria": f.get("categoria", {}).get("stringValue", ""),
-        "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", "0"),
+        "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
         "html": f.get("html", {}).get("stringValue", ""),
         "activo": f.get("activo", {}).get("booleanValue", False),
         "static": f.get("static", {}).get("booleanValue", False),
