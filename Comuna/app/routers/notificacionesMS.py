@@ -400,17 +400,26 @@ class FirebaseRepository:
     def actualizar_plantilla_juridico(self, empresa_id: str, doc_id: str, p: Any):
         fields = {}
         mask = []
+        
         if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
         if p.html: fields["html"] = {"stringValue": p.html}; mask.append("html")
         if p.categoria: fields["categoria"] = {"stringValue": p.categoria}; mask.append("categoria")
+        
+        if hasattr(p, 'tamanoDocumento') and p.tamanoDocumento:
+            fields["tamanoDocumento"] = {"stringValue": p.tamanoDocumento}
+            mask.append("tamanoDocumento")
+
         if p.activo is not None: fields["activo"] = {"booleanValue": bool(p.activo)}; mask.append("activo")
+        
         if hasattr(p, 'tags_departamento') and p.tags_departamento is not None:
             fields["tags_departamento"] = {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}
             mask.append("tags_departamento")
         
         if not mask: return None
+        
         query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}?{query_params}"
+        
         return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
 
     def _get_juridico_mapping_single(self, empresa_id: str, doc_id: str):
@@ -561,7 +570,7 @@ class StaticWAUseCase:
         self.repo = repo
         self.gateway = gateway
 
-    def ejecutar_envio_wa(self, empresa_id: str, datos: WhatsAppManualSchema, db: Session):
+    async def ejecutar_envio_wa(self, empresa_id: str, datos: WhatsAppManualSchema, db: Session):
         pack_empresa = PROVIDERS.get(empresa_id, {})
         extraer_datos = pack_empresa.get("get")
         data_sql = extraer_datos(datos.folio, db)
@@ -583,15 +592,14 @@ class StaticWAUseCase:
         id_documento_wa = next(iter(documentos_map.keys()), None)
         if id_documento_wa:
             pdf_service = GenerarPDFUseCase(self.repo)
-            adjuntos_pdf = asyncio.run(
-                pdf_service.generar_pdfs_desde_plantillas(
+            adjuntos_pdf = await pdf_service.generar_pdfs_desde_plantillas(
                     empresa_id=empresa_id,
                     ids_plantillas=[id_documento_wa],
                     folio=str(datos.folio),
                     db=db,
                     subir_bucket=True,
                 )
-            )
+            
             # WhatsApp solo permite un documento; usamos el primero generado.
             if adjuntos_pdf:
                 adjunto_pdf = adjuntos_pdf[0]
@@ -662,7 +670,7 @@ class StaticEmailFolioUseCase:
         self.repo = repo
         self.gateway = gateway
 
-    def ejecutar_envio_email_folio(self, empresa_id: str, datos: EmailFolioSchema, db: Session):
+    async def ejecutar_envio_email_folio(self, empresa_id: str, datos: EmailFolioSchema, db: Session):
         lista_adjuntos = []
 
         pack_empresa = PROVIDERS.get(empresa_id, {})
@@ -680,15 +688,14 @@ class StaticEmailFolioUseCase:
         ids_documentos = list(f_email.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).keys())
         if ids_documentos:
             pdf_service = GenerarPDFUseCase(self.repo)
-            adjuntos_pdf = asyncio.run(
-                pdf_service.generar_pdfs_desde_plantillas(
-                    empresa_id=empresa_id,
-                    ids_plantillas=ids_documentos,
-                    folio=str(datos.folio),
-                    db=db,
+            adjuntos_pdf = await pdf_service.generar_pdfs_desde_plantillas(
+                empresa_id=empresa_id,
+                ids_plantillas=ids_documentos,
+                folio=str(datos.folio),
+                db=db,
                     subir_bucket=True,
                 )
-            )
+            
             lista_adjuntos = [
                 {
                     "content": adjunto["content"],
@@ -1003,7 +1010,10 @@ class NotificationUseCase:
         data["{email_cliente}"] = str(email_persona or data.get("{email_cliente}") or data.get("{g1.email}") or "")
         data["{telefono_cliente}"] = str(tel_persona or data.get("{telefono_cliente}") or data.get("{g1.telefono}") or "")
 
-        etiquetas_en_texto = set(re.findall(r"\{[^}]+\}", texto))
+        # 1. CAMBIO: Buscamos etiquetas de forma selectiva (solo Alfanuméricos y puntos)
+        regex_etiquetas = r"\{[a-zA-Z0-9_\.]+\}"
+        
+        etiquetas_en_texto = set(re.findall(regex_etiquetas, texto))
         for tag in etiquetas_en_texto:
             valor = data.get(tag)
             if valor is None:
@@ -1011,19 +1021,23 @@ class NotificationUseCase:
             if valor is not None:
                 texto = texto.replace(tag, str(valor))
 
-        pendientes = set(re.findall(r"\{[^}]+\}", texto))
+        # 2. Verificación de pendientes (ya era específica, la dejamos igual o similar)
+        pendientes = set(re.findall(regex_etiquetas, texto))
         conocidas_no_resueltas = [
             t for t in pendientes
             if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
         ]
+        
         if conocidas_no_resueltas:
             logger.info(
-                "[CLUSTER] Etiquetas conocidas sin valor en _limpiar | total=%s | muestra=%s",
+                "[PDF] Etiquetas conocidas sin valor en _limpiar | total=%s | muestra=%s",
                 len(conocidas_no_resueltas),
                 conocidas_no_resueltas[:8],
             )
 
-        return re.sub(r"\{[^}]+\}", "", texto)
+        # 3. CAMBIO CRÍTICO: Limpieza final selectiva. 
+        # Solo borra lo que parece una etiqueta de variable, ignorando bloques CSS.
+        return re.sub(regex_etiquetas, "", texto)
 
     def _descargar_a_base64(self, url: str):
         """Descarga un archivo de internet y lo convierte al formato que pide MailerSend."""
@@ -1267,8 +1281,13 @@ class GenerarPDFUseCase:
             return texto
 
         vars_html = GenerarPDFUseCase._normalizar_variables_para_html(variables)
-        etiquetas_en_html = set(re.findall(r"\{[^}]+\}", texto))
+        
+        # REGEX SEGURO: Solo busca letras, números, puntos y guiones bajos.
+        # Esto ignora el CSS porque el CSS tiene espacios, ":" y ";".
+        regex_seguro = r"\{[a-zA-Z0-9_\.]+\}"
 
+        # Reemplazo de etiquetas existentes
+        etiquetas_en_html = set(re.findall(regex_seguro, texto))
         for tag in etiquetas_en_html:
             valor = vars_html.get(tag)
             if valor is None:
@@ -1276,21 +1295,8 @@ class GenerarPDFUseCase:
             if valor is not None:
                 texto = texto.replace(tag, str(valor))
 
-        # Visibilidad de etiquetas conocidas no resueltas (según prefijos del diccionario maestro).
-        pendientes = set(re.findall(r"\{[^}]+\}", texto))
-        conocidas_no_resueltas = [
-            t for t in pendientes
-            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
-        ]
-        if conocidas_no_resueltas:
-            muestra = conocidas_no_resueltas[:8]
-            logger.info(
-                "[PDF_GENERADOR] Etiquetas conocidas sin valor | total=%s | muestra=%s",
-                len(conocidas_no_resueltas),
-                muestra,
-            )
-
-        return re.sub(r"\{[^}]+\}", "", texto)
+        # Limpieza final: Borra etiquetas de sistema sobrantes pero PROTEGE EL CSS
+        return re.sub(regex_seguro, "", texto)
 
     @staticmethod
     def _es_cotizaciones(categoria: str) -> bool:
@@ -2290,7 +2296,7 @@ async def api_enviar_email(empresa_id: str, datos: EmailFolioSchema, db: Session
     return await use_case.ejecutar_envio_email_folio(empresa_id, datos, db)
 
 @router.post("/{empresa_id}/enviar-dual")
-def api_enviar_ambos_manual(
+async def api_enviar_ambos_manual(
     empresa_id: str, 
     datos: EmailFolioSchema, 
     db: Session = Depends(get_db), 
@@ -2309,7 +2315,7 @@ def api_enviar_ambos_manual(
         categoria=datos.categoria,
     )
     
-    return use_case.ejecutar_envio_dual(empresa_id, datos_wa, datos, db)
+    return await use_case.ejecutar_envio_dual(empresa_id, datos_wa, datos, db)
 
 @router.post("/auto-notificar/{empresa_id}", tags=["Motor Notificaciones"])
 async def api_disparar_barrido(
@@ -2991,7 +2997,7 @@ def crear_plantilla_juridico(empresa_id: str, p: JuridicoBase, user: dict = Depe
         "nombre": {"stringValue": p.nombre},
         "categoria": {"stringValue": p.categoria},
         "html": {"stringValue": p.html},
-        "tamanoDocumento": {"stringValue": str(len(p.html))},
+        "tamanoDocumento": {"stringValue": p.tamanoDocumento},
         "activo": {"booleanValue": bool(p.activo)},
         "static": {"booleanValue": False},
         "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}
@@ -3007,12 +3013,16 @@ def actualizar_juridico(empresa_id: str, doc_id: str, datos: JuridicoUpdate, use
     repo = FirebaseRepository()
     res = repo.actualizar_plantilla_juridico(empresa_id, doc_id, datos)
     
-    if res and res.status_code == 200 and datos.activo is True:
-        doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
-        cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
-        if cat:
-            TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_juridico")
-    return {"status": "actualizada", "id": doc_id}
+    if res and res.status_code == 200:
+        if datos.activo is True:
+            doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
+            cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
+            if cat:
+                TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_juridico")
+        return {"status": "actualizada", "id": doc_id}
+    
+    # Manejo de error por si falla la API de Google
+    raise HTTPException(status_code=res.status_code, detail="No se pudo actualizar en Firestore")
 
 @router_juridico.delete("/{empresa_id}/{doc_id}")
 def eliminar_juridico(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
