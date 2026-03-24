@@ -2039,7 +2039,7 @@ def api_eliminar_plantilla(empresa_id: str, doc_id: str, user: dict = Depends(es
 
 @router_crud.get("/{empresa_id}")
 def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
-    """Obtiene un listado básico de todas las plantillas de una empresa."""
+    """Obtiene un listado básico de todas las plantillas de una empresa incluyendo archivos."""
     repo = FirebaseRepository()
     docs = repo.listar_todas_plantillas(empresa_id)
     
@@ -2048,7 +2048,8 @@ def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
         fields = d.get("fields", {})
         id_tecnico = d["name"].split("/")[-1] 
         
-        resultado.append({
+        # Extraemos la información básica
+        plantilla_data = {
             "id": id_tecnico,
             "nombre": fields.get("nombre", {}).get("stringValue", "Sin nombre"),
             "asunto": fields.get("asunto", {}).get("stringValue", ""),
@@ -2060,8 +2061,32 @@ def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
                 for v in fields.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])
             ],
             "html": fields.get("html", {}).get("stringValue", ""),
-            "documentos_adjuntos": {k: v.get("stringValue") for k, v in fields.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).items()},
-        })
+            "documentos_adjuntos": {
+                k: v.get("stringValue") 
+                for k, v in fields.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            
+            # --- NUEVOS CAMPOS AGREGADOS ---
+            
+            # Procesamos 'archivos_subidos' (Mapa simple de Nombre: Valor)
+            "archivos_subidos": {
+                k: v.get("stringValue") 
+                for k, v in fields.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            
+            # Procesamos 'archivos_subidos_meta' (Mapa de Mapas)
+            "archivos_subidos_meta": {
+                nombre_archivo: {
+                    meta_k: meta_v.get("stringValue")
+                    for meta_k, meta_v in info.get("mapValue", {}).get("fields", {}).items()
+                }
+                for nombre_archivo, info in fields.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
+            }
+            # -------------------------------
+        }
+        
+        resultado.append(plantilla_data)
+        
     return resultado
 
 @router_crud.get("/{empresa_id}/{doc_id}")
@@ -2570,14 +2595,16 @@ def api_eliminar_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depends
 
 @router_wa.get("/{empresa_id}")
 def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
-    """Obtiene el listado completo con todos los datos de cada plantilla."""
+    """Obtiene el listado completo con todos los datos de cada plantilla de WhatsApp."""
     repo = FirebaseRepository()
     docs = repo.listar_plantillas_wa(empresa_id)
     
     resultado = []
     for d in docs:
         f = d.get("fields", {})
-        resultado.append({
+        
+        # Procesamos la información de la plantilla
+        plantilla_wa = {
             "id": d["name"].split("/")[-1],
             "nombre": f.get("nombre", {}).get("stringValue", ""),
             "id_respond": f.get("id_respond", {}).get("stringValue", ""),
@@ -2585,9 +2612,36 @@ def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
             "lenguaje": f.get("lenguaje", {}).get("stringValue", ""),
             "mensaje": f.get("mensaje", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False),
-            "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])],
-            "documento_adjunto_id": {k: v.get("stringValue") for k, v in f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).items()}
-        })
+            "variables": [
+                v.get("stringValue") 
+                for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])
+            ],
+            "documento_adjunto_id": {
+                k: v.get("stringValue") 
+                for k, v in f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            
+            # --- NUEVOS CAMPOS PARA ARCHIVOS ---
+            
+            # Extraemos los archivos subidos (Nombre: Token/ID)
+            "archivos_subidos": {
+                k: v.get("stringValue") 
+                for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            
+            # Extraemos los metadatos de los archivos (Nombre: {mime_type, tipo_visual})
+            "archivos_subidos_meta": {
+                nombre_archivo: {
+                    meta_key: meta_val.get("stringValue")
+                    for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
+                }
+                for nombre_archivo, info in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
+            }
+            # -----------------------------------
+        }
+        
+        resultado.append(plantilla_wa)
+        
     return resultado
 
 @router_wa.get("/{empresa_id}/{doc_id}")
