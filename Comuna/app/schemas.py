@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, StrictBool, ConfigDict
-from typing import List, Any, Optional, Dict
-from pydantic import EmailStr
+from typing import List, Any, Optional, Dict, Union
+from pydantic import EmailStr, StrictBool
 from decimal import Decimal,ROUND_HALF_UP
 from pydantic import BaseModel
 from datetime import date
@@ -300,7 +300,9 @@ class PlantillaUpdate(BaseModel):
     categoria: Optional[str] = None
     activo: Optional[StrictBool] = None
     tags_departamento: Optional[List[str]] = None
-    documentos_adjuntos: Optional[List[str]] = []
+    documentos_adjuntos: Optional[Union[Dict[str, str], List[str]]] = None
+    archivos_subidos: Optional[Dict[str, str]] = None
+    archivos_subidos_meta: Optional[Dict[str, Any]] = None
     #[id:nombre, id:nombre, id:nombre]
     
 class ConfigUpdate(BaseModel):
@@ -329,6 +331,8 @@ class PlantillaWAUpdate(BaseModel):
     mensaje: Optional[str] = None
     activo: Optional[bool] = None
     documento_adjunto_id: Optional[List[str]] = []
+    archivos_subidos: Optional[Dict[str, str]] = None
+    archivos_subidos_meta: Optional[Dict[str, Any]] = None
     
 class WhatsAppManualSchema(BaseModel):
     folio: str

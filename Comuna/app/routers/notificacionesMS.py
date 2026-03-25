@@ -249,31 +249,38 @@ class FirebaseRepository:
                 num = int(match.group(1))
                 if num > max_num: max_num = num
         return f"{prefijo}-{str(max_num + 1).zfill(4)}-WA"
-#holaaaaa
+    
     def actualizar_plantilla_wa(self, empresa_id: str, doc_id: str, p: PlantillaWAUpdate):
+        """Actualiza campos de WhatsApp de manera dinámica y flexible."""
         fields = {}
         mask = []
-        data = p.dict(exclude_unset=True)
+        # Usamos model_dump (Pydantic v2) o dict() asegurando los nombres de campo internos
+        data = p.model_dump(exclude_unset=True, by_alias=False) if hasattr(p, 'model_dump') else p.dict(exclude_unset=True)
+        
         for key, value in data.items():
             if value is None: continue
             mask.append(key)
-            if key == "activo": 
+            
+            if key in ["activo", "static"]:
                 fields[key] = {"booleanValue": bool(value)}
-            elif key == "variables": 
+            elif key in ["variables", "tags_departamento"]:
                 fields[key] = {"arrayValue": {"values": [{"stringValue": str(v)} for v in value]}}
             elif key == "documento_adjunto_id":
+                # Si es dict, va directo como MapValue (lo que envía el front)
                 if isinstance(value, dict):
                     fire_map = {k: {"stringValue": str(v)} for k, v in value.items()}
                     fields[key] = {"mapValue": {"fields": fire_map}}
                 else:
+                    # Si es lista de IDs, buscamos el mapeo en Jurídico
                     ids = value if isinstance(value, list) else [value]
                     mapeo = self._get_juridico_mapping_multiple(empresa_id, ids)
                     if mapeo:
                         fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
                         fields[key] = {"mapValue": {"fields": fire_map}}
-            else: 
+            else:
+                # Campos de texto simple (nombre, id_respond, lenguaje, mensaje, categoria)
                 fields[key] = {"stringValue": str(value)}
-        
+
         if not mask:
             return None
 
@@ -1273,6 +1280,9 @@ class GenerarPDFUseCase:
                 or ""
             )
 
+        ahora = datetime.now(ZoneInfo("America/Mexico_City"))
+        base["{fechadehoy}"] = ahora.strftime("%d/%m/%Y")
+
         return base
 
     @staticmethod
@@ -1282,20 +1292,23 @@ class GenerarPDFUseCase:
 
         vars_html = GenerarPDFUseCase._normalizar_variables_para_html(variables)
         
-        # REGEX SEGURO: Solo busca letras, números, puntos y guiones bajos.
-        # Esto ignora el CSS porque el CSS tiene espacios, ":" y ";".
-        regex_seguro = r"\{[a-zA-Z0-9_\.]+\}"
+        # REGEX ACTUALIZADO: Soporta { }, {{ }}, puntos y guiones '-'
+        regex_seguro = r"\{{1,2}[a-zA-Z0-9_\.\-]+\}{1,2}"
 
-        # Reemplazo de etiquetas existentes
         etiquetas_en_html = set(re.findall(regex_seguro, texto))
         for tag in etiquetas_en_html:
-            valor = vars_html.get(tag)
+            # Limpiamos el tag (quitamos todas las { y }) para buscar en el dict
+            tag_limpio = tag.replace("{", "").replace("}", "").strip()
+            
+            # Buscamos la variable (probablemente guardada con formato {nombre} en tu dict)
+            valor = vars_html.get(f"{{{tag_limpio}}}")
             if valor is None:
-                valor = vars_html.get(tag.lower())
+                valor = vars_html.get(f"{{{tag_limpio.lower()}}}")
+                
             if valor is not None:
                 texto = texto.replace(tag, str(valor))
 
-        # Limpieza final: Borra etiquetas de sistema sobrantes pero PROTEGE EL CSS
+        # Limpieza final segura para CSS
         return re.sub(regex_seguro, "", texto)
 
     @staticmethod
@@ -1526,6 +1539,19 @@ class GenerarPDFUseCase:
                 raise HTTPException(status_code=400, detail="La plantilla no tiene HTML.")
 
             variables_html = dict(data_sql)
+
+            # 1. Formatear montos a Moneda ($X,XXX.XX)
+            claves_monto = ["{v.total_enganche}", "{v.precio_lista}", "{v.apartado}", "{v.flujo_enganche}", "{v.total_enganche_pagar}"]
+            for k in claves_monto:
+                if k in variables_html:
+                    variables_html[k] = self._formatear_moneda(variables_html[k])
+
+            # 2. Limpiar duplicados de "meses"
+            plazo_key = "{v.plazo_financiamiento}"
+            if plazo_key in variables_html:
+                valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
+                variables_html[plazo_key] = valor_plazo
+
             if self._es_cotizaciones(categoria):
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
@@ -1847,7 +1873,7 @@ def api_contar_plantillas(empresa_id: str, categoria: str,user: dict = Depends(e
     total = TemplateUseCase.contar_plantillas_por_categoria(repo, empresa_id, categoria) 
     return {"categoria": categoria, "total": total}
 
-@router_crud.post("/{empresa_id}", status_code=201)
+@router_crud.post("/Crear/{empresa_id}", status_code=201)
 async def api_crear_plantilla(
     empresa_id: str,
     p: Optional[PlantillaBase] = Body(default=None),
@@ -1920,7 +1946,7 @@ async def api_crear_plantilla(
     
     return {"status": "creada", "id": nombre_id, "nombre": p.nombre}
     
-@router_crud.patch("/{empresa_id}/{doc_id}")
+@router_crud.patch("/Actualizar/{empresa_id}/{doc_id}")
 async def api_actualizar_plantilla(
     empresa_id: str,
     doc_id: str,
@@ -2006,7 +2032,7 @@ async def api_actualizar_plantilla(
 
     return {"status": "actualizada", "id": doc_id}
     
-@router_crud.delete("/{empresa_id}/{doc_id}")
+@router_crud.delete("/Eliminar/{empresa_id}/{doc_id}")
 def api_eliminar_plantilla(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
     """
     Elimina una plantilla permanentemente.
@@ -2043,7 +2069,7 @@ def api_eliminar_plantilla(empresa_id: str, doc_id: str, user: dict = Depends(es
         
     return {"status": "eliminada", "id": doc_id}
 
-@router_crud.get("/{empresa_id}")
+@router_crud.get("/Listado/{empresa_id}")
 def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
     """Obtiene un listado básico de todas las plantillas de una empresa incluyendo archivos."""
     repo = FirebaseRepository()
@@ -2095,38 +2121,6 @@ def api_get_listado_plantillas(empresa_id: str, user: dict = Depends(es_admin)):
         
     return resultado
 
-@router_crud.get("/{empresa_id}/{doc_id}")
-def api_get_detalle_plantilla(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
-    """Obtiene todos los campos de una plantilla específica para edición.
-    """
-    repo = FirebaseRepository()
-    doc = repo.obtener_un_doc_completo(empresa_id, doc_id)
-    
-    if not doc:
-        raise HTTPException(status_code=404, detail="Esa plantilla no existe en Firebase")
-        
-    f = doc.get("fields", {})
-    archivos_subidos_meta = {
-        k: {
-            "mime_type": v.get("mapValue", {}).get("fields", {}).get("mime_type", {}).get("stringValue", "application/octet-stream"),
-            "tipo_visual": v.get("mapValue", {}).get("fields", {}).get("tipo_visual", {}).get("stringValue", "file"),
-        }
-        for k, v in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
-    }
-    return {
-        "id": doc["name"].split("/")[-1],
-        "nombre": f.get("nombre", {}).get("stringValue", ""),
-        "asunto": f.get("asunto", {}).get("stringValue", ""),
-        "html": f.get("html", {}).get("stringValue", ""),
-        "categoria": f.get("categoria", {}).get("stringValue", ""),
-        "activo": f.get("activo", {}).get("booleanValue") is True or f.get("activo", {}).get("stringValue") == "true",
-        "static": f.get("static", {}).get("booleanValue", False),
-        "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
-        "documentos_adjuntos": {k: v.get("stringValue") for k, v in f.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {}).items()},
-        "archivos_subidos": {k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()},
-        "archivos_subidos_meta": archivos_subidos_meta,
-    }
-
 #endregion
 
 #region variables para HTML
@@ -2175,14 +2169,21 @@ def api_get_diccionario_maestro(
 
         catalogo = get_komunah_diccionario_maestro(data_real)
 
-        universales = ["{cliente}", "{email_cliente}", "{telefono_cliente}"]
+        universales = ["{cliente}", "{email_cliente}", "{telefono_cliente}", "{fechaDeHoy}"]
+
+        valores_universales = []
+        if data_real:
+            for tag in universales:
+                if tag == "{fechaDeHoy}":
+                    valor = data_real.get("{fechaDeHoy}") or data_real.get("{sys.fechaDeHoy}") or datetime.now(ZoneInfo("America/Mexico_City")).strftime('%d/%m/%Y')
+                else:
+                    valor = data_real.get(tag, "")
+                valores_universales.append({"tag": tag, "valor": valor})
 
 
         bloque_fijas = {
             "categoria": "Variables Generales Fijas",
-            "variables": universales if not data_real else [
-                {"tag": tag, "valor": data_real.get(tag, "")} for tag in universales
-            ]
+            "variables": universales if not data_real else valores_universales
         }
 
         catalogo.insert(0, bloque_fijas)
@@ -2426,7 +2427,7 @@ async def api_proceso_cluster(
 
 #region CRUD Plantillas para WhatsApp
 
-@router_wa.post("/{empresa_id}", status_code=201)
+@router_wa.post("/Crear/{empresa_id}", status_code=201)
 async def api_crear_plantilla_wa(
     empresa_id: str,
     p: Optional[PlantillaWABase] = Body(default=None),
@@ -2503,7 +2504,7 @@ async def api_crear_plantilla_wa(
         
     return {"status": "creada", "id": nombre_id}
 
-@router_wa.patch("/{empresa_id}/{doc_id}")
+@router_wa.patch("/Actualizar/{empresa_id}/{doc_id}")
 async def api_patch_wa(
     empresa_id: str,
     doc_id: str,
@@ -2512,6 +2513,7 @@ async def api_patch_wa(
     archivos: Optional[List[UploadFile]] = File(None),
     user: dict = Depends(es_admin),
 ):
+    # Normalizamos la entrada (soporta JSON o Form-Data con archivos)
     datos, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=PlantillaWAUpdate,
         datos_modelo=datos,
@@ -2521,21 +2523,18 @@ async def api_patch_wa(
     )
 
     repo = FirebaseRepository()
-
-    campos = datos.dict(exclude_unset=True)
+    campos = datos.model_dump(exclude_unset=True) if hasattr(datos, 'model_dump') else datos.dict(exclude_unset=True)
+    
     res = None
     if campos:
         res = repo.actualizar_plantilla_wa(empresa_id, doc_id, datos)
 
+    # Si hay archivos nuevos (imágenes/PDFs), los parcheamos en una segunda llamada
     if archivos_map:
-        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
+        url_files = f"{repo.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
         payload_files = {
             "fields": {
-                "archivos_subidos": {
-                    "mapValue": {
-                        "fields": {k: {"stringValue": v} for k, v in archivos_map.items()}
-                    }
-                },
+                "archivos_subidos": {"mapValue": {"fields": {k: {"stringValue": v} for k, v in archivos_map.items()}}},
                 "archivos_subidos_meta": {
                     "mapValue": {
                         "fields": {
@@ -2546,45 +2545,37 @@ async def api_patch_wa(
                                         "tipo_visual": {"stringValue": v["tipo_visual"]},
                                     }
                                 }
-                            }
-                            for k, v in archivos_meta.items()
+                            } for k, v in archivos_meta.items()
                         }
                     }
                 }
             }
         }
-        res_files = requests.patch(
-            url,
-            json=payload_files,
-            params=[
-                ("updateMask.fieldPaths", "archivos_subidos"),
-                ("updateMask.fieldPaths", "archivos_subidos_meta"),
-            ],
-            headers=repo.headers,
-            timeout=10,
-        )
-        if res_files.status_code != 200:
-            raise HTTPException(status_code=res_files.status_code, detail=res_files.text)
-    
+        res_f = requests.patch(url_files, json=payload_files, headers=repo.headers, params=[
+            ("updateMask.fieldPaths", "archivos_subidos"),
+            ("updateMask.fieldPaths", "archivos_subidos_meta")
+        ])
+        if res_f.status_code != 200:
+            raise HTTPException(status_code=res_f.status_code, detail=f"Error subiendo archivos: {res_f.text}")
+
+    # Lógica de respuesta y activación exclusiva
     if res is None:
-        if archivos_map:
-            return {"status": "actualizada", "id": doc_id, "mensaje": "Archivos actualizados"}
-        return {"status": "actualizada", "id": doc_id, "mensaje": "Sin cambios realizados"}
+        return {"status": "Actualizado", "id": doc_id, "mensaje": "Archivos actualizados" if archivos_map else "Sin cambios"}
 
     if res.status_code == 200 and datos.activo is True:
-        doc_actual = repo.obtener_un_doc_completo_wa(empresa_id, doc_id)
-        if doc_actual:
-            fields = doc_actual.get("fields", {})
-            categoria = fields.get("categoria", {}).get("stringValue")
-            if categoria:
-                TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, categoria, "plantillas_whatsapp")
-                
+        # Buscamos la categoría actual para apagar las demás
+        doc_info = repo.obtener_un_doc_completo_wa(empresa_id, doc_id)
+        if doc_info:
+            cat = doc_info.get("fields", {}).get("categoria", {}).get("stringValue")
+            if cat:
+                TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_whatsapp")
+
     if res.status_code != 200:
         raise HTTPException(status_code=res.status_code, detail=res.text)
 
-    return {"status": "actualizada", "id": doc_id}
+    return {"status": "Actualizado", "id": doc_id}
 
-@router_wa.delete("/{empresa_id}/{doc_id}")
+@router_wa.delete("/Eliminar/{empresa_id}/{doc_id}")
 def api_eliminar_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
     """Elimina permanentemente una plantilla de WhatsApp."""
     repo = FirebaseRepository()
@@ -2599,7 +2590,7 @@ def api_eliminar_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depends
         
     return {"status": "eliminada", "id": doc_id}
 
-@router_wa.get("/{empresa_id}")
+@router_wa.get("/Listado/{empresa_id}")
 def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
     """Obtiene el listado completo con todos los datos de cada plantilla de WhatsApp."""
     repo = FirebaseRepository()
@@ -2643,43 +2634,11 @@ def api_get_listado_wa(empresa_id: str, user: dict = Depends(es_admin)):
                 }
                 for nombre_archivo, info in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
             }
-            # -----------------------------------
         }
         
         resultado.append(plantilla_wa)
         
     return resultado
-
-@router_wa.get("/{empresa_id}/{doc_id}")
-def api_get_detalle_plantilla_wa(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
-    """Trae la totalidad de la información de una sola plantilla."""
-    repo = FirebaseRepository()
-    doc = repo.obtener_un_doc_completo_wa(empresa_id, doc_id)
-    
-    if not doc:
-        raise HTTPException(status_code=404, detail="Esa plantilla no existe.")
-        
-    f = doc.get("fields", {})
-    archivos_subidos_meta = {
-        k: {
-            "mime_type": v.get("mapValue", {}).get("fields", {}).get("mime_type", {}).get("stringValue", "application/octet-stream"),
-            "tipo_visual": v.get("mapValue", {}).get("fields", {}).get("tipo_visual", {}).get("stringValue", "file"),
-        }
-        for k, v in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
-    }
-    return {
-        "id": doc["name"].split("/")[-1],
-        "nombre": f.get("nombre", {}).get("stringValue", ""),
-        "id_respond": f.get("id_respond", {}).get("stringValue", ""),
-        "categoria": f.get("categoria", {}).get("stringValue", ""),
-        "lenguaje": f.get("lenguaje", {}).get("stringValue", ""),
-        "mensaje": f.get("mensaje", {}).get("stringValue", ""),
-        "activo": f.get("activo", {}).get("booleanValue", False),
-        "variables": [v.get("stringValue") for v in f.get("variables", {}).get("arrayValue", {}).get("values", [])],
-        "documento_adjunto_id": {k: v.get("stringValue") for k, v in f.get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {}).items()},
-        "archivos_subidos": {k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()},
-        "archivos_subidos_meta": archivos_subidos_meta,
-    }
 
 #endregion
 

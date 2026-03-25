@@ -240,7 +240,7 @@ if APP_MODE == "NOTIFICACIONES":
     app.include_router(notificacionesMS.router_wa)
     app.include_router(notificacionesMS.router_usuario)
     app.include_router(notificacionesMS.router_globales)
-    app.include_router(notificacionesMS.router_juridico)
+    # app.include_router(notificacionesMS.router_juridico)
     app.include_router(remitentes.router)
 else:
     app.include_router(login.router)
@@ -248,6 +248,7 @@ else:
     app.include_router(datos.router)
     app.include_router(emails.router)
     app.include_router(DashboardKomunah.router)
+    app.include_router(notificacionesMS.router_juridico)
     app.include_router(Documentos.router)
     app.include_router(webhook.router)
     app.include_router(Cobranza.router)

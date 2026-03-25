@@ -450,6 +450,4 @@ def api_consultar_documentos_folio(
         "categorias": resultado_categorias
     }
 
-
-
 #endregion
