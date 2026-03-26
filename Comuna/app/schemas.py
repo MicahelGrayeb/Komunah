@@ -501,6 +501,26 @@ class EscrituradosJuridicoResponse(BaseModel):
     FechaEscrituraLista: Optional[str] = None
     FechaEscrituraEntregada: Optional[str] = None
 
+class EscrituracionFinanciamientoResponse(BaseModel):
+    Folio: Optional[str] = None
+    NombreCliente: Optional[str] = None
+    Cluster: Optional[str] = None
+    NumeroLote: Optional[str] = None
+    Telefono: Optional[str] = None
+    CorreoElectronico: Optional[str] = None
+    Estado: Optional[str] = None
+    Pais: Optional[str] = None
+    MensualidadesFaltantes: int = 0
+
+class IncidenciasResponse(BaseModel):
+    Folio: Optional[str] = None
+    NombreCliente: Optional[str] = None
+    NumeroLote: Optional[str] = None
+    Cluster: Optional[str] = None
+    MotivoIncidencia: Optional[str] = None
+    FechaSeguimiento1: str = ""
+    FechaSeguimiento2: str = ""
+
 
 
 class JuridicoBase(BaseModel):
