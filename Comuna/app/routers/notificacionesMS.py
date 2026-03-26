@@ -38,9 +38,9 @@ logger = logging.getLogger(__name__)
 
 
 router = APIRouter(prefix="/v1/notificaciones", tags=["Motor Envios"])
-router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas"])
-router_wa = APIRouter(prefix="/v1/plantillas-wa", tags=["CRUD WhatsApp"])
-router_juridico = APIRouter(prefix="/v1/plantillas-juridico", tags=["CRUD Jurídico"])
+router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas de Correo"])
+router_wa = APIRouter(prefix="/v1/plantillas-wa", tags=["CRUD Plantillas de WhatsApp"])
+router_documento = APIRouter(prefix="/v1/plantillas-documento", tags=["CRUD Plantillas de documentos dinamicos"])
 router_usuario = APIRouter(prefix="/v1/preferencias-usuario", tags=["Switches Clientes"])
 router_globales = APIRouter(prefix="/v1/configuracion-global", tags=["Configuración Global"])
 BUCKET_NAME = "bucket-grupo-komunah-juridico"
@@ -2318,7 +2318,7 @@ async def api_enviar_ambos_manual(
     
     return await use_case.ejecutar_envio_dual(empresa_id, datos_wa, datos, db)
 
-@router.post("/auto-notificar/{empresa_id}", tags=["Motor Notificaciones"])
+@router.post("/auto-notificar/{empresa_id}")
 async def api_disparar_barrido(
     empresa_id: str, 
     dias: int, 
@@ -2908,8 +2908,8 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
 
 #region CRUD Plantillas para Jurídico
 
-@router_juridico.get("/{empresa_id}")
-def listar_juridico(empresa_id: str, user: dict = Depends(es_admin)):
+@router_documento.get("/Documentos/{empresa_id}")
+def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
     docs = repo.listar_plantillas_juridico(empresa_id)
     resultado = []
@@ -2927,26 +2927,8 @@ def listar_juridico(empresa_id: str, user: dict = Depends(es_admin)):
         })
     return resultado
 
-@router_juridico.get("/{empresa_id}/{doc_id}")
-def api_get_detalle_juridico(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
-    repo = FirebaseRepository()
-    doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="No existe la plantilla de jurídico.")
-    f = doc.get("fields", {})
-    return {
-        "id": doc["name"].split("/")[-1],
-        "nombre": f.get("nombre", {}).get("stringValue", ""),
-        "categoria": f.get("categoria", {}).get("stringValue", ""),
-        "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
-        "html": f.get("html", {}).get("stringValue", ""),
-        "activo": f.get("activo", {}).get("booleanValue", False),
-        "static": f.get("static", {}).get("booleanValue", False),
-        "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])]
-    }
-
-@router_juridico.post("/{empresa_id}", status_code=201)
-def crear_plantilla_juridico(empresa_id: str, p: JuridicoBase, user: dict = Depends(es_admin)):
+@router_documento.post("/Crear/{empresa_id}", status_code=201)
+def crear_plantilla_documento(empresa_id: str, p: JuridicoBase, user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
     nombre_id = repo.generar_siguiente_id_juridico(empresa_id)
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico?documentId={nombre_id}"
@@ -2967,8 +2949,8 @@ def crear_plantilla_juridico(empresa_id: str, p: JuridicoBase, user: dict = Depe
         TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, p.categoria, "plantillas_juridico")
     return {"status": "creada", "id": nombre_id}
 
-@router_juridico.patch("/{empresa_id}/{doc_id}")
-def actualizar_juridico(empresa_id: str, doc_id: str, datos: JuridicoUpdate, user: dict = Depends(es_admin)):
+@router_documento.patch("/Actualizar/{empresa_id}/{doc_id}")
+def actualizar_documento(empresa_id: str, doc_id: str, datos: JuridicoUpdate, user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
     res = repo.actualizar_plantilla_juridico(empresa_id, doc_id, datos)
     
@@ -2983,8 +2965,8 @@ def actualizar_juridico(empresa_id: str, doc_id: str, datos: JuridicoUpdate, use
     # Manejo de error por si falla la API de Google
     raise HTTPException(status_code=res.status_code, detail="No se pudo actualizar en Firestore")
 
-@router_juridico.delete("/{empresa_id}/{doc_id}")
-def eliminar_juridico(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
+@router_documento.delete("/Eliminar/{empresa_id}/{doc_id}")
+def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
     doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
     if not doc: raise HTTPException(status_code=404, detail="No existe.")

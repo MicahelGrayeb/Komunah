@@ -434,7 +434,6 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
     Si hay flat_data, FILTRA lo vacío y devuelve {tag, valor}.
     """
     logger.info("[DATOS_KOMUNAH] Entrada get_komunah_diccionario_maestro | con_data=%s", flat_data is not None)
-    from sqlalchemy.inspection import inspect
 
     # Helper para extraer tags de SQL y filtrar si no hay data
     def extraer_tags(modelo, prefijo):

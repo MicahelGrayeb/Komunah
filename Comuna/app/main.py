@@ -236,11 +236,8 @@ def home():
 if APP_MODE == "NOTIFICACIONES":
     # Solo exponemos el motor de envíos en el puerto 8081
     app.include_router(notificacionesMS.router)
-    app.include_router(notificacionesMS.router_crud)
-    app.include_router(notificacionesMS.router_wa)
     app.include_router(notificacionesMS.router_usuario)
     app.include_router(notificacionesMS.router_globales)
-    # app.include_router(notificacionesMS.router_juridico)
     app.include_router(remitentes.router)
 else:
     app.include_router(login.router)
@@ -252,8 +249,6 @@ else:
     app.include_router(Documentos.router)
     app.include_router(webhook.router)
     app.include_router(Cobranza.router)
-    app.include_router(notificaciones.router)
-    app.include_router(notificaciones_estaticas.router)
     app.include_router(reportes.router)
     app.include_router(admin.router)
     app.include_router(debug_config.router)
