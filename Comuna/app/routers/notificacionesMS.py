@@ -4,19 +4,16 @@ import re
 import base64
 import asyncio
 import logging
-from playwright.async_api import async_playwright
-from google.cloud import storage
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, Body
 from ..schemas import (
     EmailSchema, PlantillaBase, PlantillaUpdate, ConfigUpdate, 
     EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, 
     WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, 
     RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, 
-    JuridicoBase, JuridicoUpdate
+    DocumentosDinamicosBase, DocumentosDinamicosUpdate, AnexosBase, AnexosUpdate
 )
 from ..utils.datos_proveedores import (
     get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, 
-    set_email_komunah_marketing, set_wa_komunah_marketing, 
     get_folios_a_notificar_komunah, actualizar_switches_etapas, 
     actualizar_switches_proyecto, get_estado_etapas_komunah, 
     get_folios_deudores_komunah, get_folios_dinamico_komunah
@@ -31,7 +28,8 @@ from typing import List, Optional, Union, Any
 import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 from argparse import Namespace
-from ..models import Venta, Cliente, Amortizacion
+from ..models import Venta, Cliente
+from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase
 from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
@@ -41,9 +39,9 @@ router = APIRouter(prefix="/v1/notificaciones", tags=["Motor Envios"])
 router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas de Correo"])
 router_wa = APIRouter(prefix="/v1/plantillas-wa", tags=["CRUD Plantillas de WhatsApp"])
 router_documento = APIRouter(prefix="/v1/plantillas-documento", tags=["CRUD Plantillas de documentos dinamicos"])
+router_anexo = APIRouter(prefix="/v1/plantillas-anexo", tags=["CRUD Plantillas de anexos"])
 router_usuario = APIRouter(prefix="/v1/preferencias-usuario", tags=["Switches Clientes"])
 router_globales = APIRouter(prefix="/v1/configuracion-global", tags=["Configuración Global"])
-BUCKET_NAME = "bucket-grupo-komunah-juridico"
 
 EMPRESAS_AUTORIZADAS = ["komunah", "empresa_test"]
 PROVIDERS = {
@@ -68,6 +66,24 @@ class FirebaseRepository:
         self.api_key = os.getenv('FIREBASE_PLANTILLAS_API_KEY')
         self.base_url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents"
         self.headers = {"X-Goog-Api-Key": self.api_key, "Content-Type": "application/json"}
+
+    def obtener_config_empresa(self, empresa_id: str):
+        """Lógica de switches con reintentos."""
+        url = f"{self.base_url}/empresas/{empresa_id}/configuracion/general"
+        defaults = {"proyecto": True, "email": True, "whatsapp": True}
+        
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
+        if not resp:
+            return defaults
+            
+        f = resp.json().get("fields", {})
+        return {
+            "proyecto": f.get("proyecto_activo", {}).get("booleanValue", True),
+            "email": f.get("email_enabled", {}).get("booleanValue", True),
+            "whatsapp": f.get("whatsapp_enabled", {}).get("booleanValue", True)
+        }
+    
+#region Helpers para peticiones seguras con reintentos
 
     def _peticion_segura(self, method: str, url: str, **kwargs):
         """Maneja reintentos y logging detallado para peticiones a Firebase."""
@@ -97,22 +113,6 @@ class FirebaseRepository:
                     
         return None
 
-    def obtener_config_empresa(self, empresa_id: str):
-        """Lógica de switches con reintentos."""
-        url = f"{self.base_url}/empresas/{empresa_id}/configuracion/general"
-        defaults = {"proyecto": True, "email": True, "whatsapp": True}
-        
-        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
-        if not resp:
-            return defaults
-            
-        f = resp.json().get("fields", {})
-        return {
-            "proyecto": f.get("proyecto_activo", {}).get("booleanValue", True),
-            "email": f.get("email_enabled", {}).get("booleanValue", True),
-            "whatsapp": f.get("whatsapp_enabled", {}).get("booleanValue", True)
-        }
-
     def obtener_plantilla_segura(self, empresa_id: str, slug: str):
         """Trae el HTML de una plantilla con reintentos."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{slug}"
@@ -123,6 +123,10 @@ class FirebaseRepository:
             
         data = resp.json()
         return data.get("fields", {}).get("html", {}).get("stringValue", "")
+
+#endregion
+
+#region Operaciones con plantillas y configuraciones
 
     def query_categoria(self, empresa_id: str, categoria: str, coleccion: str = "plantillas"): 
         url = f"{self.base_url}/empresas/{empresa_id}:runQuery" 
@@ -146,6 +150,24 @@ class FirebaseRepository:
         payload = {"fields": {"activo": {"booleanValue": status}}}
         return self._peticion_segura("PATCH", url, json=payload, headers=self.headers, timeout=10)
     
+    def actualizar_configuracion(self, empresa_id: str, c: ConfigUpdate):
+        fields = {}
+        mask = []
+        if c.proyecto_activo is not None:
+            fields["proyecto_activo"] = {"booleanValue": c.proyecto_activo}; mask.append("proyecto_activo")
+        if c.email_enabled is not None:
+            fields["email_enabled"] = {"booleanValue": c.email_enabled}; mask.append("email_enabled")
+        if c.whatsapp_enabled is not None:
+            fields["whatsapp_enabled"] = {"booleanValue": c.whatsapp_enabled}; mask.append("whatsapp_enabled")
+
+        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
+        url = f"{self.base_url}/empresas/{empresa_id}/configuracion/general?{query_params}"
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
+
+#endregion
+
+#region CRUD PLANTILLAS DE CORREO
+
     def eliminar_plantilla(self, empresa_id: str, doc_id: str):
         """Elimina físicamente el documento."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
@@ -168,7 +190,7 @@ class FirebaseRepository:
                     fire_map = {k: {"stringValue": str(v)} for k, v in value.items()}
                     fields[key] = {"mapValue": {"fields": fire_map}}
                 else:
-                    mapeo = self._get_juridico_mapping_multiple(empresa_id, value)
+                    mapeo = self._get_documento_mapping_multiple(empresa_id, value)
                     if mapeo:
                         fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
                         fields[key] = {"mapValue": {"fields": fire_map}}
@@ -181,20 +203,6 @@ class FirebaseRepository:
         params = [("updateMask.fieldPaths", m) for m in mask]
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas/{doc_id}"
         return self._peticion_segura("PATCH", url, json={"fields": fields}, params=params, headers=self.headers, timeout=10)
-
-    def actualizar_configuracion(self, empresa_id: str, c: ConfigUpdate):
-        fields = {}
-        mask = []
-        if c.proyecto_activo is not None:
-            fields["proyecto_activo"] = {"booleanValue": c.proyecto_activo}; mask.append("proyecto_activo")
-        if c.email_enabled is not None:
-            fields["email_enabled"] = {"booleanValue": c.email_enabled}; mask.append("email_enabled")
-        if c.whatsapp_enabled is not None:
-            fields["whatsapp_enabled"] = {"booleanValue": c.whatsapp_enabled}; mask.append("whatsapp_enabled")
-
-        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
-        url = f"{self.base_url}/empresas/{empresa_id}/configuracion/general?{query_params}"
-        return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
     
     def listar_todas_plantillas(self, empresa_id: str):
         """Para el GET de la lista completa."""
@@ -226,6 +234,10 @@ class FirebaseRepository:
         resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
         return resp.json() if resp else None
     
+#endregion
+
+#region CRUD PLANTILLAS DE WHATSAPP
+
     def obtener_un_doc_completo_wa(self, empresa_id: str, doc_id: str):
         """Busca un solo documento en la colección de WhatsApp."""
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
@@ -273,7 +285,7 @@ class FirebaseRepository:
                 else:
                     # Si es lista de IDs, buscamos el mapeo en Jurídico
                     ids = value if isinstance(value, list) else [value]
-                    mapeo = self._get_juridico_mapping_multiple(empresa_id, ids)
+                    mapeo = self._get_documento_mapping_multiple(empresa_id, ids)
                     if mapeo:
                         fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
                         fields[key] = {"mapValue": {"fields": fire_map}}
@@ -287,7 +299,11 @@ class FirebaseRepository:
         params = [("updateMask.fieldPaths", m) for m in mask]
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_whatsapp/{doc_id}"
         return self._peticion_segura("PATCH", url, json={"fields": fields}, params=params, headers=self.headers, timeout=10)
-    
+
+#endregion
+
+#region Registro de fallas
+
     def registrar_log_falla(self, empresa_id: str, mensaje: str, contexto: str):
         """Almacena fallas agrupadas en empresas/{id}/logs_fallas."""
         error_id = hashlib.md5(mensaje.encode()).hexdigest()
@@ -320,6 +336,10 @@ class FirebaseRepository:
                 }
             }
             self._peticion_segura("PATCH", url, json=payload, headers=self.headers, timeout=5) 
+
+#endregion
+
+#region Configuración de recordatorios
 
     def obtener_config_recordatorios(self, empresa_id: str):
         """Trae los días de recordatorio desde Firebase con reintentos."""
@@ -380,20 +400,23 @@ class FirebaseRepository:
         full_url = f"{url}?{query_params}"
         
         return self._peticion_segura("PATCH", full_url, json={"fields": fields}, headers=self.headers, timeout=10)
-    
-    # --- CRUD JURÍDICO (SIN ASUNTO) ---
-    def listar_plantillas_juridico(self, empresa_id: str):
+
+#endregion
+
+#region CRUD PLANTILLAS DE DOCUMENTOS DINAMICOS
+
+    def listar_plantillas_documentos(self, empresa_id: str):
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico"
         resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
         return resp.json().get("documents", []) if resp else []
 
-    def obtener_un_doc_completo_juridico(self, empresa_id: str, doc_id: str):
+    def obtener_un_doc_completo_documentos(self, empresa_id: str, doc_id: str):
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
         resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
         return resp.json() if resp else None
 
-    def generar_siguiente_id_juridico(self, empresa_id: str):
-        docs = self.listar_plantillas_juridico(empresa_id)
+    def generar_siguiente_id_documentos(self, empresa_id: str):
+        docs = self.listar_plantillas_documentos(empresa_id)
         prefijo = empresa_id[:2].upper()
         max_num = 0
         for d in docs:
@@ -404,12 +427,93 @@ class FirebaseRepository:
                 if num > max_num: max_num = num
         return f"{prefijo}-{str(max_num + 1).zfill(4)}"
 
-    def actualizar_plantilla_juridico(self, empresa_id: str, doc_id: str, p: Any):
+    def actualizar_plantilla_documentos(self, empresa_id: str, doc_id: str, p: Any):
         fields = {}
         mask = []
         
         if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
         if p.html: fields["html"] = {"stringValue": p.html}; mask.append("html")
+        if p.categoria: fields["categoria"] = {"stringValue": p.categoria}; mask.append("categoria")
+        if p.tieneAnexos is not None: fields["tieneAnexos"] = {"booleanValue": bool(p.tieneAnexos)}; mask.append("tieneAnexos")
+
+        if hasattr(p, 'tamanoDocumento') and p.tamanoDocumento:
+            fields["tamanoDocumento"] = {"stringValue": p.tamanoDocumento}
+            mask.append("tamanoDocumento")
+
+        if p.activo is not None: fields["activo"] = {"booleanValue": bool(p.activo)}; mask.append("activo")
+        
+        if hasattr(p, 'tags_departamento') and p.tags_departamento is not None:
+            fields["tags_departamento"] = {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}
+            mask.append("tags_departamento")
+        
+        if hasattr(p, 'anexos') and p.anexos is not None:
+                # Decidimos si usamos el dict directo o consultamos el mapeo
+                mapeo_data = p.anexos if isinstance(p.anexos, dict) else self._get_anexos_mapping_multiple(empresa_id, p.anexos)
+                
+                if mapeo_data is not None:
+                    fields["anexos"] = {
+                        "mapValue": {
+                            "fields": {k: {"stringValue": str(v)} for k, v in mapeo_data.items()}
+                        }
+                    }
+                    mask.append("anexos")
+
+        if not mask: return None
+        
+        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}?{query_params}"
+        
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
+
+    def _get_documento_mapping_single(self, empresa_id: str, doc_id: str):
+        """Busca un solo ID en documentos y devuelve {ID: Nombre}."""
+        if not doc_id or not isinstance(doc_id, str): return None
+        doc = self.obtener_un_doc_completo_documentos(empresa_id, doc_id)
+        if not doc: return {doc_id: "N/A"}
+        nombre = doc.get("fields", {}).get("nombre", {}).get("stringValue", "N/A")
+        return {doc_id: nombre}
+
+    def _get_documento_mapping_multiple(self, empresa_id: str, ids: List[str]):
+        """Busca varios IDs y devuelve un diccionario {ID: Nombre}."""
+        resultado = {}
+        for doc_id in (ids or []):
+            mapping = self._get_documento_mapping_single(empresa_id, doc_id)
+            if mapping:
+                resultado.update(mapping)
+        return resultado if resultado else None
+
+#endregion
+
+#region CRUD PLANTILLAS DE ANEXO
+
+    def listar_plantillas_anexo(self, empresa_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_anexo"
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json().get("documents", []) if resp else []
+
+    def obtener_un_doc_completo_anexos(self, empresa_id: str, doc_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}"
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json() if resp else None
+
+    def generar_siguiente_id_anexos(self, empresa_id: str):
+        docs = self.listar_plantillas_anexo(empresa_id)
+        prefijo = empresa_id[:2].upper()
+        max_num = 0
+        for d in docs:
+            id_doc = d["name"].split("/")[-1]
+            match = re.search(rf"{prefijo}-(\d+)", id_doc)
+            if match:
+                num = int(match.group(1))
+                if num > max_num: max_num = num
+        return f"{prefijo}-{str(max_num + 1).zfill(4)}"
+
+    def actualizar_plantilla_anexos(self, empresa_id: str, doc_id: str, p: Any):
+        fields = {}
+        mask = []
+        
+        if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
+        if p.contenido: fields["contenido"] = {"stringValue": p.contenido}; mask.append("contenido")
         if p.categoria: fields["categoria"] = {"stringValue": p.categoria}; mask.append("categoria")
         
         if hasattr(p, 'tamanoDocumento') and p.tamanoDocumento:
@@ -425,26 +529,28 @@ class FirebaseRepository:
         if not mask: return None
         
         query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
-        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}?{query_params}"
+        url = f"{self.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}?{query_params}"
         
         return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
 
-    def _get_juridico_mapping_single(self, empresa_id: str, doc_id: str):
-        """Busca un solo ID en jurídico y devuelve {ID: Nombre}."""
+    def _get_anexo_mapping_single(self, empresa_id: str, doc_id: str):
+        """Busca un solo ID en anexos y devuelve {ID: Nombre}."""
         if not doc_id or not isinstance(doc_id, str): return None
-        doc = self.obtener_un_doc_completo_juridico(empresa_id, doc_id)
+        doc = self.obtener_un_doc_completo_anexos(empresa_id, doc_id)
         if not doc: return {doc_id: "N/A"}
         nombre = doc.get("fields", {}).get("nombre", {}).get("stringValue", "N/A")
         return {doc_id: nombre}
 
-    def _get_juridico_mapping_multiple(self, empresa_id: str, ids: List[str]):
+    def _get_anexo_mapping_multiple(self, empresa_id: str, ids: List[str]):
         """Busca varios IDs y devuelve un diccionario {ID: Nombre}."""
         resultado = {}
         for doc_id in (ids or []):
-            mapping = self._get_juridico_mapping_single(empresa_id, doc_id)
+            mapping = self._get_anexo_mapping_single(empresa_id, doc_id)
             if mapping:
                 resultado.update(mapping)
         return resultado if resultado else None
+
+#endregion
 
 class NotificationGateway:
     """Maneja la comunicación pura con MailerSend."""
@@ -850,7 +956,7 @@ class NotificationUseCase:
                 if hijos_email:
                     for doc_id in hijos_email.keys():
                         try:
-                            pdf_gen = await pdf_service.generar_pdf_desde_plantilla(empresa_id, doc_id, str(row), db)
+                            pdf_gen = await pdf_service.generar_pdf_barrido_automatico(empresa_id, doc_id, str(row), db)
                             adjuntos_email_dinamicos.append({"content": pdf_gen["content"], "filename": pdf_gen["filename"]})
                         except Exception:
                             self.repo.registrar_log_falla(empresa_id, f"Folio {row}: falló generación de PDF adjunto '{doc_id}' para email.", "PDF_GEN")
@@ -873,7 +979,7 @@ class NotificationUseCase:
                 if hijos_wa:
                     pid_wa = list(hijos_wa.keys())[0]
                     try:
-                        pdf_wa = await pdf_service.generar_pdf_desde_plantilla(empresa_id, pid_wa, str(row), db)
+                        pdf_wa = await pdf_service.generar_pdf_barrido_automatico(empresa_id, pid_wa, str(row), db)
                         link_wa_doc = GenerarPDFUseCase._subir_pdf_a_bucket(
                             base64.b64decode(pdf_wa["content"]),
                             f"Komunah/AutoWA/{row}",
@@ -1233,511 +1339,6 @@ class StaticEmailClusterUseCase:
         logger.info("[CLUSTER] Fin ejecutar_proceso_cluster | modo=%s | resumen=%s", "SIMULACION" if datos.simular else "REAL", conteo)
 
         return {"modo": "SIMULACION" if datos.simular else "REAL", "resumen": conteo, "detalles": reporte_global}
-    
-class GenerarPDFUseCase:
-    def __init__(self, repo: FirebaseRepository):
-        self.repo = repo
-
-    @staticmethod
-    def _normalizar_fragmento(valor: Any, fallback: str = "N/A") -> str:
-        texto = str(valor).strip() if valor is not None else ""
-        if not texto:
-            texto = fallback
-        # Evitar separadores invalidos en nombre/ruta.
-        return re.sub(r"[\\/:*?\"<>|]", "_", texto)
-
-    @staticmethod
-    def _normalizar_variables_para_html(variables: dict) -> dict:
-        """Prepara variables para reemplazo robusto en HTML (incluye aliases del diccionario maestro)."""
-        base = dict(variables or {})
-
-        # Mapa case-insensitive para tolerar diferencias de mayúsculas/minúsculas en plantillas.
-        for k, v in list(base.items()):
-            base[str(k).lower()] = v
-
-        # Variables generales fijas del diccionario maestro.
-        if "{cliente}" not in base:
-            base["{cliente}"] = (
-                base.get("{cl.cliente}")
-                or base.get("{v.cliente}")
-                or base.get("{c1.client_name}")
-                or ""
-            )
-
-        if "{email_cliente}" not in base:
-            base["{email_cliente}"] = (
-                base.get("{g1.email}")
-                or base.get("{c1.email}")
-                or base.get("{v.correo_electronico}")
-                or ""
-            )
-
-        if "{telefono_cliente}" not in base:
-            base["{telefono_cliente}"] = (
-                base.get("{g1.telefono}")
-                or base.get("{c1.main_phone}")
-                or base.get("{v.telefono}")
-                or ""
-            )
-
-        ahora = datetime.now(ZoneInfo("America/Mexico_City"))
-        base["{fechadehoy}"] = ahora.strftime("%d/%m/%Y")
-
-        return base
-
-    @staticmethod
-    def _reemplazar_etiquetas(texto: str, variables: dict):
-        if not texto:
-            return texto
-
-        vars_html = GenerarPDFUseCase._normalizar_variables_para_html(variables)
-        
-        # REGEX ACTUALIZADO: Soporta { }, {{ }}, puntos y guiones '-'
-        regex_seguro = r"\{{1,2}[a-zA-Z0-9_\.\-]+\}{1,2}"
-
-        etiquetas_en_html = set(re.findall(regex_seguro, texto))
-        for tag in etiquetas_en_html:
-            # Limpiamos el tag (quitamos todas las { y }) para buscar en el dict
-            tag_limpio = tag.replace("{", "").replace("}", "").strip()
-            
-            # Buscamos la variable (probablemente guardada con formato {nombre} en tu dict)
-            valor = vars_html.get(f"{{{tag_limpio}}}")
-            if valor is None:
-                valor = vars_html.get(f"{{{tag_limpio.lower()}}}")
-                
-            if valor is not None:
-                texto = texto.replace(tag, str(valor))
-
-        # Limpieza final segura para CSS
-        return re.sub(regex_seguro, "", texto)
-
-    @staticmethod
-    def _es_cotizaciones(categoria: str) -> bool:
-        return str(categoria or "").strip().lower() == "cotizaciones"
-
-    @staticmethod
-    def _a_float(valor: Any) -> float:
-        try:
-            return float(valor)
-        except (TypeError, ValueError):
-            return 0.0
-
-    @staticmethod
-    def _formatear_moneda(valor: Any) -> str:
-        numero = GenerarPDFUseCase._a_float(valor)
-        return f"${numero:,.2f}"
-
-    def _construir_tabla_pagos_cotizaciones(self, html_raw: str, folio: str, db: Session):
-        logger.info("[PDF_COTIZACIONES] Entrada _construir_tabla_pagos_cotizaciones | folio=%s", folio)
-        try:
-            logger.info("[PDF_COTIZACIONES] Paso: consultar amortizaciones por folio")
-            amortizaciones = (
-                db.query(
-                    Amortizacion.number,
-                    Amortizacion.date,
-                    Amortizacion.concept,
-                    Amortizacion.capital,
-                    Amortizacion.down_payment,
-                    Amortizacion.total
-                )
-                .filter(Amortizacion.folder_id == str(folio))
-                .order_by(Amortizacion.date.asc())
-                .all()
-            )
-        except Exception as e:
-            logger.exception("[PDF_COTIZACIONES] Error consultando amortizaciones | folio=%s | error=%s", folio, str(e))
-            raise HTTPException(status_code=500, detail=f"Error al consultar amortizaciones para folio {folio}: {str(e)}")
-
-        # --- INICIO DE BÚSQUEDA CORREGIDA ---
-        # 1. Encontramos la posición de la primera variable de la fila
-        idx_pago = html_raw.find("{pago.numero}")
-        
-        if idx_pago == -1:
-            logger.info("[PDF_COTIZACIONES] Paso: no se encontró plantilla de fila de pagos en HTML")
-            return html_raw, {
-                "{totales.suma_capital}": self._formatear_moneda(0),
-                "{totales.suma_enganche}": self._formatear_moneda(0),
-                "{totales.suma_total}": self._formatear_moneda(0),
-            }
-
-        # 2. Buscamos el inicio de esa fila hacia atrás y el final hacia adelante
-        idx_tr_start = html_raw.rfind("<tr", 0, idx_pago)
-        idx_tr_end = html_raw.find("</tr>", idx_pago)
-
-        if idx_tr_start == -1 or idx_tr_end == -1:
-            logger.error("[PDF_COTIZACIONES] Paso: No se pudo delimitar la fila <tr> en el HTML")
-            return html_raw, {
-                "{totales.suma_capital}": self._formatear_moneda(0),
-                "{totales.suma_enganche}": self._formatear_moneda(0),
-                "{totales.suma_total}": self._formatear_moneda(0),
-            }
-
-        # 3. Extraemos exactamente la fila (sumamos 5 para incluir los caracteres de "</tr>")
-        fila_template = html_raw[idx_tr_start:idx_tr_end + 5]
-        # --- FIN DE BÚSQUEDA CORREGIDA ---
-
-        pagos_apartado = [a for a in amortizaciones if str(getattr(a, "concept", "")).strip() == "initial_payment"]
-        pagos_enganche = [a for a in amortizaciones if str(getattr(a, "concept", "")).strip() == "down_payment"]
-        pagos_restantes = [
-            a
-            for a in amortizaciones
-            if str(getattr(a, "concept", "")).strip() not in {"initial_payment", "down_payment"}
-        ]
-
-        secuencia = []
-        for idx, pago in enumerate(pagos_apartado, 1):
-            etiqueta = "A" if idx == 1 else f"A{idx}"
-            secuencia.append((etiqueta, pago))
-        for idx, pago in enumerate(pagos_enganche, 1):
-            secuencia.append((f"{idx}E", pago))
-        for pago in pagos_restantes:
-            secuencia.append((str(getattr(pago, "number", "")), pago))
-
-        total_capital = sum(
-            self._a_float(getattr(p, "capital", 0))
-            for p in pagos_restantes
-        )
-        saldo_capital = total_capital
-
-        suma_capital = 0.0
-        suma_enganche = 0.0
-        suma_total = 0.0
-        filas_renderizadas = []
-
-        for etiqueta, pago in secuencia:
-            concepto = str(getattr(pago, "concept", "")).strip()
-            capital = self._a_float(getattr(pago, "capital", 0))
-            enganche = self._a_float(getattr(pago, "down_payment", 0))
-            total = self._a_float(getattr(pago, "total", 0))
-
-            suma_capital += capital
-            suma_enganche += enganche
-            suma_total += total
-
-            if concepto in {"initial_payment", "down_payment"}:
-                capital_txt = ""
-                saldo_txt = ""
-                enganche_txt = self._formatear_moneda(enganche)
-            else:
-                saldo_capital = max(saldo_capital - capital, 0)
-                capital_txt = self._formatear_moneda(capital)
-                enganche_txt = self._formatear_moneda(enganche)
-                saldo_txt = self._formatear_moneda(saldo_capital)
-
-            total_txt = self._formatear_moneda(total) if total else ""
-
-            fila = fila_template
-            fila = fila.replace("{pago.numero}", str(etiqueta))
-            fila = fila.replace("{pago.fecha}", str(getattr(pago, "date", "") or ""))
-            fila = fila.replace("{pago.capital}", capital_txt)
-            fila = fila.replace("{pago.enganche}", enganche_txt)
-            fila = fila.replace("{pago.total}", total_txt)
-            fila = fila.replace("{pago.saldo_capital}", saldo_txt)
-            filas_renderizadas.append(fila)
-
-        if not filas_renderizadas:
-            fila = fila_template
-            fila = fila.replace("{pago.numero}", "")
-            fila = fila.replace("{pago.fecha}", "")
-            fila = fila.replace("{pago.capital}", "")
-            fila = fila.replace("{pago.enganche}", "")
-            fila = fila.replace("{pago.total}", "")
-            fila = fila.replace("{pago.saldo_capital}", "")
-            filas_renderizadas.append(fila)
-
-        html_con_filas = html_raw.replace(fila_template, "\n".join(filas_renderizadas), 1)
-        totales = {
-            "{totales.suma_capital}": self._formatear_moneda(suma_capital),
-            "{totales.suma_enganche}": self._formatear_moneda(suma_enganche),
-            "{totales.suma_total}": self._formatear_moneda(suma_total),
-        }
-        logger.info(
-            "[PDF_COTIZACIONES] Paso: tabla construida | filas=%s | suma_capital=%s | suma_enganche=%s | suma_total=%s",
-            len(filas_renderizadas),
-            totales["{totales.suma_capital}"],
-            totales["{totales.suma_enganche}"],
-            totales["{totales.suma_total}"],
-        )
-        return html_con_filas, totales
-
-    def _obtener_plantillas_por_categoria(self, empresa_id: str, categoria: str):
-        doc_activo = UtilsNotifications._buscar_documento_plantilla(
-            self.repo,
-            empresa_id,
-            categoria,
-            "plantillas_juridico",
-            solo_activas=True,
-            fallback_listado=True,
-        )
-        if doc_activo:
-            return doc_activo
-
-        doc_cualquiera = UtilsNotifications._buscar_documento_plantilla(
-            self.repo,
-            empresa_id,
-            categoria,
-            "plantillas_juridico",
-            solo_activas=False,
-            fallback_listado=True,
-        )
-        if doc_cualquiera:
-            return doc_cualquiera
-
-        if not doc_cualquiera:
-            raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica para categoría '{categoria}'.")
-
-    @staticmethod
-    def _subir_pdf_a_bucket(pdf_bytes: bytes, ruta_carpeta: str, nombre_archivo: str) -> str:
-        cred_path = os.getenv("STORAGE_CREDENTIALS_PATH")
-        if not cred_path:
-            raise HTTPException(status_code=500, detail="Falta STORAGE_CREDENTIALS_PATH")
-
-        storage_client = storage.Client.from_service_account_json(cred_path)
-        bucket = storage_client.bucket(BUCKET_NAME)
-        ruta_completa = f"{ruta_carpeta}/{nombre_archivo}"
-        blob = bucket.blob(ruta_completa)
-
-        if not blob.exists():
-            blob.upload_from_string(pdf_bytes, content_type="application/pdf")
-
-        return blob.generate_signed_url(version="v4", expiration=timedelta(hours=1), method="GET")
-
-    async def generar_pdf_por_categoria(self, empresa_id: str, categoria: str, folio: str, db: Session, subir_bucket: bool = False):
-        logger.info(
-            "[PDF_GENERADOR] Entrada generar_pdf_por_categoria | empresa=%s | categoria=%s | folio=%s | subir_bucket=%s",
-            empresa_id,
-            categoria,
-            folio,
-            subir_bucket,
-        )
-        try:
-            logger.info("[PDF_GENERADOR] Paso: obtener plantilla por categoria")
-            plantilla = self._obtener_plantillas_por_categoria(empresa_id, categoria)
-
-            logger.info("[PDF_GENERADOR] Paso: obtener proveedor de datos")
-            pack_empresa = PROVIDERS.get(empresa_id, {})
-            extraer_datos = pack_empresa.get("get")
-            if not extraer_datos:
-                raise HTTPException(status_code=400, detail="Empresa no configurada.")
-
-            logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio")
-            data_sql = extraer_datos(folio, db)
-            if not data_sql:
-                raise HTTPException(status_code=404, detail="Folio no encontrado.")
-
-            cliente = (
-                    data_sql.get("{c1.client_name}")
-                    or data_sql.get("{cliente}")
-                    or data_sql.get("{cl.cliente}")
-                    or data_sql.get("{v.cliente}")
-                    or "Cliente"
-                )
-
-            fields = plantilla.get("fields", {})
-            html_raw = fields.get("html", {}).get("stringValue", "")
-            if not html_raw:
-                raise HTTPException(status_code=400, detail="La plantilla no tiene HTML.")
-
-            variables_html = dict(data_sql)
-
-            # 1. Formatear montos a Moneda ($X,XXX.XX)
-            claves_monto = ["{v.total_enganche}", "{v.precio_lista}", "{v.apartado}", "{v.flujo_enganche}", "{v.total_enganche_pagar}"]
-            for k in claves_monto:
-                if k in variables_html:
-                    variables_html[k] = self._formatear_moneda(variables_html[k])
-
-            # 2. Limpiar duplicados de "meses"
-            plazo_key = "{v.plazo_financiamiento}"
-            if plazo_key in variables_html:
-                valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
-                variables_html[plazo_key] = valor_plazo
-
-            if self._es_cotizaciones(categoria):
-                logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
-                html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
-                variables_html.update(totales)
-
-            logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas y generar PDF")
-            html_final = self._reemplazar_etiquetas(html_raw, variables_html)
-            nombre_plantilla = fields.get("categoria", {}).get("stringValue", "documento")
-            tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
-            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')} - {self._normalizar_fragmento(cliente, 'Cliente')}.pdf"
-
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-                page = await browser.new_page()
-                await page.set_content(html_final, wait_until="networkidle")
-                await page.emulate_media(media="screen")
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(format=tamanoDocumento, print_background=True)
-                await browser.close()
-
-            respuesta = {
-                "filename": nombre_pdf,
-                "content": base64.b64encode(pdf_bytes).decode("utf-8"),
-                "content_type": "application/pdf",
-                "tamanoDocumento": tamanoDocumento
-            }
-
-            if subir_bucket:
-                logger.info("[PDF_GENERADOR] Paso: subir PDF a bucket")
-                ruta = f"Komunah/PlantillasWeb/Categorias/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
-                respuesta["url_descarga"] = self._subir_pdf_a_bucket(pdf_bytes, ruta, nombre_pdf)
-
-            logger.info("[PDF_GENERADOR] Paso: PDF generado correctamente | filename=%s", nombre_pdf)
-            return respuesta
-        except HTTPException:
-            logger.exception(
-                "[PDF_GENERADOR] Error HTTP en generar_pdf_por_categoria | empresa=%s | categoria=%s | folio=%s",
-                empresa_id,
-                categoria,
-                folio,
-            )
-            raise
-        except Exception as e:
-            logger.exception(
-                "[PDF_GENERADOR] Error inesperado en generar_pdf_por_categoria | empresa=%s | categoria=%s | folio=%s | error=%s",
-                empresa_id,
-                categoria,
-                folio,
-                str(e),
-            )
-            raise HTTPException(status_code=500, detail=f"Error en generar_pdf_por_categoria (folio={folio}, categoria={categoria}): {str(e)}")
-
-    async def _generar_pdf_desde_documento(self, empresa_id: str, id_plantilla: str, folio: str, db: Session, subir_bucket: bool = False):
-        """Genera un PDF desde un documento jurídico por ID."""
-        logger.info(
-            "[PDF_GENERADOR] Entrada _generar_pdf_desde_documento | empresa=%s | plantilla=%s | folio=%s | subir_bucket=%s",
-            empresa_id,
-            id_plantilla,
-            folio,
-            subir_bucket,
-        )
-        logger.info("[PDF_GENERADOR] Paso: obtener plantilla por id")
-        plantilla = self.repo.obtener_un_doc_completo_juridico(empresa_id, id_plantilla)
-        if not plantilla:
-            raise HTTPException(status_code=404, detail=f"No existe la plantilla jurídica seleccionada: {id_plantilla}.")
-
-        pack_empresa = PROVIDERS.get(empresa_id, {})
-        extraer_datos = pack_empresa.get("get")
-        if not extraer_datos:
-            raise HTTPException(status_code=400, detail="Empresa no configurada.")
-
-        logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio")
-        data_sql = extraer_datos(folio, db)
-        if not data_sql:
-            raise HTTPException(status_code=404, detail="Folio no encontrado.")
-
-        fields = plantilla.get("fields", {})
-        html_raw = fields.get("html", {}).get("stringValue", "")
-        if not html_raw:
-            raise HTTPException(status_code=400, detail="La plantilla no tiene HTML.")
-
-        variables_html = dict(data_sql)
-        categoria_plantilla = fields.get("categoria", {}).get("stringValue", "")
-
-        if self._es_cotizaciones(categoria_plantilla):
-            logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones desde ID")
-            html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
-            variables_html.update(totales)
-
-        html_final = self._reemplazar_etiquetas(html_raw, variables_html)
-
-        nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
-        nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')}.pdf"
-        tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
-        logger.info("[PDF_GENERADOR] Paso: render PDF con Playwright")
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-            page = await browser.new_page()
-            await page.set_content(html_final, wait_until="networkidle")
-            await page.emulate_media(media="screen")
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(400)
-            pdf_bytes = await page.pdf(format=tamanoDocumento, print_background=True)
-            await browser.close()
-
-        respuesta = {
-            "id_plantilla": id_plantilla,
-            "filename": nombre_pdf,
-            "content": base64.b64encode(pdf_bytes).decode("utf-8"),
-            "content_type": "application/pdf",
-            "tamanoDocumento": tamanoDocumento
-        }
-
-        if subir_bucket:
-            cliente = (
-                data_sql.get("{c1.client_name}")
-                or data_sql.get("{cliente}")
-                or data_sql.get("{cl.cliente}")
-                or data_sql.get("{v.cliente}")
-                or "Cliente"
-            )
-            ruta = f"Komunah/PlantillasWeb/Categorias/{self._normalizar_fragmento(categoria_plantilla, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
-            respuesta["url_descarga"] = self._subir_pdf_a_bucket(pdf_bytes, ruta, nombre_pdf)
-
-        logger.info("[PDF_GENERADOR] Paso: PDF generado correctamente | plantilla=%s | filename=%s", id_plantilla, nombre_pdf)
-        return respuesta
-
-    async def generar_pdfs_desde_plantillas(
-        self,
-        empresa_id: str,
-        ids_plantillas: Optional[List[str]],
-        folio: str,
-        db: Session,
-        subir_bucket: bool = False,
-    ):
-        """Genera una lista de PDFs usando una lista de IDs de plantillas jurídicas."""
-        ids_limpios = [str(doc_id).strip() for doc_id in (ids_plantillas or []) if str(doc_id).strip()]
-        if not ids_limpios:
-            return []
-
-        resultado = []
-        for doc_id in ids_limpios:
-            pdf = await self._generar_pdf_desde_documento(
-                empresa_id=empresa_id,
-                id_plantilla=doc_id,
-                folio=folio,
-                db=db,
-                subir_bucket=subir_bucket,
-            )
-            resultado.append(pdf)
-
-        return resultado
-
-    async def generar_pdf_desde_plantilla(self, empresa_id: str, id_plantilla: str, folio: str, db: Session):
-        logger.info(
-            "[PDF_GENERADOR] Entrada generar_pdf_desde_plantilla | empresa=%s | plantilla=%s | folio=%s",
-            empresa_id,
-            id_plantilla,
-            folio,
-        )
-        try:
-            return await self._generar_pdf_desde_documento(
-                empresa_id=empresa_id,
-                id_plantilla=id_plantilla,
-                folio=folio,
-                db=db,
-                subir_bucket=True,
-            )
-        except HTTPException:
-            logger.exception(
-                "[PDF_GENERADOR] Error HTTP en generar_pdf_desde_plantilla | empresa=%s | plantilla=%s | folio=%s",
-                empresa_id,
-                id_plantilla,
-                folio,
-            )
-            raise
-        except Exception as e:
-            logger.exception(
-                "[PDF_GENERADOR] Error inesperado en generar_pdf_desde_plantilla | empresa=%s | plantilla=%s | folio=%s | error=%s",
-                empresa_id,
-                id_plantilla,
-                folio,
-                str(e),
-            )
-            raise HTTPException(status_code=500, detail=f"Error en generar_pdf_desde_plantilla (folio={folio}, plantilla={id_plantilla}): {str(e)}")
 
 class UtilsNotifications:
     @staticmethod
@@ -1822,7 +1423,7 @@ class UtilsNotifications:
         if coleccion == "plantillas_whatsapp":
             return repo.listar_plantillas_wa(empresa_id)
         if coleccion == "plantillas_juridico":
-            return repo.listar_plantillas_juridico(empresa_id)
+            return repo.listar_plantillas_documentos(empresa_id)
         return []
 
     @staticmethod
@@ -1912,7 +1513,7 @@ async def api_crear_plantilla(
             fire_map = {k: {"stringValue": str(v)} for k, v in p.documentos_adjuntos.items()}
             payload["fields"]["documentos_adjuntos"] = {"mapValue": {"fields": fire_map}}
         else:
-            mapeo = repo._get_juridico_mapping_multiple(empresa_id, p.documentos_adjuntos)
+            mapeo = repo._get_documento_mapping_multiple(empresa_id, p.documentos_adjuntos)
             if mapeo:
                 fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
                 payload["fields"]["documentos_adjuntos"] = {"mapValue": {"fields": fire_map}}
@@ -2466,7 +2067,7 @@ async def api_crear_plantilla_wa(
             payload["fields"]["documento_adjunto_id"] = {"mapValue": {"fields": fire_map}}
         else:
             ids = p.documento_adjunto_id if isinstance(p.documento_adjunto_id, list) else [p.documento_adjunto_id]
-            mapeo = repo._get_juridico_mapping_multiple(empresa_id, ids)
+            mapeo = repo._get_documento_mapping_multiple(empresa_id, ids)
             if mapeo:
                 fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
                 payload["fields"]["documento_adjunto_id"] = {"mapValue": {"fields": fire_map}}
@@ -2906,12 +2507,12 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
 
 #endregion
 
-#region CRUD Plantillas para Jurídico
+#region CRUD Plantillas para documentos dinamicos (PDFs)
 
-@router_documento.get("/Documentos/{empresa_id}")
+@router_documento.get("/Documentos")
 def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
-    docs = repo.listar_plantillas_juridico(empresa_id)
+    docs = repo.listar_plantillas_documentos(empresa_id)
     resultado = []
     for d in docs:
         f = d.get("fields", {})
@@ -2922,41 +2523,139 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
             "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False),
             "static": f.get("static", {}).get("booleanValue", False),
+            "anexos": {k: v.get("stringValue") for k, v in f.get("anexos", {}).get("mapValue", {}).get("fields", {}).items()},
+            "tieneAnexos": f.get("tieneAnexos", {}).get("booleanValue", False),
+            "anexos": [v.get("stringValue") for v in f.get("anexos", {}).get("arrayValue", {}).get("values", [])],
             "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
-            "html": f.get("html", {}).get("stringValue", "")
+            "html": f.get("html", {}).get("stringValue", ""),
+            "archivos_subidos": {
+                k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()
+            }   
         })
     return resultado
 
-@router_documento.post("/Crear/{empresa_id}", status_code=201)
-def crear_plantilla_documento(empresa_id: str, p: JuridicoBase, user: dict = Depends(es_admin)):
+@router_documento.post("/Crear", status_code=201)
+async def crear_plantilla_documento(empresa_id: str, p: DocumentosDinamicosBase, archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
-    nombre_id = repo.generar_siguiente_id_juridico(empresa_id)
+    nombre_id = repo.generar_siguiente_id_documentos(empresa_id)
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico?documentId={nombre_id}"
     
+    adjuntos_procesados = []
+
+    if archivos:
+        for f in archivos:
+            if f.filename:
+                contenido = await f.read()
+                adjuntos_procesados.append({
+                    "content": base64.b64encode(contenido).decode('utf-8'),
+                    "filename": f.filename,
+                    "mime_type": f.content_type,
+                    "tipo_visual": "image" if str(f.content_type).startswith("image/") else "file"
+                })
+    anexos_firestore = {"mapValue": {"fields": {}}}
+    if p.anexos:
+        mapeo_data = {}
+        if isinstance(p.anexos, dict):
+            mapeo_data = p.anexos
+        else:
+            mapeo_data = repo._get_anexos_mapping_multiple(empresa_id, p.anexos) or {}
+        
+        if mapeo_data:
+            anexos_firestore = {
+                "mapValue": {
+                    "fields": {k: {"stringValue": str(v)} for k, v in mapeo_data.items()}
+                }
+            }
+
     payload = {"fields": {
-        "id": {"stringValue": nombre_id},
-        "nombre": {"stringValue": p.nombre},
-        "categoria": {"stringValue": p.categoria},
-        "html": {"stringValue": p.html},
-        "tamanoDocumento": {"stringValue": p.tamanoDocumento},
-        "activo": {"booleanValue": bool(p.activo)},
-        "static": {"booleanValue": False},
-        "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}
-    }}
+            "id": {"stringValue": nombre_id},
+            "nombre": {"stringValue": p.nombre},
+            "categoria": {"stringValue": p.categoria},
+            "tamanoDocumento": {"stringValue": p.tamanoDocumento},
+            "activo": {"booleanValue": bool(p.activo)},
+            "static": {"booleanValue": False},
+            "anexos": anexos_firestore,
+            "tieneAnexos": {"booleanValue": p.tieneAnexos},
+            "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}},
+            "html": {"stringValue": p.html},
+            "archivos_subidos": {
+                "arrayValue": {
+                    "values": [
+                        {
+                            "mapValue": {
+                                "fields": {
+                                    "filename": {"stringValue": a["filename"]},
+                                    "mime_type": {"stringValue": a["mime_type"]},
+                                    "tipo_visual": {"stringValue": a["tipo_visual"]},
+                                    "content": {"stringValue": a["content"]}
+                                }
+                            }
+                        } for a in adjuntos_procesados
+                    ]
+                }
+            }
+        }
+    }
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     if r.status_code == 200 and p.activo:
         TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, p.categoria, "plantillas_juridico")
     return {"status": "creada", "id": nombre_id}
 
-@router_documento.patch("/Actualizar/{empresa_id}/{doc_id}")
-def actualizar_documento(empresa_id: str, doc_id: str, datos: JuridicoUpdate, user: dict = Depends(es_admin)):
+@router_documento.patch("/Actualizar")
+async def actualizar_documento(empresa_id: str, doc_id: str, datos: DocumentosDinamicosUpdate, archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
-    res = repo.actualizar_plantilla_juridico(empresa_id, doc_id, datos)
+    res = repo.actualizar_plantilla_documentos(empresa_id, doc_id, datos)
     
+    # Procesar archivos si se enviaron
+    if archivos:
+        adjuntos_procesados = []
+        for f in archivos:
+            if f.filename:
+                contenido = await f.read()
+                adjuntos_procesados.append({
+                    "content": base64.b64encode(contenido).decode('utf-8'),
+                    "filename": f.filename,
+                    "mime_type": f.content_type,
+                    "tipo_visual": "image" if str(f.content_type).startswith("image/") else "file"
+                })
+        
+        if adjuntos_procesados:
+            url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
+            payload_files = {
+                "fields": {
+                    "archivos_subidos": {
+                        "arrayValue": {
+                            "values": [
+                                {
+                                    "mapValue": {
+                                        "fields": {
+                                            "filename": {"stringValue": a["filename"]},
+                                            "mime_type": {"stringValue": a["mime_type"]},
+                                            "tipo_visual": {"stringValue": a["tipo_visual"]},
+                                            "content": {"stringValue": a["content"]}
+                                        }
+                                    }
+                                } for a in adjuntos_procesados
+                            ]
+                        }
+                    }
+                }
+            }
+            res_files = requests.patch(
+                url,
+                json=payload_files,
+                params=[("updateMask.fieldPaths", "archivos_subidos")],
+                headers=repo.headers,
+                timeout=10,
+            )
+            if res_files.status_code != 200:
+                raise HTTPException(status_code=res_files.status_code, detail=res_files.text)
+
+
     if res and res.status_code == 200:
         if datos.activo is True:
-            doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
+            doc = repo.obtener_un_doc_completo_documentos(empresa_id, doc_id)
             cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
             if cat:
                 TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_juridico")
@@ -2965,10 +2664,10 @@ def actualizar_documento(empresa_id: str, doc_id: str, datos: JuridicoUpdate, us
     # Manejo de error por si falla la API de Google
     raise HTTPException(status_code=res.status_code, detail="No se pudo actualizar en Firestore")
 
-@router_documento.delete("/Eliminar/{empresa_id}/{doc_id}")
+@router_documento.delete("/Eliminar")
 def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
-    doc = repo.obtener_un_doc_completo_juridico(empresa_id, doc_id)
+    doc = repo.obtener_un_doc_completo_documentos(empresa_id, doc_id)
     if not doc: raise HTTPException(status_code=404, detail="No existe.")
     
     if doc.get("fields", {}).get("static", {}).get("booleanValue", False):
@@ -2979,3 +2678,75 @@ def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_adm
     return {"status": "eliminada", "id": doc_id}
 
 #endregion
+
+#region CRUD Plantillas para anexos
+
+@router_anexo.get("/Listar-anexos")
+def listar_anexos(empresa_id: str, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    docs = repo.listar_plantillas_anexo(empresa_id)
+    resultado = []
+    for d in docs:
+        f = d.get("fields", {})
+        resultado.append({
+            "id": d["name"].split("/")[-1],
+            "nombre": f.get("nombre", {}).get("stringValue", ""),
+            "categoria": f.get("categoria", {}).get("stringValue", ""),
+            "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
+            "static": f.get("static", {}).get("booleanValue", False),
+            "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
+            "contenido": f.get("contenido", {}).get("stringValue", "")
+        })
+    return resultado
+
+@router_anexo.post("/Crear-anexo", status_code=201)
+def crear_plantilla_anexo(empresa_id: str, datos: AnexosBase, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    nombre_id = repo.generar_siguiente_id_anexos(empresa_id)
+    url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo?documentId={nombre_id}"
+    
+    payload = {"fields": {
+        "id": {"stringValue": nombre_id},
+        "nombre": {"stringValue": datos.nombre},
+        "categoria": {"stringValue": datos.categoria},
+        "contenido": {"stringValue": datos.contenido},
+        "tamanoDocumento": {"stringValue": datos.tamanoDocumento},
+        "static": {"booleanValue": False},
+        "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in datos.tags_departamento]}}
+        }
+    }
+    r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
+    if r.status_code == 200 and datos.activo:
+        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, datos.categoria, "plantillas_anexo")
+    return {"status": "creada", "id": nombre_id}
+
+@router_anexo.patch("/Actualizar-anexo")
+def actualizar_anexo(empresa_id: str, doc_id: str, datos: AnexosUpdate, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, datos)
+    
+    if res and res.status_code == 200:
+        if datos.activo is True:
+            doc = repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
+            cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
+            if cat:
+                TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_anexo")
+        return {"status": "actualizada", "id": doc_id}
+    
+    # Manejo de error por si falla la API de Google
+    raise HTTPException(status_code=res.status_code, detail="No se pudo actualizar en Firestore")
+
+@router_anexo.delete("/Eliminar-anexo")
+def eliminar_anexo(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
+    repo = FirebaseRepository()
+    doc = repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
+    if not doc: raise HTTPException(status_code=404, detail="No existe.")
+    
+    if doc.get("fields", {}).get("static", {}).get("booleanValue", False):
+        raise HTTPException(status_code=403, detail="No puedes borrar una plantilla base del sistema.")
+    
+    url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}"
+    requests.delete(url, headers=repo.headers, timeout=10)
+    return {"status": "eliminada", "id": doc_id}
+
+#endregion 
