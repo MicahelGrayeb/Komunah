@@ -523,21 +523,53 @@ class IncidenciasResponse(BaseModel):
 
 
 
-class JuridicoBase(BaseModel):
+class DocumentosDinamicosBase(BaseModel):
     nombre: str
     categoria: str
     html: str
     tamanoDocumento: str
     activo: bool = False
+    tieneAnexos: Optional[bool] = None
+    anexos: Optional[List[str]] = None
     tags_departamento: List[str] = []
 
-class JuridicoUpdate(BaseModel):
+class DocumentosDinamicosUpdate(BaseModel):
     nombre: Optional[str] = None
     categoria: Optional[str] = None
     html: Optional[str] = None
     activo: Optional[bool] = None
+    tieneAnexos: Optional[bool] = None
+    anexos: Optional[List[str]] = None
     tags_departamento: Optional[List[str]] = None
     tamanoDocumento: Optional[str] = None
+
+class AnexosBase(BaseModel):
+    nombre: str
+    # htmlLibre: Optional[bool] = None
+    # FirmastesEmpresa: Optional[bool] = None
+    # FirmasCoopropietarios: Optional[bool] = None
+    # HojaMebretadaProyecto: Optional[bool] = None
+    categoria: str
+    # encabezado: Optional[str] = None
+    contenido: str
+    # footer: Optional[str] = None
+    tamanoDocumento: str
+    activo: bool = False
+
+class AnexosUpdate(BaseModel):
+    nombre: str
+    # htmlLibre: Optional[bool] = None
+    # FirmastesEmpresa: Optional[bool] = None
+    # FirmasCoopropietarios: Optional[bool] = None
+    # HojaMebretadaProyecto: Optional[bool] = None
+    categoria: str
+    # encabezado: Optional[str] = None
+    contenido: str
+    # footer: Optional[str] = None
+    activo: Optional[bool] = None
+    tamanoDocumento: Optional[str] = None
+
+
 
 class ReporteExpedientesDetalladoResponse(BaseModel):
     folio: Any = Field(alias="FOLIO")
