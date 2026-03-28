@@ -448,7 +448,7 @@ class FirebaseRepository:
         
         if hasattr(p, 'anexos') and p.anexos is not None:
                 # Decidimos si usamos el dict directo o consultamos el mapeo
-                mapeo_data = p.anexos if isinstance(p.anexos, dict) else self._get_anexos_mapping_multiple(empresa_id, p.anexos)
+                mapeo_data = p.anexos if isinstance(p.anexos, dict) else self._get_anexo_mapping_multiple(empresa_id, p.anexos)
                 
                 if mapeo_data is not None:
                     fields["anexos"] = {
@@ -2523,42 +2523,53 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
             "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False),
             "static": f.get("static", {}).get("booleanValue", False),
-            "anexos": {k: v.get("stringValue") for k, v in f.get("anexos", {}).get("mapValue", {}).get("fields", {}).items()},
             "tieneAnexos": f.get("tieneAnexos", {}).get("booleanValue", False),
-            "anexos": [v.get("stringValue") for v in f.get("anexos", {}).get("arrayValue", {}).get("values", [])],
+            "anexos": {
+                k: v.get("stringValue") for k, v in f.get("anexos", {}).get("mapValue", {}).get("fields", {}).items()
+            },
             "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
             "html": f.get("html", {}).get("stringValue", ""),
             "archivos_subidos": {
                 k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()
-            }   
+            },
+            "archivos_subidos_meta": {
+                k: {
+                    meta_key: meta_val.get("stringValue")
+                    for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
+                }                for k, info in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
+            }
         })
     return resultado
 
 @router_documento.post("/Crear", status_code=201)
-async def crear_plantilla_documento(empresa_id: str, p: DocumentosDinamicosBase, archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_admin)):
+async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_admin)):
+    # 1. Obtenemos los datos del normalizador
+    data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=DocumentosDinamicosBase,
+        datos_modelo=None,
+        datos_json=datos_json,
+        archivos=archivos,
+    )
+    
+    if hasattr(data_obj, "model_dump"):
+        data = data_obj.model_dump()
+    else:
+        data = data_obj.dict()
+    
     repo = FirebaseRepository()
     nombre_id = repo.generar_siguiente_id_documentos(empresa_id)
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico?documentId={nombre_id}"
     
-    adjuntos_procesados = []
-
-    if archivos:
-        for f in archivos:
-            if f.filename:
-                contenido = await f.read()
-                adjuntos_procesados.append({
-                    "content": base64.b64encode(contenido).decode('utf-8'),
-                    "filename": f.filename,
-                    "mime_type": f.content_type,
-                    "tipo_visual": "image" if str(f.content_type).startswith("image/") else "file"
-                })
+    # El resto de tu código ahora funcionará porque 'data' ya es un diccionario
     anexos_firestore = {"mapValue": {"fields": {}}}
-    if p.anexos:
+    anexos_raw = data.get("anexos")
+
+    if anexos_raw:
         mapeo_data = {}
-        if isinstance(p.anexos, dict):
-            mapeo_data = p.anexos
+        if isinstance(anexos_raw, dict):
+            mapeo_data = anexos_raw
         else:
-            mapeo_data = repo._get_anexos_mapping_multiple(empresa_id, p.anexos) or {}
+            mapeo_data = repo._get_anexo_mapping_multiple(empresa_id, anexos_raw) or {}
         
         if mapeo_data:
             anexos_firestore = {
@@ -2567,102 +2578,128 @@ async def crear_plantilla_documento(empresa_id: str, p: DocumentosDinamicosBase,
                 }
             }
 
-    payload = {"fields": {
+    payload = {
+        "fields": {
             "id": {"stringValue": nombre_id},
-            "nombre": {"stringValue": p.nombre},
-            "categoria": {"stringValue": p.categoria},
-            "tamanoDocumento": {"stringValue": p.tamanoDocumento},
-            "activo": {"booleanValue": bool(p.activo)},
+            "nombre": {"stringValue": data.get("nombre", "")},
+            "categoria": {"stringValue": data.get("categoria", "")},
+            "tamanoDocumento": {"stringValue": data.get("tamanoDocumento", "Letter")},
+            "activo": {"booleanValue": bool(data.get("activo", False))},
             "static": {"booleanValue": False},
             "anexos": anexos_firestore,
-            "tieneAnexos": {"booleanValue": p.tieneAnexos},
-            "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}},
-            "html": {"stringValue": p.html},
-            "archivos_subidos": {
+            "tieneAnexos": {"booleanValue": bool(data.get("tieneAnexos", False))},
+            "tags_departamento": {
                 "arrayValue": {
-                    "values": [
-                        {
-                            "mapValue": {
-                                "fields": {
-                                    "filename": {"stringValue": a["filename"]},
-                                    "mime_type": {"stringValue": a["mime_type"]},
-                                    "tipo_visual": {"stringValue": a["tipo_visual"]},
-                                    "content": {"stringValue": a["content"]}
-                                }
+                    "values": [{"stringValue": t} for t in data.get("tags_departamento", [])]
+                }
+            },
+            "html": {"stringValue": data.get("html", "")}
+        }
+    }
+
+    if archivos_map:
+        payload["fields"]["archivos_subidos"] = {
+            "mapValue": {
+                "fields": {k: {"stringValue": v} for k, v in archivos_map.items()}
+            }
+        }
+        payload["fields"]["archivos_subidos_meta"] = {
+            "mapValue": {
+                "fields": {
+                    k: {
+                        "mapValue": {
+                            "fields": {
+                                "mime_type": {"stringValue": v["mime_type"]},
+                                "tipo_visual": {"stringValue": v["tipo_visual"]},
                             }
-                        } for a in adjuntos_procesados
-                    ]
+                        }
+                    } for k, v in archivos_meta.items()
                 }
             }
         }
-    }
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
-    if r.status_code == 200 and p.activo:
-        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, p.categoria, "plantillas_juridico")
+    if r.status_code == 200 and data.get("activo"):
+        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, data.get("categoria"), "plantillas_juridico")
+        
     return {"status": "creada", "id": nombre_id}
 
 @router_documento.patch("/Actualizar")
-async def actualizar_documento(empresa_id: str, doc_id: str, datos: DocumentosDinamicosUpdate, archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_admin)):
-    repo = FirebaseRepository()
-    res = repo.actualizar_plantilla_documentos(empresa_id, doc_id, datos)
+async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_admin)):
+    # 1. Normalizar datos
+    data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=DocumentosDinamicosUpdate,
+        datos_modelo=None,
+        datos_json=datos_json,
+        archivos=archivos,
+    )
     
-    # Procesar archivos si se enviaron
-    if archivos:
-        adjuntos_procesados = []
-        for f in archivos:
-            if f.filename:
-                contenido = await f.read()
-                adjuntos_procesados.append({
-                    "content": base64.b64encode(contenido).decode('utf-8'),
-                    "filename": f.filename,
-                    "mime_type": f.content_type,
-                    "tipo_visual": "image" if str(f.content_type).startswith("image/") else "file"
-                })
-        
-        if adjuntos_procesados:
-            url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
-            payload_files = {
-                "fields": {
-                    "archivos_subidos": {
-                        "arrayValue": {
-                            "values": [
-                                {
-                                    "mapValue": {
-                                        "fields": {
-                                            "filename": {"stringValue": a["filename"]},
-                                            "mime_type": {"stringValue": a["mime_type"]},
-                                            "tipo_visual": {"stringValue": a["tipo_visual"]},
-                                            "content": {"stringValue": a["content"]}
-                                        }
+    # 2. CONVERSIÓN CRÍTICA: Convertir objeto Pydantic a Diccionario
+    data = data_obj.model_dump(exclude_unset=True) if hasattr(data_obj, "model_dump") else data_obj.dict(exclude_unset=True)
+    
+    repo = FirebaseRepository()
+    
+    # 3. Actualizar datos principales
+    # Pasamos el diccionario 'data' en lugar del objeto Pydantic
+    res = repo.actualizar_plantilla_documentos(empresa_id, doc_id, data_obj)
+    
+    # 4. Procesar archivos si existen
+    if archivos_map:
+        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}" # Asegúrate que la ruta sea correcta
+        payload_files = {
+            "fields": {
+                "archivos_subidos": {
+                    "mapValue": {
+                        "fields": {k: {"stringValue": v} for k, v in archivos_map.items()}
+                    }
+                },
+                "archivos_subidos_meta": {
+                    "mapValue": {
+                        "fields": {
+                            k: {
+                                "mapValue": {
+                                    "fields": {
+                                        "mime_type": {"stringValue": v["mime_type"]},
+                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
                                     }
-                                } for a in adjuntos_procesados
-                            ]
+                                }
+                            } for k, v in archivos_meta.items()
                         }
                     }
                 }
             }
-            res_files = requests.patch(
-                url,
-                json=payload_files,
-                params=[("updateMask.fieldPaths", "archivos_subidos")],
-                headers=repo.headers,
-                timeout=10,
-            )
-            if res_files.status_code != 200:
-                raise HTTPException(status_code=res_files.status_code, detail=res_files.text)
+        }
+        
+        # Corregimos la updateMask para incluir AMBOS campos
+        params = [
+            ("updateMask.fieldPaths", "archivos_subidos"),
+            ("updateMask.fieldPaths", "archivos_subidos_meta")
+        ]
+        
+        res_files = requests.patch(
+            url,
+            json=payload_files,
+            params=params,
+            headers=repo.headers,
+            timeout=10,
+        )
+        if res_files.status_code != 200:
+            raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos: {res_files.text}")
 
-
+    # 5. Lógica de activación única
     if res and res.status_code == 200:
-        if datos.activo is True:
+        # Usamos .get() de forma segura sobre el diccionario 'data'
+        if data.get("activo") is True:
             doc = repo.obtener_un_doc_completo_documentos(empresa_id, doc_id)
-            cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
+            # Firestore devuelve una estructura compleja, accedemos con cuidado
+            fields = doc.get("fields", {})
+            cat = fields.get("categoria", {}).get("stringValue")
             if cat:
                 TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_juridico")
+        
         return {"status": "actualizada", "id": doc_id}
     
-    # Manejo de error por si falla la API de Google
-    raise HTTPException(status_code=res.status_code, detail="No se pudo actualizar en Firestore")
+    raise HTTPException(status_code=res.status_code if res else 500, detail="No se pudo actualizar en Firestore")
 
 @router_documento.delete("/Eliminar")
 def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
@@ -2700,33 +2737,33 @@ def listar_anexos(empresa_id: str, user: dict = Depends(es_admin)):
     return resultado
 
 @router_anexo.post("/Crear-anexo", status_code=201)
-def crear_plantilla_anexo(empresa_id: str, datos: AnexosBase, user: dict = Depends(es_admin)):
+def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[AnexosBase] = Body(default=None), user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
     nombre_id = repo.generar_siguiente_id_anexos(empresa_id)
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo?documentId={nombre_id}"
     
     payload = {"fields": {
         "id": {"stringValue": nombre_id},
-        "nombre": {"stringValue": datos.nombre},
-        "categoria": {"stringValue": datos.categoria},
-        "contenido": {"stringValue": datos.contenido},
-        "tamanoDocumento": {"stringValue": datos.tamanoDocumento},
+        "nombre": {"stringValue": datos_json.nombre},
+        "categoria": {"stringValue": datos_json.categoria},
+        "contenido": {"stringValue": datos_json.contenido},
+        "tamanoDocumento": {"stringValue": datos_json.tamanoDocumento},
         "static": {"booleanValue": False},
-        "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in datos.tags_departamento]}}
+        "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in datos_json.tags_departamento]}}
         }
     }
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
-    if r.status_code == 200 and datos.activo:
-        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, datos.categoria, "plantillas_anexo")
+    if r.status_code == 200 and datos_json.activo:
+        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, datos_json.categoria, "plantillas_anexo")
     return {"status": "creada", "id": nombre_id}
 
 @router_anexo.patch("/Actualizar-anexo")
-def actualizar_anexo(empresa_id: str, doc_id: str, datos: AnexosUpdate, user: dict = Depends(es_admin)):
+def actualizar_anexo(empresa_id: str, doc_id: str, datos_json: Optional[AnexosUpdate] = Body(default=None), user: dict = Depends(es_admin)):
     repo = FirebaseRepository()
-    res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, datos)
+    res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, datos_json)
     
     if res and res.status_code == 200:
-        if datos.activo is True:
+        if datos_json.activo is True:
             doc = repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
             cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
             if cat:
