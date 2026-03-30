@@ -10,7 +10,8 @@ from ..schemas import (
     EmailManualSchema, PlantillaWAUpdate, PlantillaWABase, 
     WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, 
     RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, 
-    DocumentosDinamicosBase, DocumentosDinamicosUpdate, AnexosBase, AnexosUpdate
+    DocumentosDinamicosBase, DocumentosDinamicosUpdate, AnexosBase, AnexosUpdate,
+    DocumentoDinamicoGeneracionSchema
 )
 from ..utils.datos_proveedores import (
     get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, 
@@ -29,7 +30,7 @@ import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 from argparse import Namespace
 from ..models import Venta, Cliente
-from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase
+from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase, GenerarPDFDinamico, GenerarPDFAnexo
 from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
@@ -430,35 +431,39 @@ class FirebaseRepository:
     def actualizar_plantilla_documentos(self, empresa_id: str, doc_id: str, p: Any):
         fields = {}
         mask = []
-        
-        if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
-        if p.html: fields["html"] = {"stringValue": p.html}; mask.append("html")
-        if p.categoria: fields["categoria"] = {"stringValue": p.categoria}; mask.append("categoria")
-        if p.tieneAnexos is not None: fields["tieneAnexos"] = {"booleanValue": bool(p.tieneAnexos)}; mask.append("tieneAnexos")
-
-        if hasattr(p, 'tamanoDocumento') and p.tamanoDocumento:
-            fields["tamanoDocumento"] = {"stringValue": p.tamanoDocumento}
-            mask.append("tamanoDocumento")
-
-        if p.activo is not None: fields["activo"] = {"booleanValue": bool(p.activo)}; mask.append("activo")
-        
-        if hasattr(p, 'tags_departamento') and p.tags_departamento is not None:
-            fields["tags_departamento"] = {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}
-            mask.append("tags_departamento")
-        
-        if hasattr(p, 'anexos') and p.anexos is not None:
-                # Decidimos si usamos el dict directo o consultamos el mapeo
-                mapeo_data = p.anexos if isinstance(p.anexos, dict) else self._get_anexo_mapping_multiple(empresa_id, p.anexos)
+        data = p.dict(exclude_unset=True)
+        for key, value in data.items():
+            if value is None: 
+                continue 
+            mask.append(key)
+            # 1. Tipos Booleanos
+            if key in ["activo", "static", "tieneAnexos"]:
+                fields[key] = {"booleanValue": bool(value)}
+            # 2. Listas (como los tags)
+            elif key == "tags":
+                fields[key] = {"arrayValue": {"values": [{"stringValue": str(t)} for t in value]}}
+            # 3. Mapas Especiales (Anexos - siguiendo tu lógica de documentos_adjuntos)
+            elif key == "anexos":
+                if isinstance(value, dict):
+                    fire_map = {k: {"stringValue": str(v)} for k, v in value.items()}
+                    fields[key] = {"mapValue": {"fields": fire_map}}
+                else:
+                    mapeo = self._get_anexo_mapping_multiple(empresa_id, value)
+                    if mapeo:
+                        fire_map = {k: {"stringValue": v} for k, v in mapeo.items()}
+                        fields[key] = {"mapValue": {"fields": fire_map}}
+            # 4. Otros Mapas (Para archivos_subidos y archivos_subidos_meta)
+            # Esto evita que un {} caiga en el else de stringValue
+            elif isinstance(value, dict):
+                fire_map = {k: {"stringValue": str(v)} for k, v in value.items()}
+                fields[key] = {"mapValue": {"fields": fire_map}}
                 
-                if mapeo_data is not None:
-                    fields["anexos"] = {
-                        "mapValue": {
-                            "fields": {k: {"stringValue": str(v)} for k, v in mapeo_data.items()}
-                        }
-                    }
-                    mask.append("anexos")
-
-        if not mask: return None
+            # 5. El "Else" Dinámico para strings (Nombre, HTML, categoria, tamanoDocumento, etc.)
+            else:
+                fields[key] = {"stringValue": str(value)}
+        
+        if not mask: 
+            return None
         
         query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}?{query_params}"
@@ -520,11 +525,9 @@ class FirebaseRepository:
             fields["tamanoDocumento"] = {"stringValue": p.tamanoDocumento}
             mask.append("tamanoDocumento")
 
-        if p.activo is not None: fields["activo"] = {"booleanValue": bool(p.activo)}; mask.append("activo")
-        
-        if hasattr(p, 'tags_departamento') and p.tags_departamento is not None:
-            fields["tags_departamento"] = {"arrayValue": {"values": [{"stringValue": t} for t in p.tags_departamento]}}
-            mask.append("tags_departamento")
+        if hasattr(p, 'tags') and p.tags is not None:
+            fields["tags"] = {"arrayValue": {"values": [{"stringValue": t} for t in p.tags]}}
+            mask.append("tags")
         
         if not mask: return None
         
@@ -2527,7 +2530,7 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
             "anexos": {
                 k: v.get("stringValue") for k, v in f.get("anexos", {}).get("mapValue", {}).get("fields", {}).items()
             },
-            "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
+            "tags": [v.get("stringValue") for v in f.get("tags", {}).get("arrayValue", {}).get("values", [])],
             "html": f.get("html", {}).get("stringValue", ""),
             "archivos_subidos": {
                 k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()
@@ -2588,9 +2591,9 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
             "static": {"booleanValue": False},
             "anexos": anexos_firestore,
             "tieneAnexos": {"booleanValue": bool(data.get("tieneAnexos", False))},
-            "tags_departamento": {
+            "tags": {
                 "arrayValue": {
-                    "values": [{"stringValue": t} for t in data.get("tags_departamento", [])]
+                    "values": [{"stringValue": t} for t in data.get("tags", [])]
                 }
             },
             "html": {"stringValue": data.get("html", "")}
@@ -2640,17 +2643,23 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
     repo = FirebaseRepository()
     
     # 3. Actualizar datos principales
-    # Pasamos el diccionario 'data' en lugar del objeto Pydantic
     res = repo.actualizar_plantilla_documentos(empresa_id, doc_id, data_obj)
     
+    archivos_viejos = data.get("archivos_subidos", {})
+    meta_vieja = data.get("archivos_subidos_meta", {})
+
+    # Unimos (los nuevos sobreescriben si tienen el mismo nombre)
+    archivos_finales = {**archivos_viejos, **archivos_map}
+    meta_final = {**meta_vieja, **archivos_meta}
+
     # 4. Procesar archivos si existen
-    if archivos_map:
-        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}" # Asegúrate que la ruta sea correcta
+    if archivos_finales:
+        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
         payload_files = {
             "fields": {
                 "archivos_subidos": {
                     "mapValue": {
-                        "fields": {k: {"stringValue": v} for k, v in archivos_map.items()}
+                        "fields": {k: {"stringValue": v} for k, v in archivos_finales.items()}
                     }
                 },
                 "archivos_subidos_meta": {
@@ -2663,7 +2672,7 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
                                         "tipo_visual": {"stringValue": v["tipo_visual"]},
                                     }
                                 }
-                            } for k, v in archivos_meta.items()
+                            } for k, v in meta_final.items()
                         }
                     }
                 }
@@ -2714,6 +2723,24 @@ def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_adm
     requests.delete(url, headers=repo.headers, timeout=10)
     return {"status": "eliminada", "id": doc_id}
 
+@router_documento.post("/generar-documento-dinamico")
+async def api_generar_subir_documento_dinamico(
+    payload: DocumentoDinamicoGeneracionSchema,
+    user: dict = Depends(es_usuario),
+):
+    logger.info(
+        "[PDF_DINAMICO] Endpoint /generar-subir | empresa_id=%s | doc_id=%s",
+        payload.empresa_id,
+        payload.doc_id,
+    )
+
+    generador = GenerarPDFDinamico(FirebaseRepository())
+    return await generador.generar_por_doc_id(
+        empresa_id=payload.empresa_id.strip(),
+        doc_id=payload.doc_id.strip(),
+        subir_bucket=True,
+    )
+
 #endregion
 
 #region CRUD Plantillas para anexos
@@ -2731,7 +2758,7 @@ def listar_anexos(empresa_id: str, user: dict = Depends(es_admin)):
             "categoria": f.get("categoria", {}).get("stringValue", ""),
             "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
             "static": f.get("static", {}).get("booleanValue", False),
-            "tags": [v.get("stringValue") for v in f.get("tags_departamento", {}).get("arrayValue", {}).get("values", [])],
+            "tags": [v.get("stringValue") for v in f.get("tags", {}).get("arrayValue", {}).get("values", [])],
             "contenido": f.get("contenido", {}).get("stringValue", "")
         })
     return resultado
@@ -2747,13 +2774,13 @@ def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[AnexosBase] = Bo
         "nombre": {"stringValue": datos_json.nombre},
         "categoria": {"stringValue": datos_json.categoria},
         "contenido": {"stringValue": datos_json.contenido},
-        "tamanoDocumento": {"stringValue": datos_json.tamanoDocumento},
         "static": {"booleanValue": False},
-        "tags_departamento": {"arrayValue": {"values": [{"stringValue": t} for t in datos_json.tags_departamento]}}
+        "tamanoDocumento": {"stringValue": datos_json.tamanoDocumento},
+        "tags": {"arrayValue": {"values": [{"stringValue": t} for t in datos_json.tags]}}
         }
     }
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
-    if r.status_code == 200 and datos_json.activo:
+    if r.status_code == 200 and datos_json:
         TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, datos_json.categoria, "plantillas_anexo")
     return {"status": "creada", "id": nombre_id}
 
@@ -2763,10 +2790,9 @@ def actualizar_anexo(empresa_id: str, doc_id: str, datos_json: Optional[AnexosUp
     res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, datos_json)
     
     if res and res.status_code == 200:
-        if datos_json.activo is True:
-            doc = repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
-            cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
-            if cat:
+        doc = repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
+        cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
+        if cat:
                 TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_anexo")
         return {"status": "actualizada", "id": doc_id}
     
@@ -2785,5 +2811,24 @@ def eliminar_anexo(empresa_id: str, doc_id: str, user: dict = Depends(es_admin))
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}"
     requests.delete(url, headers=repo.headers, timeout=10)
     return {"status": "eliminada", "id": doc_id}
+
+@router_anexo.post("/generar-documento-anexo")
+async def api_generar_subir_anexo_dinamico(
+    payload: DocumentoDinamicoGeneracionSchema,
+    user: dict = Depends(es_usuario),
+):
+    logger.info(
+        "[PDF_ANEXO] Endpoint /generar-anexo | empresa_id=%s | doc_id=%s",
+        payload.empresa_id,
+        payload.doc_id,
+    )
+
+    generador = GenerarPDFAnexo(FirebaseRepository())
+    return await generador.generar_por_doc_id(
+        empresa_id=payload.empresa_id.strip(),
+        doc_id=payload.doc_id.strip(),
+        subir_bucket=True,
+    )
+
 
 #endregion 

@@ -531,7 +531,7 @@ class DocumentosDinamicosBase(BaseModel):
     activo: bool = False
     tieneAnexos: Optional[bool] = False
     anexos: Optional[Union[Dict[str, str], List[str]]] = None
-    tags_departamento: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
 
 class DocumentosDinamicosUpdate(BaseModel):
     nombre: Optional[str] = None
@@ -540,7 +540,7 @@ class DocumentosDinamicosUpdate(BaseModel):
     activo: Optional[bool] = None
     tieneAnexos: Optional[bool] = None
     anexos: Optional[Union[Dict[str, str], List[str]]] = None
-    tags_departamento: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
     tamanoDocumento: Optional[str] = None
     archivos_subidos: Optional[Dict[str, str]] = None
     archivos_subidos_meta: Optional[Dict[str, Any]] = None
@@ -556,8 +556,7 @@ class AnexosBase(BaseModel):
     contenido: str
     # footer: Optional[str] = None
     tamanoDocumento: str
-    activo: bool = False
-    tags_departamento: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
 
 class AnexosUpdate(BaseModel):
     nombre: str
@@ -569,9 +568,8 @@ class AnexosUpdate(BaseModel):
     # encabezado: Optional[str] = None
     contenido: str
     # footer: Optional[str] = None
-    activo: Optional[bool] = None
     tamanoDocumento: Optional[str] = None
-    tags_departamento: Optional[List[str]] = None
+    tags: Optional[List[str]] = None
 
 
 
@@ -606,6 +604,11 @@ class DocumentosSchemaGeneracion(BaseModel):
     empresa_id: str
     folio: str
     categoria: str
+
+
+class DocumentoDinamicoGeneracionSchema(BaseModel):
+    empresa_id: str
+    doc_id: str
 
 class DocumentosFiltroSchema(BaseModel):
     categoria: Optional[str] = None

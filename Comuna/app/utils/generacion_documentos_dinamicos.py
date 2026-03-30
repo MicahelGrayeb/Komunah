@@ -2,7 +2,8 @@ import os
 import re
 import base64
 import logging
-from datetime import datetime, timedelta
+import io
+from datetime import datetime
 from typing import Any, List, Optional
 from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
@@ -368,7 +369,7 @@ class GenerarPDFUseCase:
             else:
                 logger.info("[PDF_GENERADOR] Paso: blob existente, se omite upload")
 
-            url = blob.generate_signed_url(version="v4", expiration=timedelta(hours=1), method="GET")
+            url = blob.public_url
             logger.info("[PDF_GENERADOR] Salida _subir_pdf_a_bucket | url_generada=true")
             return url
         except HTTPException:
@@ -842,3 +843,307 @@ class GenerarPDFUseCase:
                     str(e),
                 )
                 raise HTTPException(status_code=500, detail=f"Error en generar_pdfs_desde_anexos (folio={folio}): {str(e)}")
+
+class GenerarPDFDinamico(GenerarPDFUseCase):
+    @staticmethod
+    def _append_html_sections(html_base: str, sections: List[str]) -> str:
+        contenido = html_base or ""
+        secciones_validas = [s for s in (sections or []) if str(s).strip()]
+        if not secciones_validas:
+            return contenido
+
+        extras = "".join(
+            f"<div style=\"page-break-before: always;\"></div>{seccion}"
+            for seccion in secciones_validas
+        )
+
+        match = re.search(r"</body\\s*>", contenido, flags=re.IGNORECASE)
+        if match:
+            idx = match.start()
+            return f"{contenido[:idx]}{extras}{contenido[idx:]}"
+
+        return f"{contenido}{extras}"
+
+    @staticmethod
+    def _es_imagen_adjunto(nombre_archivo: str, mime_type: str) -> bool:
+        if mime_type and str(mime_type).lower().startswith("image/"):
+            return True
+
+        nombre = str(nombre_archivo or "").lower()
+        extensiones = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+        return nombre.endswith(extensiones)
+
+    @staticmethod
+    def _es_pdf_adjunto(nombre_archivo: str, mime_type: str) -> bool:
+        if mime_type and str(mime_type).lower() == "application/pdf":
+            return True
+        return str(nombre_archivo or "").lower().endswith(".pdf")
+
+    @staticmethod
+    def _normalizar_base64_contenido(content: str) -> str:
+        valor = str(content or "").strip()
+        if valor.startswith("data:") and "," in valor:
+            return valor.split(",", 1)[1]
+        return valor
+
+    @staticmethod
+    def _unir_pdfs(partes_pdf: List[bytes]) -> bytes:
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Se detectaron adjuntos PDF, pero falta la dependencia 'pypdf'.",
+            ) from exc
+
+        writer = PdfWriter()
+        for pdf_bytes in partes_pdf:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            for page in reader.pages:
+                writer.add_page(page)
+
+        salida = io.BytesIO()
+        writer.write(salida)
+        return salida.getvalue()
+
+    async def generar_por_doc_id(self, empresa_id: str, doc_id: str, subir_bucket: bool = True):
+        logger.info(
+            "[PDF_DINAMICO] Entrada generar_por_doc_id | empresa=%s | doc_id=%s | subir_bucket=%s",
+            empresa_id,
+            doc_id,
+            subir_bucket,
+        )
+        try:
+            empresa_norm = str(empresa_id or "").strip()
+            doc_norm = str(doc_id or "").strip()
+            if not empresa_norm or not doc_norm:
+                raise HTTPException(status_code=400, detail="empresa_id y doc_id son obligatorios.")
+
+            plantilla = self.repo.obtener_un_doc_completo_documentos(empresa_norm, doc_norm)
+            if not plantilla:
+                raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica con id '{doc_norm}'.")
+
+            fields = plantilla.get("fields", {})
+            html_base = fields.get("html", {}).get("stringValue", "")
+            if not html_base:
+                raise HTTPException(status_code=400, detail="La plantilla no tiene HTML en el campo 'html'.")
+
+            categoria = fields.get("categoria", {}).get("stringValue", "general")
+            nombre_plantilla = fields.get("nombre", {}).get("stringValue", doc_norm)
+            cliente = (
+                fields.get("cliente", {}).get("stringValue")
+                or fields.get("nombre_cliente", {}).get("stringValue")
+                or "Cliente"
+            )
+            tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+            variables_base = {
+                "{doc_id}": doc_norm,
+                "{nombre}": nombre_plantilla,
+                "{categoria}": categoria,
+                "{cliente}": cliente,
+            }
+            variables_html = self._normalizar_variables_para_html(variables_base)
+            html_base = self._reemplazar_etiquetas(html_base, variables_html)
+
+            secciones_anexo: List[str] = []
+            tiene_anexos = fields.get("tieneAnexos", {}).get("booleanValue", False)
+            if tiene_anexos:
+                ids_anexos = self._obtener_ids_anexos_desde_fields(fields)
+                for anexo_id in ids_anexos:
+                    anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_norm, anexo_id)
+                    if not anexo_doc:
+                        logger.warning("[PDF_DINAMICO] Anexo no encontrado | empresa=%s | anexo_id=%s", empresa_norm, anexo_id)
+                        continue
+                    anexo_fields = anexo_doc.get("fields", {})
+                    contenido_anexo = (
+                        anexo_fields.get("contenido", {}).get("stringValue")
+                        or anexo_fields.get("html", {}).get("stringValue", "")
+                    )
+                    if contenido_anexo:
+                        secciones_anexo.append(self._reemplazar_etiquetas(contenido_anexo, variables_html))
+
+            archivos_subidos = self._obtener_archivos_subidos_desde_fields(fields)
+            meta_archivos = fields.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {})
+            secciones_imagenes: List[str] = []
+            pdfs_adjuntos: List[bytes] = []
+            for adjunto in archivos_subidos:
+                nombre_archivo = str(adjunto.get("filename", "")).strip()
+                content_b64 = self._normalizar_base64_contenido(adjunto.get("content", ""))
+                meta = meta_archivos.get(nombre_archivo, {}).get("mapValue", {}).get("fields", {})
+                mime_type = meta.get("mime_type", {}).get("stringValue", "")
+
+                if not content_b64:
+                    continue
+
+                if self._es_pdf_adjunto(nombre_archivo, mime_type):
+                    try:
+                        pdfs_adjuntos.append(base64.b64decode(content_b64))
+                    except Exception:
+                        logger.warning("[PDF_DINAMICO] PDF adjunto invalido, se omite | archivo=%s", nombre_archivo)
+                    continue
+
+                if not self._es_imagen_adjunto(nombre_archivo, mime_type):
+                    continue
+
+                mime_final = mime_type if mime_type and mime_type.startswith("image/") else "image/png"
+                secciones_imagenes.append(
+                    """
+                    <div style="page-break-before: always; width: 100%; min-height: 100vh; display: flex; align-items: center; justify-content: center;">
+                        <img src="data:{mime};base64,{content}" style="max-width: 100%; max-height: 100vh; object-fit: contain;" />
+                    </div>
+                    """.format(mime=mime_final, content=content_b64)
+                )
+
+            html_final = self._append_html_sections(html_base, secciones_anexo + secciones_imagenes)
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+                page = await browser.new_page()
+                await page.set_content(html_final, wait_until="networkidle")
+                await page.emulate_media(media="screen")
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(400)
+                pdf_bytes = await page.pdf(format=tamano_documento, print_background=True)
+                await browser.close()
+
+            if pdfs_adjuntos:
+                pdf_bytes = self._unir_pdfs([pdf_bytes, *pdfs_adjuntos])
+
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, 'documento')}.pdf"
+
+            tiene_contenido_extra = bool(secciones_anexo or secciones_imagenes or pdfs_adjuntos)
+            if tiene_contenido_extra:
+                ruta = f"Komunah/Documentos/Completos/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
+            else:
+                ruta = f"Komunah/PlantillasWeb/Categorias/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
+
+            respuesta = {
+                "empresa_id": empresa_norm,
+                "doc_id": doc_norm,
+                "filename": nombre_pdf,
+                "ruta": ruta,
+                "incluye_anexos": bool(secciones_anexo),
+                "incluye_imagenes": bool(secciones_imagenes),
+                "incluye_pdfs": bool(pdfs_adjuntos),
+            }
+
+            if subir_bucket:
+                url_descarga = self._subir_pdf_a_bucket(pdf_bytes, ruta, nombre_pdf)
+                respuesta["url_descarga"] = url_descarga
+                respuesta["blob_path"] = f"{ruta}/{nombre_pdf}"
+
+            logger.info(
+                "[PDF_DINAMICO] Salida generar_por_doc_id | doc_id=%s | anexos=%s | imagenes=%s | pdfs=%s",
+                doc_norm,
+                len(secciones_anexo),
+                len(secciones_imagenes),
+                len(pdfs_adjuntos),
+            )
+            return respuesta
+        except HTTPException:
+            logger.exception(
+                "[PDF_DINAMICO] Error HTTP en generar_por_doc_id | empresa=%s | doc_id=%s",
+                empresa_id,
+                doc_id,
+            )
+            raise
+        except Exception as e:
+            logger.exception(
+                "[PDF_DINAMICO] Error inesperado en generar_por_doc_id | empresa=%s | doc_id=%s | error=%s",
+                empresa_id,
+                doc_id,
+                str(e),
+            )
+            raise HTTPException(status_code=500, detail=f"Error al generar PDF dinámico por doc_id: {str(e)}")
+
+class GenerarPDFAnexo(GenerarPDFUseCase):
+    async def generar_por_doc_id(self, empresa_id: str, doc_id: str, subir_bucket: bool = True):
+        logger.info(
+            "[PDF_ANEXO] Entrada generar_por_doc_id | empresa=%s | doc_id=%s | subir_bucket=%s",
+            empresa_id,
+            doc_id,
+            subir_bucket,
+        )
+        try:
+            empresa_norm = str(empresa_id or "").strip()
+            doc_norm = str(doc_id or "").strip()
+            if not empresa_norm or not doc_norm:
+                raise HTTPException(status_code=400, detail="empresa_id y doc_id son obligatorios.")
+
+            anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_norm, doc_norm)
+            if not anexo_doc:
+                raise HTTPException(status_code=404, detail=f"No existe plantilla de anexo con id '{doc_norm}'.")
+
+            fields = anexo_doc.get("fields", {})
+            html_raw = (
+                fields.get("contenido", {}).get("stringValue")
+                or fields.get("html", {}).get("stringValue", "")
+            )
+            if not html_raw:
+                raise HTTPException(status_code=400, detail="La plantilla de anexo no tiene contenido HTML.")
+
+            categoria = fields.get("categoria", {}).get("stringValue", "general")
+            cliente = (
+                fields.get("cliente", {}).get("stringValue")
+                or fields.get("nombre_cliente", {}).get("stringValue")
+                or "Cliente"
+            )
+            nombre_anexo = fields.get("nombre", {}).get("stringValue", doc_norm)
+            tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+            variables_base = {
+                "{doc_id}": doc_norm,
+                "{nombre}": nombre_anexo,
+                "{categoria}": categoria,
+                "{cliente}": cliente,
+            }
+            variables_html = self._normalizar_variables_para_html(variables_base)
+            html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+                page = await browser.new_page()
+                await page.set_content(html_final, wait_until="networkidle")
+                await page.emulate_media(media="screen")
+                await page.wait_for_load_state("networkidle")
+                await page.wait_for_timeout(400)
+                pdf_bytes = await page.pdf(format=tamano_documento, print_background=True)
+                await browser.close()
+
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, 'anexo')}.pdf"
+            ruta = f"Komunah/Documentos/Anexos/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
+
+            respuesta = {
+                "empresa_id": empresa_norm,
+                "doc_id": doc_norm,
+                "filename": nombre_pdf,
+                "ruta": ruta,
+            }
+
+            if subir_bucket:
+                url_descarga = self._subir_pdf_a_bucket(pdf_bytes, ruta, nombre_pdf)
+                respuesta["url_descarga"] = url_descarga
+                respuesta["blob_path"] = f"{ruta}/{nombre_pdf}"
+
+            logger.info(
+                "[PDF_ANEXO] Salida generar_por_doc_id | doc_id=%s | filename=%s",
+                doc_norm,
+                nombre_pdf,
+            )
+            return respuesta
+        except HTTPException:
+            logger.exception(
+                "[PDF_ANEXO] Error HTTP en generar_por_doc_id | empresa=%s | doc_id=%s",
+                empresa_id,
+                doc_id,
+            )
+            raise
+        except Exception as e:
+            logger.exception(
+                "[PDF_ANEXO] Error inesperado en generar_por_doc_id | empresa=%s | doc_id=%s | error=%s",
+                empresa_id,
+                doc_id,
+                str(e),
+            )
+            raise HTTPException(status_code=500, detail=f"Error al generar PDF de anexo por doc_id: {str(e)}")

@@ -25,6 +25,8 @@ from ..utils.datos_proveedores import (
     actualizar_switches_proyecto, get_estado_etapas_komunah, 
     get_folios_deudores_komunah, get_folios_dinamico_komunah
 )
+from ..routers.notificacionesMS import FirebaseRepository
+from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase
 from urllib.parse import quote
 from ..database import get_db
 from sqlalchemy.orm import Session
@@ -35,7 +37,7 @@ import hashlib
 from ..services.security import es_usuario
 from argparse import Namespace
 from ..models import Venta, Cliente, Amortizacion
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +101,7 @@ class GCSDocumentosService:
             "blob_path": blob_path,
             "tamaño_kb": round((blob.size or 0) / 1024, 1),
             "fecha_creacion": blob.time_created.isoformat() if blob.time_created else None,
-            "url_descarga": blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(hours=1),
-                method="GET",
-            ),
+            "url_descarga": blob.public_url,
             "endpoint_descarga_individual": f"/v1/documentos/descarga-individual?blob_path={quote(blob_path)}",
         }
 
@@ -179,7 +177,7 @@ class GCSDocumentosService:
         if not blob.exists():
             raise HTTPException(status_code=404, detail="El archivo solicitado no existe en el bucket.")
 
-        signed_url = blob.generate_signed_url(version="v4", expiration=timedelta(hours=1), method="GET")
+        signed_url = blob.public_url
         return {
             "blob_path": blob_path,
             "nombre": blob_path.split("/")[-1],
@@ -224,11 +222,7 @@ class GCSDocumentosService:
         return {
             "mensaje": "Documento generado y subido correctamente.",
             "blob_path": blob_path,
-            "url_descarga": blob.generate_signed_url(
-                version="v4",
-                expiration=timedelta(hours=1),
-                method="GET",
-            ),
+            "url_descarga": blob.public_url,
         }
 
     def delete_document(self, blob_path: str) -> dict:
@@ -380,7 +374,6 @@ async def api_generar_subir_documento(
         payload.folio,
         payload.categoria,
     )
-    from .notificacionesMS import FirebaseRepository, GenerarPDFUseCase
 
     generador = GenerarPDFUseCase(FirebaseRepository())
     return await generador.generar_pdf_por_categoria(
