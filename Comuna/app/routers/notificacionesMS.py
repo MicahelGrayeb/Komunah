@@ -63,56 +63,137 @@ class FirebaseRepository:
     """Maneja la comunicación técnica con Firebase Firestore."""
     
     def __init__(self):
+        from google.cloud import firestore
+        import json
+        
+        # 1. Jalamos el proyecto DIRECTO del .env como pediste
         self.project_id = os.getenv('FIREBASE_PLANTILLAS_PROJECT_ID', '').strip()
-        self.api_key = os.getenv('FIREBASE_PLANTILLAS_API_KEY')
+        
+        if os.path.exists("serviceAccountKey.json"):
+            try:
+                with open("serviceAccountKey.json") as f:
+                    info = json.load(f)
+                # Forzamos que use el ID del .env aunque el JSON sea de otro lado
+                self.db = firestore.Client.from_service_account_info(info, project=self.project_id)
+                logger.info(f"✅ FirebaseRepository: Conectado al proyecto '{self.project_id}'")
+            except Exception as e:
+                logger.error(f"❌ Error con serviceAccountKey.json: {e}")
+                self.db = firestore.Client(project=self.project_id)
+        else:
+            self.db = firestore.Client(project=self.project_id)
+            
+        # Variables que tus métodos actuales (de tu compañero) necesitan para no tronar
         self.base_url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents"
-        self.headers = {"X-Goog-Api-Key": self.api_key, "Content-Type": "application/json"}
+        self.headers = {"Content-Type": "application/json"}
 
     def obtener_config_empresa(self, empresa_id: str):
-        """Lógica de switches con reintentos."""
+        """Si Firebase falla, retorna todo en False para detener procesos."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/general"
-        defaults = {"proyecto": True, "email": True, "whatsapp": True}
-        
         resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
-        if not resp:
-            return defaults
+        
+        if not resp or not resp.json().get("fields"):
+            return {"proyecto": False, "email": False, "whatsapp": False}
             
         f = resp.json().get("fields", {})
         return {
-            "proyecto": f.get("proyecto_activo", {}).get("booleanValue", True),
-            "email": f.get("email_enabled", {}).get("booleanValue", True),
-            "whatsapp": f.get("whatsapp_enabled", {}).get("booleanValue", True)
+            "proyecto": f.get("proyecto_activo", {}).get("booleanValue", False),
+            "email": f.get("email_enabled", {}).get("booleanValue", False),
+            "whatsapp": f.get("whatsapp_enabled", {}).get("booleanValue", False)
         }
     
 #region Helpers para peticiones seguras con reintentos
 
     def _peticion_segura(self, method: str, url: str, **kwargs):
-        """Maneja reintentos y logging detallado para peticiones a Firebase."""
-        max_retries = 3
-        timeout = kwargs.pop('timeout', 10)
-        
-        for i in range(max_retries):
-            try:
-                resp = requests.request(method, url, timeout=timeout, **kwargs)
-                if resp.status_code == 200:
-                    return resp
+        """Proxy blindado contra fallos de red y permisos."""
+        try:
+            # Extraer ruta limpia
+            path_raw = url.split("/documents/")[-1]
+            path = path_raw.split("?")[0].split(":")[0]
+            
+            # A. Extraer documentId de los params (para crear documentos nuevos)
+            params = kwargs.get("params", {})
+            doc_id_param = None
+            if isinstance(params, list): 
+                doc_id_param = next((v for k, v in params if k == "documentId"), None)
+            elif isinstance(params, dict): 
+                doc_id_param = params.get("documentId")
+            
+            # 1. Resolver Queries
+            if ":runQuery" in path_raw:
+                query_body = kwargs.get("json", {}).get("structuredQuery", {})
+                coll_id = query_body.get("from", [{}])[0].get("collectionId", "plantillas")
+                where_clause = query_body.get("where", {}).get("fieldFilter", {})
+                field = where_clause.get("field", {}).get("fieldPath", "categoria")
+                value = where_clause.get("value", {}).get("stringValue")
                 
-                # Si no es 200, logueamos el aviso y reintentamos si aplica
-                logger.warning(f"⚠️ Firebase API ({method}) devolvió status {resp.status_code} para {url}. Intento {i+1}/{max_retries}")
-                if i < max_retries - 1:
-                    time.sleep(2 ** i) # Backoff exponencial: 1s, 2s, 4s...
+                # ✅ LA LÍNEA MÁGICA ARREGLADA: Usamos .document(path)
+                docs = self.db.document(path).collection(coll_id).where(field, "==", value).stream()
+                
+                data = [{"document": {"name": d.reference.path, "fields": self._formatear_a_rest(d.to_dict())}} for d in docs]
             
-            except requests.exceptions.Timeout:
-                logger.warning(f"⏰ Timeout ({timeout}s) en Firebase API ({method}) para {url}. Intento {i+1}/{max_retries}")
-                if i < max_retries - 1:
-                    time.sleep(2 ** i)
+            # 2. Resolver GET
+            elif method == "GET":
+                parts = [p for p in path.split("/") if p]
+                if len(parts) % 2 == 0: 
+                    doc = self.db.document(path).get()
+                    data = {"fields": self._formatear_a_rest(doc.to_dict())} if doc.exists else {}
+                else: 
+                    docs = self.db.collection(path).stream()
+                    data = {"documents": [{"name": d.reference.path, "fields": self._formatear_a_rest(d.to_dict())} for d in docs]}
             
-            except requests.exceptions.RequestException as e:
-                logger.error(f"❌ Error de red/petición en Firebase API: {str(e)}. Intento {i+1}/{max_retries}")
-                if i < max_retries - 1:
-                    time.sleep(2 ** i)
-                    
-        return None
+            # 3. PATCH/POST
+            elif method in ["PATCH", "POST"]:
+                payload = kwargs.get("json", {}).get("fields", {})
+                clean_data = self._limpiar_payload_recursivo(payload)
+                
+                if doc_id_param: # Crear con ID específico
+                    self.db.collection(path).document(doc_id_param).set(clean_data)
+                else: # Actualizar existente
+                    self.db.document(path).set(clean_data, merge=True)
+                data = {"fields": payload}
+                
+            # 4. DELETE
+            elif method == "DELETE":
+                self.db.document(path).delete()
+                data = {}
+
+            class MockResponse:
+                def __init__(self, json_data): self.json_data = json_data; self.status_code = 200
+                def json(self): return self.json_data
+            return MockResponse(data)
+
+        except Exception as e:
+            # CAPTURAMOS EL ERROR SIN MATAR EL PROCESO
+            logger.error(f"⚠️ Fallo en Proxy Firebase: {str(e)}")
+            class ErrorResponse:
+                def __init__(self): self.status_code = 500; self.text = str(e)
+                def json(self): return {}
+            return ErrorResponse()
+
+    def _limpiar_payload_recursivo(self, obj):
+        """Limpia la basura de {'stringValue': 'x'} para guardar datos limpios en Firebase."""
+        if not isinstance(obj, dict): return obj
+        # Si es un valor de Firestore, extraemos el contenido real
+        for key in ['stringValue', 'integerValue', 'booleanValue', 'doubleValue']:
+            if key in obj: return obj[key]
+        if 'mapValue' in obj:
+            return self._limpiar_payload_recursivo(obj['mapValue'].get('fields', {}))
+        if 'arrayValue' in obj:
+            return [self._limpiar_payload_recursivo(item) for item in obj['arrayValue'].get('values', [])]
+        # Si es un dict normal (como el raíz de fields), limpiamos sus hijos
+        return {k: self._limpiar_payload_recursivo(v) for k, v in obj.items()}
+
+    def _formatear_a_rest(self, data: dict):
+        """Traduce dict nativo al formato {'fields': {'key': {'stringValue': 'val'}}}."""
+        if not data: return {}
+        res = {}
+        for k, v in data.items():
+            if isinstance(v, bool): res[k] = {"booleanValue": v}
+            elif isinstance(v, (int, float)): res[k] = {"integerValue": str(v)}
+            elif isinstance(v, list): res[k] = {"arrayValue": {"values": [{"stringValue": str(i)} for i in v]}}
+            elif isinstance(v, dict): res[k] = {"mapValue": {"fields": self._formatear_a_rest(v)}}
+            else: res[k] = {"stringValue": str(v)}
+        return res
 
     def obtener_plantilla_segura(self, empresa_id: str, slug: str):
         """Trae el HTML de una plantilla con reintentos."""
@@ -343,37 +424,44 @@ class FirebaseRepository:
 #region Configuración de recordatorios
 
     def obtener_config_recordatorios(self, empresa_id: str):
-        """Trae los días de recordatorio desde Firebase con reintentos."""
+        """Versión robusta: Si no hay datos o hay error de red, loguea pero no mata el startup."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
-        defaults = {"dias_1": 3, "dias_2": 1, "hora": 10, "minuto": 0}
+        resp = self._peticion_segura("GET", url)
         
-        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
-        if not resp:
-            return defaults
+        # Si el Proxy regresó vacío o error 500
+        if not resp or resp.status_code != 200 or not resp.json().get("fields"):
+            logger.error(f"❌ No se pudo cargar config de {empresa_id}. Usando pausa de seguridad.")
+            # Retornamos una hora imposible para que el scheduler no dispare nada por error
+            return {"dias_1": 0, "dias_2": 0, "hora": 23, "minuto": 59}
             
         f = resp.json().get("fields", {})
-        return {
-            "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
-            "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
-            "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
-            "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
-        }
-    
+        try:
+            return {
+                "dias_1": int(f["recordatorio_1"]["integerValue"]),
+                "dias_2": int(f["recordatorio_2"]["integerValue"]),
+                "hora": int(f["hora_recordatorio"]["integerValue"]),
+                "minuto": int(f["minuto_recordatorio"]["integerValue"])
+            }
+        except Exception as e:
+            logger.error(f"❌ Error parseando Firebase: {e}")
+            return {"dias_1": 0, "dias_2": 0, "hora": 23, "minuto": 59}
+
     def obtener_config_recordatorios_seguro(self, empresa_id: str):
-        """Retorna None si Firebase falla tras reintentos, para que el sync job no reprograme con defaults."""
+        """Retorna None si Firebase falla para que el sync job no haga cambios basura."""
         url = f"{self.base_url}/empresas/{empresa_id}/configuracion/recordatorios"
         resp = self._peticion_segura("GET", url, headers=self.headers, timeout=5)
         
-        if not resp:
+        if not resp or not resp.json().get("fields"):
             return None
             
         f = resp.json().get("fields", {})
-        return {
-            "dias_1": int(f.get("recordatorio_1", {}).get("integerValue", 3)),
-            "dias_2": int(f.get("recordatorio_2", {}).get("integerValue", 1)),
-            "hora": int(f.get("hora_recordatorio", {}).get("integerValue", 10)),
-            "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
-        }
+        try:
+            return {
+                "hora": int(f.get("hora_recordatorio", {}).get("integerValue")),
+                "minuto": int(f.get("minuto_recordatorio", {}).get("integerValue", 0))
+            }
+        except (TypeError, ValueError):
+            return None
     
     def actualizar_config_recordatorios(self, empresa_id: str, datos: dict):
         """Recibe un diccionario y parchea solo los campos presentes en él."""

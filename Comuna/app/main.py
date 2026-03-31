@@ -45,14 +45,15 @@ if not firebase_admin._apps:
     try:
         if os.path.exists("serviceAccountKey.json"):
             print("🔥 Iniciando Firebase con serviceAccountKey.json...")
+            # Forzamos al sistema operativo a reconocer la ruta de la llave
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath("serviceAccountKey.json")
             cred = credentials.Certificate("serviceAccountKey.json")
             firebase_admin.initialize_app(cred)
         else:
             print("☁️ Iniciando Firebase con ApplicationDefault (Cloud)...")
+            p_id = os.getenv('FIREBASE_PLANTILLAS_PROJECT_ID')
             cred = credentials.ApplicationDefault()
-            firebase_admin.initialize_app(cred, {
-                'projectId': 'comuna-480820'
-            })
+            firebase_admin.initialize_app(cred, {'projectId': p_id})
     except Exception as e:
         print(f"⚠️ Advertencia: No se pudo iniciar Firebase: {e}")
 
@@ -76,8 +77,8 @@ def sincronizar_horario_cron(scheduler_instancia):
                 logger.warning(f"⚠️ SYNC: Firebase no respondió tras {duracion:.2f}s, saltando verificación.")
                 return
             
-            nueva_h = int(config.get("hora", 10))
-            nueva_m = int(config.get("minuto", 0))
+            nueva_h = int(config["hora"])
+            nueva_m = int(config["minuto"])
 
             job = scheduler_instancia.get_job(JOB_ID_BARRIDO)
             if job:
@@ -219,7 +220,7 @@ def iniciar_scheduler():
         sincronizar_horario_cron(scheduler)
         
         scheduler.start()
-        logger.info(f"🚀 Scheduler iniciado: Barrido a las {config['hora']:02d}:{config['minuto']:02d}")
+        logger.info(f"🚀 Scheduler iniciado: Barrido configurado a las {config['hora']:02d}:{config['minuto']:02d}")
 
 @app.get("/")
 def home():
