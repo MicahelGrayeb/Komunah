@@ -13,7 +13,6 @@ import logging
 from zoneinfo import ZoneInfo
 from .services.sync_service import AutoSyncManager
 
-      
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)    
 
@@ -26,7 +25,8 @@ from .routers import (
     login, 
     datos, 
     emails, 
-    notificaciones, 
+    notificaciones,
+    Documentos,
     notificaciones_estaticas,
     notificacionesMS,
     usuarios,
@@ -236,23 +236,23 @@ def home():
 if APP_MODE == "NOTIFICACIONES":
     # Solo exponemos el motor de envíos en el puerto 8081
     app.include_router(notificacionesMS.router)
-    app.include_router(notificacionesMS.router_crud)
-    app.include_router(notificacionesMS.router_wa)
     app.include_router(notificacionesMS.router_usuario)
     app.include_router(notificacionesMS.router_globales)
-    app.include_router(notificacionesMS.router_juridico)
+    app.include_router(notificacionesMS.router_crud)
+    app.include_router(notificacionesMS.router_wa)
+    app.include_router(notificacionesMS.router_documento)
+    app.include_router(notificacionesMS.router_anexo)
     app.include_router(remitentes.router)
 else:
     app.include_router(login.router)
     app.include_router(usuarios.router)
     app.include_router(datos.router)
     app.include_router(emails.router)
-    app.include_router(notificaciones.router)
-    app.include_router(notificaciones_estaticas.router)
-    app.include_router(reportes.router)
+    app.include_router(DashboardKomunah.router)
+    app.include_router(Documentos.router)
     app.include_router(webhook.router)
     app.include_router(Cobranza.router)
-    app.include_router(DashboardKomunah.router)
+    app.include_router(reportes.router)
     app.include_router(admin.router)
     app.include_router(debug_config.router)
 

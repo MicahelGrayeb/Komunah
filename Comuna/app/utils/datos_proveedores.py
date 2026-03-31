@@ -11,6 +11,17 @@ from sqlalchemy import text, func
 
 logger = logging.getLogger(__name__)
 
+
+def _normalizar_lista_entrada(valores: List[str]) -> List[str]:
+    """Normaliza entradas que pueden venir como lista o CSV dentro de cada item."""
+    salida: List[str] = []
+    for item in (valores or []):
+        for parte in str(item).replace(";", ",").split(","):
+            limpio = parte.strip()
+            if limpio:
+                salida.append(limpio)
+    return salida
+
 def get_komunah_data(folio_ref: str, db: Session):
     logger.info("[DATOS_KOMUNAH] Entrada get_komunah_data | folio=%s", folio_ref)
     # 1. BUSCAR VENTA
@@ -46,6 +57,7 @@ def get_komunah_data(folio_ref: str, db: Session):
             "{cl.concepto}": "",
             "{cl.proyecto}": ""
         })
+        logger.info("[DATOS_KOMUNAH] Salida get_komunah_data sin folio | tags=%s", len(data))
         return data
 
         
@@ -315,6 +327,7 @@ def get_folios_a_notificar_komunah(db: Session, fecha: str):
     CORREGIDO: usa SUM de pagos para detectar deuda real (no registro individual),
     evitando clasificar mal a clientes que pagan en varios abonos.
     """
+    logger.info("[DATOS_KOMUNAH] Entrada get_folios_a_notificar_komunah | fecha=%s", fecha)
     query = text("""
         SELECT DISTINCT a.folder_id 
             FROM amortizaciones a
@@ -367,13 +380,16 @@ def get_folios_a_notificar_komunah(db: Session, fecha: str):
             );
     """)
     registros = db.execute(query, {"f": fecha}).fetchall()
-    return [row[0] for row in registros]
+    resultado = [row[0] for row in registros]
+    logger.info("[DATOS_KOMUNAH] Salida get_folios_a_notificar_komunah | fecha=%s | folios=%s", fecha, len(resultado))
+    return resultado
 
 def get_folios_deudores_komunah(db: Session, fecha: str):
     """
     COBRANZA: folios que vencen en 'fecha' y YA tienen deuda real de meses anteriores.
     CORREGIDO: usa SUM de pagos para detectar deuda real (no registro individual).
     """
+    logger.info("[DATOS_KOMUNAH] Entrada get_folios_deudores_komunah | fecha=%s", fecha)
     query = text("""
         SELECT DISTINCT a.folder_id 
         FROM amortizaciones a
@@ -408,16 +424,16 @@ def get_folios_deudores_komunah(db: Session, fecha: str):
         )
     """)
     registros = db.execute(query, {"f": fecha}).fetchall()
-    return [row[0] for row in registros]
-    registros = db.execute(query, {"f": fecha}).fetchall()
-    return [row[0] for row in registros]
+    resultado = [row[0] for row in registros]
+    logger.info("[DATOS_KOMUNAH] Salida get_folios_deudores_komunah | fecha=%s | folios=%s", fecha, len(resultado))
+    return resultado
 
 def get_komunah_diccionario_maestro(flat_data: dict = None):
     """
     Escanea las tablas SQL y devuelve el catálogo.
     Si hay flat_data, FILTRA lo vacío y devuelve {tag, valor}.
     """
-    from sqlalchemy.inspection import inspect
+    logger.info("[DATOS_KOMUNAH] Entrada get_komunah_diccionario_maestro | con_data=%s", flat_data is not None)
 
     # Helper para extraer tags de SQL y filtrar si no hay data
     def extraer_tags(modelo, prefijo):
@@ -501,40 +517,49 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
         if vars_gi:
             catalogo.append({"categoria": f"Switches y Gestión del Integrante {i} (g{i}.)", "variables": vars_gi})
 
+    logger.info("[DATOS_KOMUNAH] Salida get_komunah_diccionario_maestro | categorias=%s", len(catalogo))
     return catalogo
 
 def set_email_komunah_marketing(client_id: str, estado: bool, db: Session):
     """AFECTA TOdo: Apaga el permiso para todos los folios de este cliente"""
-    db.query(GestionClientes).filter(
+    logger.info("[DATOS_KOMUNAH] Entrada set_email_komunah_marketing | client_id=%s | estado=%s", client_id, estado)
+    filas = db.query(GestionClientes).filter(
         GestionClientes.client_id == client_id
     ).update({"permite_marketing_email": estado})
     db.commit()
+    logger.info("[DATOS_KOMUNAH] Salida set_email_komunah_marketing | filas=%s", filas)
     return True
 
 def set_wa_komunah_marketing(client_id: str, estado: bool, db: Session):
     """AFECTA TOdo: Apaga WhatsApp para todos los folios de este cliente"""
-    db.query(GestionClientes).filter(
+    logger.info("[DATOS_KOMUNAH] Entrada set_wa_komunah_marketing | client_id=%s | estado=%s", client_id, estado)
+    filas = db.query(GestionClientes).filter(
         GestionClientes.client_id == client_id
     ).update({"permite_marketing_whatsapp": estado})
     db.commit()
+    logger.info("[DATOS_KOMUNAH] Salida set_wa_komunah_marketing | filas=%s", filas)
     return True
 
 def set_email_komunah_lote(client_id: str, folio: str, estado: bool, db: Session):
     """ Solo apaga el permiso para ESTE folio específico"""
-    db.query(GestionClientes).filter(
+    logger.info("[DATOS_KOMUNAH] Entrada set_email_komunah_lote | client_id=%s | folio=%s | estado=%s", client_id, folio, estado)
+    filas = db.query(GestionClientes).filter(
         GestionClientes.client_id == client_id,
         GestionClientes.folio == folio
     ).update({"permite_email_lote": estado})
     db.commit()
+    logger.info("[DATOS_KOMUNAH] Salida set_email_komunah_lote | filas=%s", filas)
     return True
 
 def set_wa_komunah_lote(client_id: str, folio: str, estado: bool, db: Session):
     """Solo apaga WhatsApp para ESTE folio específico"""
-    db.query(GestionClientes).filter(
+    logger.info("[DATOS_KOMUNAH] Entrada set_wa_komunah_lote | client_id=%s | folio=%s | estado=%s", client_id, folio, estado)
+    filas = db.query(GestionClientes).filter(
         GestionClientes.client_id == client_id,
         GestionClientes.folio == folio
     ).update({"permite_whatsapp_lote": estado})
     db.commit()
+    logger.info("[DATOS_KOMUNAH] Salida set_wa_komunah_lote | filas=%s", filas)
     return True
 
 
@@ -542,11 +567,13 @@ def actualizar_switches_etapas(cambios: dict, db: Session):
     """
     Actualiza el switch individual de cada ETAPA usando su ID.
     """
+    logger.info("[DATOS_KOMUNAH] Entrada actualizar_switches_etapas | cambios=%s", len(cambios or {}))
     for id_etapa, nuevo_estado in cambios.items():
         db.query(ConfigEtapa).filter(ConfigEtapa.id == id_etapa).update(
             {"etapa_activo": nuevo_estado} # <--- NOMBRE ACTUALIZADO
         )
     db.commit()
+    logger.info("[DATOS_KOMUNAH] Salida actualizar_switches_etapas | cambios_aplicados=%s", len(cambios or {}))
     return True
 
 def actualizar_switches_proyecto(nombres_proyectos: List[str], nuevo_estado: bool, db: Session):
@@ -554,15 +581,18 @@ def actualizar_switches_proyecto(nombres_proyectos: List[str], nuevo_estado: boo
     Aplica el valor del selector (True/False) a la columna 'proyecto_activo' 
     para todos los proyectos recibidos en la lista.
     """
-    db.query(ConfigEtapa).filter(ConfigEtapa.proyecto.in_(nombres_proyectos)).update(
+    logger.info("[DATOS_KOMUNAH] Entrada actualizar_switches_proyecto | proyectos=%s | estado=%s", len(nombres_proyectos or []), nuevo_estado)
+    filas = db.query(ConfigEtapa).filter(ConfigEtapa.proyecto.in_(nombres_proyectos)).update(
         {"proyecto_activo": nuevo_estado}, 
         synchronize_session=False
     )
     db.commit()
+    logger.info("[DATOS_KOMUNAH] Salida actualizar_switches_proyecto | filas=%s", filas)
     return True     
 
 
 def get_estado_etapas_komunah(db: Session):
+    logger.info("[DATOS_KOMUNAH] Entrada get_estado_etapas_komunah")
     resultados = db.query(ConfigEtapa).all()
     
     def to_bool(val):
@@ -583,7 +613,7 @@ def get_estado_etapas_komunah(db: Session):
             # Si es texto puro que no es "0", devolvemos True
             return True
 
-    return [
+    salida = [
         {
             "id": r.id,
             "proyecto": r.proyecto,
@@ -593,6 +623,8 @@ def get_estado_etapas_komunah(db: Session):
             "total_folios": int(float(r.total_folios or 0))
         } for r in resultados
     ]
+    logger.info("[DATOS_KOMUNAH] Salida get_estado_etapas_komunah | etapas=%s", len(salida))
+    return salida
 
 def get_folios_dinamico_komunah(clusters: List[str], pipeline_status: List[str], db: Session):
     """
@@ -600,6 +632,21 @@ def get_folios_dinamico_komunah(clusters: List[str], pipeline_status: List[str],
     Usa .distinct() para evitar mandar correos repetidos por cada deuda.
     """
     
+    logger.info(
+        "[DATOS_KOMUNAH] Entrada get_folios_dinamico_komunah | clusters_raw=%s | pipeline_raw=%s",
+        clusters,
+        pipeline_status,
+    )
+
+    clusters_limpios = _normalizar_lista_entrada(clusters)
+    pipeline_limpios = _normalizar_lista_entrada(pipeline_status)
+
+    logger.info(
+        "[DATOS_KOMUNAH] Filtros normalizados get_folios_dinamico_komunah | clusters=%s | pipeline=%s",
+        clusters_limpios,
+        pipeline_limpios,
+    )
+
     # IMPORTANTE: Usamos .distinct() para que el folio 87 solo salga UNA vez
     query = db.query(Venta.folio).distinct()
     
@@ -607,15 +654,17 @@ def get_folios_dinamico_komunah(clusters: List[str], pipeline_status: List[str],
     query = query.filter(func.lower(Venta.estado_expediente).notin_(estados_prohibidos))
 
     # Si hay clusters, filtramos en Ventas
-    if clusters and len(clusters) > 0:
-        query = query.filter(Venta.etapa.in_(clusters))
+    if clusters_limpios and len(clusters_limpios) > 0:
+        query = query.filter(Venta.etapa.in_(clusters_limpios))
 
     # Si hay pipeline_status, filtramos con case-insensitivity
-    if pipeline_status and len(pipeline_status) > 0:
-        pipeline_status_lower = [s.lower().strip() for s in pipeline_status]
+    if pipeline_limpios and len(pipeline_limpios) > 0:
+        pipeline_status_lower = [s.lower().strip() for s in pipeline_limpios]
         query = query.filter(func.lower(Venta.estado_expediente).in_(pipeline_status_lower))
 
     registros = query.all()
-    
+
     # Limpiamos los resultados para devolver solo la lista de strings
-    return [str(row.folio) for row in registros]
+    resultado = [str(row.folio) for row in registros]
+    logger.info("[DATOS_KOMUNAH] Salida get_folios_dinamico_komunah | folios=%s", len(resultado))
+    return resultado

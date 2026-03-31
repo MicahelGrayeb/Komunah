@@ -2,13 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import text, and_, func
 from typing import List, Optional
+from collections import defaultdict
 import re
 from ..database import get_db
 from .. import schemas
 from datetime import datetime
 from typing import Any, Dict 
 from ..services.security import get_current_user, es_admin, es_usuario
-from ..models import Venta, Pago
+from ..models import Venta, Pago, Amortizacion
 
 router = APIRouter(prefix="/reportes", tags=["Reportes Financieros"])
 
@@ -16,6 +17,28 @@ def extraer_numeros_finales(valor: Optional[str]) -> str:
     texto = str(valor or "").strip()
     match = re.search(r"(\d+)\s*$", texto)
     return match.group(1) if match else ""
+
+def _to_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    texto = str(value).strip().replace("$", "").replace(",", "")
+    if texto in ["", "None", "NULL", "nan", "NaN"]:
+        return 0.0
+    try:
+        return float(texto)
+    except Exception:
+        return 0.0
+    
+def _traducir_concepto_amortizacion(concepto: Any) -> str:
+    traducciones = {
+        "financing": "Parcialidad",
+        "down_payment": "Enganche",
+        "initial_payment": "Apartado",
+        "last_payment": "Último pago"
+    }
+    c = str(concepto or "").strip().lower()
+    # Buscamos en el dict, si no está, devolvemos el original
+    return traducciones.get(c, c).strip().lower()
 
 @router.get("/pagos-historico", response_model=List[schemas.ConciliacionClienteResponse])
 def get_conciliacion_clientes(anio: Optional[int] = None, folio: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
@@ -203,6 +226,9 @@ def get_reporte_detallado(anio: Optional[int] = None, db: Session = Depends(get_
             a.`FOLIO` as FOLIO, 
             a.`CLIENTE` as CLIENTE,
             a.`PROYECTO` as PROYECTO,
+            v.`ASESOR` as ASESOR,
+            v.`ESTADO` as ESTADO,
+            v.`PAÍS` as PAÍS,
             a.`FASE` as FASE,
             a.`ETAPA` as ETAPA, 
             a.`UNIDAD` as UNIDAD, 
@@ -239,8 +265,8 @@ def get_reporte_detallado(anio: Optional[int] = None, db: Session = Depends(get_
             ) t WHERE rank_fecha = 1
         ) cv ON a.`FOLIO` = cv.`FOLIO`
         WHERE a.`FECHA DE PAGO` IS NOT NULL 
-          AND a.`FECHA DE PAGO` != ''
-          AND (:anio_val IS NULL OR a.`FECHA DE PAGO` LIKE :busqueda_anio)
+            AND a.`FECHA DE PAGO` != ''
+            AND (:anio_val IS NULL OR a.`FECHA DE PAGO` LIKE :busqueda_anio)
     """)
 
     try:
@@ -440,7 +466,7 @@ def get_reporte_expedientes_liquidados(db: Session = Depends(get_db), user: dict
 
 # ENDPOINTS DE REPORTES JURÍDICOS
 
-@router.get("/Juridico", response_model=List[schemas.ReporteJuridicoResponse])
+@router.get("/Juridico/Reporte-mensual", response_model=List[schemas.ReporteJuridicoResponse])
 def get_reporte_juridico(
     start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
     end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
@@ -574,7 +600,7 @@ def get_reporte_juridico(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en reporte jurídico: {str(e)}")
 
-@router.get("/JuridicoADMVentas", response_model=List[schemas.ReporteADMVentasJuridicoResponse])
+@router.get("/Juridico/ADMVentas", response_model=List[schemas.ReporteADMVentasJuridicoResponse])
 def get_reporteADMVentas_juridico(
     start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
     end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
@@ -656,7 +682,7 @@ def get_reporteADMVentas_juridico(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en reporte ADM Ventas jurídico: {str(e)}")
 
-@router.get("/recordatorioFirmaJuridico", response_model=List[schemas.RecordatorioFirmaJuridicoResponse])
+@router.get("/Juridico/Recordatorio-firmas", response_model=List[schemas.RecordatorioFirmaJuridicoResponse])
 def get_recordatorioFirma_juridico(
     start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
     end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
@@ -730,7 +756,7 @@ def get_escriturados_juridico(
         ).filter(
             Venta.fecha_inicio_operacion >= start_date,
             Venta.fecha_inicio_operacion <= end_date,
-            Venta.estado_expediente.in_(['Jurídico', 'Verificación de datos', 'Firma', 'Firmado por Cliente', 'Firma de Testigos', 'Contrato Firmado '])
+            Venta.estado_expediente.in_(['Escriturado'])
         ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
 
         if proyecto and proyecto.lower() != "todos":
@@ -762,13 +788,178 @@ def get_escriturados_juridico(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en escriturados jurídico: {str(e)}")
 
+@router.get("/Juridico/Escrituracion-financiamiento", response_model=List[schemas.EscrituracionFinanciamientoResponse])
+def get_escrituracion_financiamiento(
+    start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
+    end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
+    proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
+):
+    try:
+        # 1) Obtener Ventas filtradas
+        # Simplificamos el folio tratándolo como viene en la BD
+        query_ventas = db.query(Venta).filter(
+            Venta.fecha_inicio_operacion >= start_date,
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Contrato Firmado', 'Incidencias', 'Liquidado'])
+        )
+
+        if proyecto and proyecto.lower() != "todos":
+            query_ventas = query_ventas.filter(Venta.desarrollo == proyecto)
+
+        ventas = query_ventas.all()
+        if not ventas:
+            return []
+
+        # Diccionario para acceso rápido y lista de folios para las siguientes queries
+        mapa_ventas = {str(v.folio): v for v in ventas}
+        lista_folios = list(mapa_ventas.keys())
+
+        # 2) Obtener y UNIFICAR Pagos
+        # Agrupamos por folio, número y concepto para sumar abonos fragmentados
+        pagos_db = db.query(
+            Pago.folio_venta,
+            Pago.numero_pago,
+            Pago.concepto_pago,
+            func.sum(Pago.monto_pagado).label("monto_total_unificado")
+        ).filter(
+            Pago.folio_venta.in_(lista_folios),
+            Pago.estatus_flujo == 'active',
+            Pago.estatus == 'active',
+            func.lower(Pago.metodo_pago) != 'nota de crédito'
+        ).group_by(
+            Pago.folio_venta,
+            Pago.numero_pago,
+            Pago.concepto_pago
+        ).all()
+
+        # Estructura: {(folio, num_pago, concepto): monto_total}
+        pagos_acumulados = {}
+        for p in pagos_db:
+            key = (str(p.folio_venta), str(p.numero_pago).strip(), str(p.concepto_pago or "").strip().lower())
+            pagos_acumulados[key] = float(p.monto_total_unificado)
+
+        # 3) Obtener Amortizaciones para comparar
+        amortizaciones = db.query(
+            Amortizacion.folder_id,
+            Amortizacion.number,
+            Amortizacion.concept,
+            Amortizacion.total
+        ).filter(
+            Amortizacion.folder_id.in_(lista_folios)
+        ).all()
+
+        # 4) Calcular mensualidades faltantes
+        faltantes_por_folio = defaultdict(int)
+        for am in amortizaciones:
+            f_id = str(am.folder_id)
+            n_pag = str(am.number).strip()
+            # Traducimos el concepto de la amortización para que coincida con el del Pago
+            concepto_traducido = _traducir_concepto_amortizacion(am.concept)
+            
+            total_requerido = _to_float(am.total)
+            # Buscamos cuánto se ha pagado en total para este folio/número/concepto
+            total_abonado = pagos_acumulados.get((f_id, n_pag, concepto_traducido), 0.0)
+
+            # Si lo abonado es menor a lo requerido (con margen de 1 centavo)
+            if total_abonado + 0.01 < total_requerido:
+                faltantes_por_folio[f_id] += 1
+
+        # 5) Construir Respuesta Final
+        respuesta = []
+        for folio_str, venta in mapa_ventas.items():
+            respuesta.append(
+                schemas.EscrituracionFinanciamientoResponse(
+                    Folio=folio_str,
+                    NombreCliente=venta.cliente or "",
+                    Cluster=venta.etapa or "",
+                    NumeroLote=venta.numero or "",
+                    Telefono=venta.telefono or "",
+                    CorreoElectronico=venta.correo_electronico or "",
+                    Estado=venta.estado or "",
+                    Pais=venta.pais or "",
+                    MensualidadesFaltantes=faltantes_por_folio[folio_str]
+                )
+            )
+
+        return respuesta
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en proceso: {str(e)}")
+
+@router.get("/Juridico/Incidencias", response_model=List[schemas.IncidenciasResponse])
+def get_incidencias(
+    start_date: str = Query(..., description="Fecha inicio YYYY-MM-DD"),
+    end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
+    proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
+):
+    try:
+        query = db.query(Venta, Pago).join(
+            Pago,
+            and_(
+                Pago.folio_venta == Venta.folio,
+                Pago.fecha_comprobante >= start_date,
+                Pago.fecha_comprobante <= end_date,
+                Pago.estatus_flujo == 'active',
+                Pago.estatus == 'active',
+                func.lower(Pago.metodo_pago) != 'nota de crédito'
+            )
+        ).filter(
+            Venta.fecha_inicio_operacion >= start_date,
+            Venta.fecha_inicio_operacion <= end_date,
+            Venta.estado_expediente.in_(['Contrato Firmado', 'Incidencias', 'Liquidado'])
+        ).order_by(Venta.folio, Pago.fecha_comprobante.desc(), Pago.numero_pago.desc())
+
+        if proyecto and proyecto.lower() != "todos":
+            query = query.filter(Venta.desarrollo == proyecto)
+
+        filas = query.all()
+
+        ventas_unicas = {}
+        for venta, _ in filas:
+            folio = str(getattr(venta, 'folio', '') or '')
+            if folio not in ventas_unicas:
+                ventas_unicas[folio] = venta
+
+        respuesta = []
+        for folio, v in ventas_unicas.items():
+            respuesta.append(
+                schemas.IncidenciasResponse(
+                    Folio=folio,
+                    NombreCliente=str(getattr(v, 'cliente', '') or ''),
+                    NumeroLote=str(getattr(v, 'numero', '') or ''),
+                    Cluster=str(getattr(v, 'etapa', '') or ''),
+                    MotivoIncidencia=str(getattr(v, 'estado_expediente', '') or ''),
+                    FechaSeguimiento1="",
+                    FechaSeguimiento2=""
+                )
+            )
+
+        return respuesta
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en incidencias: {str(e)}")
+
+# ENDPOINTS DE REPORTES DE EXPEDIENTES PARA RESPOND.IO (TITULARES Y COPROPIETARIOS)
+
 @router.get("/expedientes-detallado", response_model=List[schemas.ReporteExpedientesDetalladoResponse])
 def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     try:
         busqueda = f"%{anio}%" if anio else None
-        
-        # Subconsulta corregida para no contar de más (solo copros reales)
-        subquery_count = "(SELECT COUNT(*) FROM notificaciones_gestion_clientes WHERE folio = v.FOLIO AND (es_propietario_principal = 0 OR es_propietario_principal IS NULL))"
+
+        # Subconsulta: solo copropietarios reales, excluyendo al titular por flag y por nombre
+        subquery_count = """
+        (
+            SELECT COUNT(*)
+            FROM notificaciones_gestion_clientes ngc
+            WHERE ngc.folio = v.FOLIO
+                AND (ngc.es_propietario_principal = 0 OR ngc.es_propietario_principal IS NULL)
+                AND TRIM(LOWER(COALESCE(ngc.client_name, ''))) <> TRIM(LOWER(COALESCE(v.CLIENTE, '')))
+        )
+        """
 
         query = text(f"""
             -- 1. Fila del TITULAR (Es Propietario Principal)
@@ -791,7 +982,7 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
                 v.`PRECIO FINAL` as `PRECIO TOTAL`
             FROM ventas v
             WHERE (:anio_val IS NULL OR v.`FECHA DE INICIO DE OPERACIÓN` LIKE :busqueda_anio)
-              AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
+                AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
 
             UNION ALL
 
@@ -818,6 +1009,7 @@ def get_reporte_expedientes_detallado(anio: Optional[int] = None, db: Session = 
             WHERE (:anio_val_2 IS NULL OR v.`FECHA DE INICIO DE OPERACIÓN` LIKE :busqueda_anio_2)
               AND v.`ESTADO DEL EXPEDIENTE` NOT IN ('cancelado', 'expirado', 'Cancelado', 'Expirado')
               AND (gc.es_propietario_principal = 0 OR gc.es_propietario_principal IS NULL)
+                            AND TRIM(LOWER(COALESCE(gc.client_name, ''))) <> TRIM(LOWER(COALESCE(v.CLIENTE, '')))
             
             ORDER BY FOLIO ASC, `ES TITULAR` DESC 
         """)

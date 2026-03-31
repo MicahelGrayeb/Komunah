@@ -1,8 +1,9 @@
 from pydantic import BaseModel, Field, StrictBool, ConfigDict
-from typing import List, Any, Optional, Dict
-from pydantic import EmailStr
+from typing import List, Any, Optional, Dict, Union
+from pydantic import EmailStr, StrictBool
 from decimal import Decimal,ROUND_HALF_UP
 from pydantic import BaseModel
+from datetime import date
 
 class ConfigBase:
     from_attributes = True
@@ -299,8 +300,11 @@ class PlantillaUpdate(BaseModel):
     categoria: Optional[str] = None
     activo: Optional[StrictBool] = None
     tags_departamento: Optional[List[str]] = None
-    documentos_adjuntos: Optional[List[str]] = None
+    documentos_adjuntos: Optional[Union[Dict[str, str], List[str]]] = None
+    archivos_subidos: Optional[Dict[str, str]] = None
+    archivos_subidos_meta: Optional[Dict[str, Any]] = None
     #[id:nombre, id:nombre, id:nombre]
+    
 class ConfigUpdate(BaseModel):
     proyecto_activo: Optional[bool] = None
     email_enabled: Optional[bool] = None
@@ -315,7 +319,7 @@ class PlantillaWABase(BaseModel):
     variables: List[str]    # Ej: ["{cliente}", "{cl.monto}"]
     mensaje: str            # Texto para previsualizar
     activo: bool = False
-    documento_adjunto_id: Optional[Any] = None 
+    documento_adjunto_id: Optional[List[str]] = [] 
     #[id:nombre]
 
 class PlantillaWAUpdate(BaseModel):
@@ -326,13 +330,13 @@ class PlantillaWAUpdate(BaseModel):
     variables: Optional[List[str]] = None
     mensaje: Optional[str] = None
     activo: Optional[bool] = None
-    documento_adjunto_id: Optional[List[str]] = None
+    documento_adjunto_id: Optional[List[str]] = []
+    archivos_subidos: Optional[Dict[str, str]] = None
+    archivos_subidos_meta: Optional[Dict[str, Any]] = None
     
 class WhatsAppManualSchema(BaseModel):
     folio: str
     categoria: str
-    categoriaDocumento: Optional[str] = None
-    simular: bool = False
     
     
 class UsuarioUpdate(BaseModel):
@@ -354,9 +358,7 @@ class GlobalMassiveUpdate(BaseModel):
 class EmailFolioSchema(BaseModel):
     folio: str
     categoria: str
-    categoriaDocumento: Optional[str] = None
-    simular: bool = False
-
+    
 class RemitenteCreate(BaseModel):
     remitente: EmailStr
 
@@ -384,7 +386,7 @@ class EmailClusterSchema(BaseModel):
     asunto: str
     contenido_html: str
     reply_to: Optional[str] = None
-    simular: bool = True
+    simular: bool = False
     excluir_folios: Optional[List[str]] = []
     excluir_emails: Optional[List[str]] = []
     excluir_clientes: Optional[List[str]] = []
@@ -499,21 +501,77 @@ class EscrituradosJuridicoResponse(BaseModel):
     FechaEscrituraLista: Optional[str] = None
     FechaEscrituraEntregada: Optional[str] = None
 
+class EscrituracionFinanciamientoResponse(BaseModel):
+    Folio: Optional[str] = None
+    NombreCliente: Optional[str] = None
+    Cluster: Optional[str] = None
+    NumeroLote: Optional[str] = None
+    Telefono: Optional[str] = None
+    CorreoElectronico: Optional[str] = None
+    Estado: Optional[str] = None
+    Pais: Optional[str] = None
+    MensualidadesFaltantes: int = 0
+
+class IncidenciasResponse(BaseModel):
+    Folio: Optional[str] = None
+    NombreCliente: Optional[str] = None
+    NumeroLote: Optional[str] = None
+    Cluster: Optional[str] = None
+    MotivoIncidencia: Optional[str] = None
+    FechaSeguimiento1: str = ""
+    FechaSeguimiento2: str = ""
 
 
-class JuridicoBase(BaseModel):
+
+class DocumentosDinamicosBase(BaseModel):
     nombre: str
     categoria: str
     html: str
+    tamanoDocumento: str
     activo: bool = False
-    tags_departamento: List[str] = []
+    tieneAnexos: Optional[bool] = False
+    anexos: Optional[Union[Dict[str, str], List[str]]] = None
+    tags: Optional[List[str]] = None
 
-class JuridicoUpdate(BaseModel):
+class DocumentosDinamicosUpdate(BaseModel):
     nombre: Optional[str] = None
     categoria: Optional[str] = None
     html: Optional[str] = None
     activo: Optional[bool] = None
-    tags_departamento: Optional[List[str]] = None
+    tieneAnexos: Optional[bool] = None
+    anexos: Optional[Union[Dict[str, str], List[str]]] = None
+    tags: Optional[List[str]] = None
+    tamanoDocumento: Optional[str] = None
+    archivos_subidos: Optional[Dict[str, str]] = None
+    archivos_subidos_meta: Optional[Dict[str, Any]] = None
+
+class AnexosBase(BaseModel):
+    nombre: str
+    # htmlLibre: Optional[bool] = None
+    # FirmastesEmpresa: Optional[bool] = None
+    # FirmasCoopropietarios: Optional[bool] = None
+    # HojaMebretadaProyecto: Optional[bool] = None
+    categoria: str
+    # encabezado: Optional[str] = None
+    contenido: str
+    # footer: Optional[str] = None
+    tamanoDocumento: str
+    tags: Optional[List[str]] = None
+
+class AnexosUpdate(BaseModel):
+    nombre: str
+    # htmlLibre: Optional[bool] = None
+    # FirmastesEmpresa: Optional[bool] = None
+    # FirmasCoopropietarios: Optional[bool] = None
+    # HojaMebretadaProyecto: Optional[bool] = None
+    categoria: str
+    # encabezado: Optional[str] = None
+    contenido: str
+    # footer: Optional[str] = None
+    tamanoDocumento: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+
 
 class ReporteExpedientesDetalladoResponse(BaseModel):
     folio: Any = Field(alias="FOLIO")
@@ -534,6 +592,42 @@ class ReporteExpedientesDetalladoResponse(BaseModel):
     plazo: Any = Field(alias="PLAZO")
     precio_total: Any = Field(alias="PRECIO TOTAL")
 
-    class Config:
-        populate_by_name = True
-        from_attributes = True
+class Config:
+    populate_by_name = True
+    from_attributes = True
+
+class DocumentosSchema(BaseModel):
+    empresa_id: str
+    folio: str
+
+class DocumentosSchemaGeneracion(BaseModel):
+    empresa_id: str
+    folio: str
+    categoria: str
+
+
+class DocumentoDinamicoGeneracionSchema(BaseModel):
+    empresa_id: str
+    doc_id: str
+
+class DocumentosFiltroSchema(BaseModel):
+    categoria: Optional[str] = None
+    cliente: Optional[str] = None
+    fecha_inicio: Optional[date] = None
+    fecha_fin: Optional[date] = None
+
+
+class DocumentoDescargaSchema(BaseModel):
+    blob_path: str
+
+
+class DocumentoGenerarSubirSchema(BaseModel):
+    categoria: str
+    cliente: str
+    nombre_archivo: str
+    contenido_base64: str
+    content_type: Optional[str] = "application/octet-stream"
+
+
+class DocumentoEliminarSchema(BaseModel):
+    blob_path: str

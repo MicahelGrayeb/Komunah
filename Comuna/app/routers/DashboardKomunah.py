@@ -6,7 +6,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from ..database import get_db
 from ..models import Venta, Pago, ConfigEtapa
-from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
+from ..services.security import get_current_user, es_usuario, es_super_admin, es_usuario
 import calendar
 
 # Configuración de logger
@@ -57,7 +57,7 @@ def get_dashboard_kpis(
     end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
     proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
     db: Session = Depends(get_db),
-    user: dict = Depends(es_admin)
+    user: dict = Depends(es_usuario)
     ):
     """
     Calcula las tarjetas de métricas principales incluyendo Notas de Crédito.
@@ -168,7 +168,7 @@ def get_financial_charts(
     proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
     banco: Optional[str] = Query(None, description="Filtrar por nombre del banco"), 
     db: Session = Depends(get_db),
-    user: dict = Depends(es_admin)
+    user: dict = Depends(es_usuario)
     ):
     try:
         db_banco = "No aplica" if banco == "Banco Mercantil del Norte, S.A." else banco
@@ -277,7 +277,7 @@ def get_clusters_chart(
     end_date: str = Query(..., description="Fecha fin YYYY-MM-DD"),
     proyecto: Optional[str] = Query(None, description="Filtrar por nombre del proyecto"),
     db: Session = Depends(get_db),
-    user: dict = Depends(es_admin)
+    user: dict = Depends(es_usuario)
     ):
     """
     Retorna la evolución de ventas agrupadas por Etapa.
@@ -363,7 +363,7 @@ def get_clusters_chart(
 @router.get("/proyectos")
 def get_proyectos(
     db: Session = Depends(get_db),
-    user: dict = Depends(es_admin)
+    user: dict = Depends(es_usuario)
     ):
     try:
         resultados = db.query(ConfigEtapa).all()
