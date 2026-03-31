@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from playwright.sync_api import sync_playwright
 from google.cloud import storage
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 load_dotenv()
@@ -194,7 +194,7 @@ class CobranzaService:
         if not blob.exists():
             blob.upload_from_string(pdf_bytes, content_type="application/pdf")
 
-        return blob.public_url
+        return blob.generate_signed_url(version="v4", expiration=timedelta(days=3), method="GET")
 
     def generar_y_subir_pdf(self, id_empresa: str, comprobante_id: str, db: Session, status_pago: str):
         comprobante_doc = self.obtener_comprobante(comprobante_id)

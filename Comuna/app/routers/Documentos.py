@@ -37,7 +37,7 @@ import hashlib
 from ..services.security import es_usuario
 from argparse import Namespace
 from ..models import Venta, Cliente, Amortizacion
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +101,11 @@ class GCSDocumentosService:
             "blob_path": blob_path,
             "tamaño_kb": round((blob.size or 0) / 1024, 1),
             "fecha_creacion": blob.time_created.isoformat() if blob.time_created else None,
-            "url_descarga": blob.public_url,
+            "url_descarga": blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(days=3),
+                method="GET",
+            ),
             "endpoint_descarga_individual": f"/v1/documentos/descarga-individual?blob_path={quote(blob_path)}",
         }
 
@@ -177,7 +181,7 @@ class GCSDocumentosService:
         if not blob.exists():
             raise HTTPException(status_code=404, detail="El archivo solicitado no existe en el bucket.")
 
-        signed_url = blob.public_url
+        signed_url = blob.generate_signed_url(version="v4", expiration=timedelta(days=3), method="GET")
         return {
             "blob_path": blob_path,
             "nombre": blob_path.split("/")[-1],
@@ -222,7 +226,11 @@ class GCSDocumentosService:
         return {
             "mensaje": "Documento generado y subido correctamente.",
             "blob_path": blob_path,
-            "url_descarga": blob.public_url,
+            "url_descarga": blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(days=3),
+                method="GET",
+            ),
         }
 
     def delete_document(self, blob_path: str) -> dict:

@@ -3,7 +3,7 @@ import re
 import base64
 import logging
 import io
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from zoneinfo import ZoneInfo
 from sqlalchemy.orm import Session
@@ -369,7 +369,7 @@ class GenerarPDFUseCase:
             else:
                 logger.info("[PDF_GENERADOR] Paso: blob existente, se omite upload")
 
-            url = blob.public_url
+            url = blob.generate_signed_url(version="v4", expiration=timedelta(days=3), method="GET")
             logger.info("[PDF_GENERADOR] Salida _subir_pdf_a_bucket | url_generada=true")
             return url
         except HTTPException:
@@ -533,7 +533,7 @@ class GenerarPDFUseCase:
             variables_html = dict(data_sql)
             categoria_plantilla = fields.get("categoria", {}).get("stringValue", "")
 
-            if categoria_plantilla.tolower() == "cotizaciones":
+            if categoria_plantilla.lower() == "cotizaciones":
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones desde ID")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)
@@ -846,6 +846,18 @@ class GenerarPDFUseCase:
 
 class GenerarPDFDinamico(GenerarPDFUseCase):
     @staticmethod
+    def _extraer_contenido_body(html_fragmento: str) -> str:
+        contenido = str(html_fragmento or "")
+        if not contenido.strip():
+            return ""
+
+        match = re.search(r"<body[^>]*>(.*?)</body\s*>", contenido, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+
+        return contenido
+
+    @staticmethod
     def _append_html_sections(html_base: str, sections: List[str]) -> str:
         contenido = html_base or ""
         secciones_validas = [s for s in (sections or []) if str(s).strip()]
@@ -857,7 +869,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
             for seccion in secciones_validas
         )
 
-        match = re.search(r"</body\\s*>", contenido, flags=re.IGNORECASE)
+        match = re.search(r"</body\s*>", contenido, flags=re.IGNORECASE)
         if match:
             idx = match.start()
             return f"{contenido[:idx]}{extras}{contenido[idx:]}"
@@ -906,7 +918,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
         writer.write(salida)
         return salida.getvalue()
 
-    async def generar_por_doc_id(self, empresa_id: str, doc_id: str, subir_bucket: bool = True):
+    async def generar_por_doc_id(self, empresa_id: str, doc_id: str, folio: Optional[str] = None, db: Optional[Session] = None, subir_bucket: bool = True):
         logger.info(
             "[PDF_DINAMICO] Entrada generar_por_doc_id | empresa=%s | doc_id=%s | subir_bucket=%s",
             empresa_id,
@@ -914,46 +926,63 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
             subir_bucket,
         )
         try:
-            empresa_norm = str(empresa_id or "").strip()
-            doc_norm = str(doc_id or "").strip()
-            if not empresa_norm or not doc_norm:
-                raise HTTPException(status_code=400, detail="empresa_id y doc_id son obligatorios.")
-
-            plantilla = self.repo.obtener_un_doc_completo_documentos(empresa_norm, doc_norm)
+            logger.info("[PDF_GENERADOR] Paso: obtener plantilla documento dinámico por doc_id")
+            plantilla = self.repo.obtener_un_doc_completo_documentos(empresa_id, doc_id)
             if not plantilla:
-                raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica con id '{doc_norm}'.")
+                raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica con id '{doc_id}'.")
+            
+            logger.info("[PDF_GENERADOR] Paso: obtener proveedor de datos")
+            pack_empresa = _get_providers().get(empresa_id, {})
+            extraer_datos = pack_empresa.get("get")
+            if not extraer_datos:
+                raise HTTPException(status_code=400, detail="Empresa no configurada.")
 
+            logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio")
+            data_sql = extraer_datos(folio, db)
+            if not data_sql:
+                raise HTTPException(status_code=404, detail="Folio no encontrado.")
+
+            cliente = (
+                    data_sql.get("{c1.client_name}")
+                    or data_sql.get("{cliente}")
+                    or data_sql.get("{cl.cliente}")
+                    or data_sql.get("{v.cliente}")
+                    or "Cliente"
+                )
+            
             fields = plantilla.get("fields", {})
-            html_base = fields.get("html", {}).get("stringValue", "")
-            if not html_base:
+            html_raw = fields.get("html", {}).get("stringValue", "")
+            if not html_raw:
                 raise HTTPException(status_code=400, detail="La plantilla no tiene HTML en el campo 'html'.")
 
             categoria = fields.get("categoria", {}).get("stringValue", "general")
-            nombre_plantilla = fields.get("nombre", {}).get("stringValue", doc_norm)
-            cliente = (
-                fields.get("cliente", {}).get("stringValue")
-                or fields.get("nombre_cliente", {}).get("stringValue")
-                or "Cliente"
-            )
+            nombre_plantilla = fields.get("nombre", {}).get("stringValue", doc_id)
             tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
 
-            variables_base = {
-                "{doc_id}": doc_norm,
-                "{nombre}": nombre_plantilla,
-                "{categoria}": categoria,
-                "{cliente}": cliente,
-            }
-            variables_html = self._normalizar_variables_para_html(variables_base)
-            html_base = self._reemplazar_etiquetas(html_base, variables_html)
+            variables_html = dict(data_sql)
+
+            # 1. Formatear montos a Moneda ($X,XXX.XX)
+            claves_monto = ["{v.total_enganche}", "{v.precio_lista}", "{v.apartado}", "{v.flujo_enganche}", "{v.total_enganche_pagar}"]
+            for k in claves_monto:
+                if k in variables_html:
+                    variables_html[k] = self._formatear_moneda(variables_html[k])
+
+            # 2. Limpiar duplicados de "meses"
+            plazo_key = "{v.plazo_financiamiento}"
+            if plazo_key in variables_html:
+                valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
+                variables_html[plazo_key] = valor_plazo
+
+            html_base = self._reemplazar_etiquetas(html_raw, variables_html)
 
             secciones_anexo: List[str] = []
             tiene_anexos = fields.get("tieneAnexos", {}).get("booleanValue", False)
             if tiene_anexos:
                 ids_anexos = self._obtener_ids_anexos_desde_fields(fields)
                 for anexo_id in ids_anexos:
-                    anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_norm, anexo_id)
+                    anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_id, anexo_id)
                     if not anexo_doc:
-                        logger.warning("[PDF_DINAMICO] Anexo no encontrado | empresa=%s | anexo_id=%s", empresa_norm, anexo_id)
+                        logger.warning("[PDF_DINAMICO] Anexo no encontrado | empresa=%s | anexo_id=%s", empresa_id, anexo_id)
                         continue
                     anexo_fields = anexo_doc.get("fields", {})
                     contenido_anexo = (
@@ -961,7 +990,26 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                         or anexo_fields.get("html", {}).get("stringValue", "")
                     )
                     if contenido_anexo:
-                        secciones_anexo.append(self._reemplazar_etiquetas(contenido_anexo, variables_html))
+                        contenido_anexo = self._extraer_contenido_body(contenido_anexo)
+                        subcategoria_anexo = anexo_fields.get("subcategorianexo", {}).get("stringValue", "")
+                        variables_anexo = variables_html
+
+                        if subcategoria_anexo.strip().lower() == "cotizaciones":
+                            if folio and db is not None:
+                                logger.info(
+                                    "[PDF_DINAMICO] Paso: construir tabla de pagos para anexo cotizaciones | anexo_id=%s | folio=%s",
+                                    anexo_id,
+                                    folio,
+                                )
+                                contenido_anexo, totales = self._construir_tabla_pagos_cotizaciones(contenido_anexo, folio, db)
+                                variables_anexo.update(totales)
+                            else:
+                                logger.warning(
+                                    "[PDF_DINAMICO] Anexo cotizaciones sin folio/db, se omite tabla | anexo_id=%s",
+                                    anexo_id,
+                                )
+
+                        secciones_anexo.append(self._reemplazar_etiquetas(contenido_anexo, variables_anexo))
 
             archivos_subidos = self._obtener_archivos_subidos_desde_fields(fields)
             meta_archivos = fields.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {})
@@ -1001,10 +1049,14 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
                 page = await browser.new_page()
                 await page.set_content(html_final, wait_until="networkidle")
-                await page.emulate_media(media="screen")
+                await page.emulate_media(media="print")
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(format=tamano_documento, print_background=True)
+                pdf_bytes = await page.pdf(
+                    format=tamano_documento,
+                    print_background=True,
+                    prefer_css_page_size=True,
+                )
                 await browser.close()
 
             if pdfs_adjuntos:
@@ -1019,8 +1071,8 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 ruta = f"Komunah/PlantillasWeb/Categorias/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
 
             respuesta = {
-                "empresa_id": empresa_norm,
-                "doc_id": doc_norm,
+                "empresa_id": empresa_id,
+                "doc_id": doc_id,
                 "filename": nombre_pdf,
                 "ruta": ruta,
                 "incluye_anexos": bool(secciones_anexo),
@@ -1035,7 +1087,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
 
             logger.info(
                 "[PDF_DINAMICO] Salida generar_por_doc_id | doc_id=%s | anexos=%s | imagenes=%s | pdfs=%s",
-                doc_norm,
+                doc_id,
                 len(secciones_anexo),
                 len(secciones_imagenes),
                 len(pdfs_adjuntos),
@@ -1058,7 +1110,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
             raise HTTPException(status_code=500, detail=f"Error al generar PDF dinámico por doc_id: {str(e)}")
 
 class GenerarPDFAnexo(GenerarPDFUseCase):
-    async def generar_por_doc_id(self, empresa_id: str, doc_id: str, subir_bucket: bool = True):
+    async def generar_por_doc_id(self, empresa_id: str, doc_id: str, folio: Optional[str] = None, db: Optional[Session] = None,subir_bucket: bool = True):
         logger.info(
             "[PDF_ANEXO] Entrada generar_por_doc_id | empresa=%s | doc_id=%s | subir_bucket=%s",
             empresa_id,
@@ -1066,15 +1118,30 @@ class GenerarPDFAnexo(GenerarPDFUseCase):
             subir_bucket,
         )
         try:
-            empresa_norm = str(empresa_id or "").strip()
-            doc_norm = str(doc_id or "").strip()
-            if not empresa_norm or not doc_norm:
-                raise HTTPException(status_code=400, detail="empresa_id y doc_id son obligatorios.")
-
-            anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_norm, doc_norm)
+            logger.info("[PDF_GENERADOR] Paso: obtener plantilla de anexo por doc_id")
+            anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
             if not anexo_doc:
-                raise HTTPException(status_code=404, detail=f"No existe plantilla de anexo con id '{doc_norm}'.")
+                raise HTTPException(status_code=404, detail=f"No existe plantilla de anexo con id '{doc_id}'.")
+            
+            logger.info("[PDF_GENERADOR] Paso: obtener proveedor de datos")
+            pack_empresa = _get_providers().get(empresa_id, {})
+            extraer_datos = pack_empresa.get("get")
+            if not extraer_datos:
+                raise HTTPException(status_code=400, detail="Empresa no configurada.")
 
+            logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio")
+            data_sql = extraer_datos(folio, db)
+            if not data_sql:
+                raise HTTPException(status_code=404, detail="Folio no encontrado.")
+
+            cliente = (
+                    data_sql.get("{c1.client_name}")
+                    or data_sql.get("{cliente}")
+                    or data_sql.get("{cl.cliente}")
+                    or data_sql.get("{v.cliente}")
+                    or "Cliente"
+                )
+            
             fields = anexo_doc.get("fields", {})
             html_raw = (
                 fields.get("contenido", {}).get("stringValue")
@@ -1084,21 +1151,31 @@ class GenerarPDFAnexo(GenerarPDFUseCase):
                 raise HTTPException(status_code=400, detail="La plantilla de anexo no tiene contenido HTML.")
 
             categoria = fields.get("categoria", {}).get("stringValue", "general")
-            cliente = (
-                fields.get("cliente", {}).get("stringValue")
-                or fields.get("nombre_cliente", {}).get("stringValue")
-                or "Cliente"
-            )
-            nombre_anexo = fields.get("nombre", {}).get("stringValue", doc_norm)
+            subcategorianexo = fields.get("subcategorianexo", {}).get("stringValue", "")
+            nombre_anexo = fields.get("nombre", {}).get("stringValue", doc_id)
             tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
 
-            variables_base = {
-                "{doc_id}": doc_norm,
-                "{nombre}": nombre_anexo,
-                "{categoria}": categoria,
-                "{cliente}": cliente,
-            }
-            variables_html = self._normalizar_variables_para_html(variables_base)
+            variables_html = dict(data_sql)
+
+            # 1. Formatear montos a Moneda ($X,XXX.XX)
+            claves_monto = ["{v.total_enganche}", "{v.precio_lista}", "{v.apartado}", "{v.flujo_enganche}", "{v.total_enganche_pagar}"]
+            for k in claves_monto:
+                if k in variables_html:
+                    variables_html[k] = self._formatear_moneda(variables_html[k])
+
+            # 2. Limpiar duplicados de "meses"
+            plazo_key = "{v.plazo_financiamiento}"
+            if plazo_key in variables_html:
+                valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
+                variables_html[plazo_key] = valor_plazo
+
+
+            if subcategorianexo.strip().lower() == "cotizaciones":
+                logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
+                html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
+                variables_html.update(totales)
+
+            logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas y generar PDF")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
             async with async_playwright() as p:
@@ -1115,8 +1192,8 @@ class GenerarPDFAnexo(GenerarPDFUseCase):
             ruta = f"Komunah/Documentos/Anexos/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
 
             respuesta = {
-                "empresa_id": empresa_norm,
-                "doc_id": doc_norm,
+                "empresa_id": empresa_id,
+                "doc_id": doc_id,
                 "filename": nombre_pdf,
                 "ruta": ruta,
             }
@@ -1128,7 +1205,7 @@ class GenerarPDFAnexo(GenerarPDFUseCase):
 
             logger.info(
                 "[PDF_ANEXO] Salida generar_por_doc_id | doc_id=%s | filename=%s",
-                doc_norm,
+                doc_id,
                 nombre_pdf,
             )
             return respuesta
