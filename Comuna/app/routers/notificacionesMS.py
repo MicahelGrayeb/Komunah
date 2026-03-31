@@ -1,4 +1,4 @@
-﻿import os
+import os
 import requests
 import re
 import base64
@@ -33,8 +33,29 @@ from ..models import Venta, Cliente
 from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase, GenerarPDFDinamico, GenerarPDFAnexo
 from datetime import datetime, date, timedelta
 
-logger = logging.getLogger(__name__)
+# --- EL MARTILLAZO CORREGIDO: PARCHE GLOBAL QUE SÍ RESPETA LA AUTH ---
+import google.auth.transport.requests
 
+# Guardamos la referencia a la clase original de Google para no romper la cadena de auth
+OriginalAuthorizedSession = google.auth.transport.requests.AuthorizedSession
+
+class CloseConnectionSession(OriginalAuthorizedSession):
+    def __init__(self, *args, **kwargs):
+        # Súper importante: aceptamos las credenciales y se las pasamos a Google
+        super().__init__(*args, **kwargs)
+
+    def request(self, *args, **kwargs):
+        # Mantenemos tu protección de cerrar conexiones para evitar errores en Cloud Run
+        headers = kwargs.get('headers', {})
+        headers['Connection'] = 'close'
+        kwargs['headers'] = headers
+        return super().request(*args, **kwargs)
+
+# Aplicamos el parche inyectando nuestra clase mejorada
+google.auth.transport.requests.AuthorizedSession = CloseConnectionSession
+# ---------------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/notificaciones", tags=["Motor Envios"])
 router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas de Correo"])
@@ -62,29 +83,36 @@ PROVIDERS = {
 class FirebaseRepository:
     """Maneja la comunicación técnica con Firebase Firestore."""
     
+    _db_instance = None
+
     def __init__(self):
         from google.cloud import firestore
         import json
         
-        # 1. Jalamos el proyecto DIRECTO del .env como pediste
         self.project_id = os.getenv('FIREBASE_PLANTILLAS_PROJECT_ID', '').strip()
+        is_cloud_run = os.getenv('K_SERVICE') is not None
         
-        if os.path.exists("serviceAccountKey.json"):
-            try:
-                with open("serviceAccountKey.json") as f:
-                    info = json.load(f)
-                # Forzamos que use el ID del .env aunque el JSON sea de otro lado
-                self.db = firestore.Client.from_service_account_info(info, project=self.project_id)
-                logger.info(f"✅ FirebaseRepository: Conectado al proyecto '{self.project_id}'")
-            except Exception as e:
-                logger.error(f"❌ Error con serviceAccountKey.json: {e}")
-                self.db = firestore.Client(project=self.project_id)
-        else:
-            self.db = firestore.Client(project=self.project_id)
+        # 🚀 SINGLETON CRÍTICO: Reutilizar el Cliente de Firestore
+        if FirebaseRepository._db_instance is None:
+            if not is_cloud_run and os.path.exists("serviceAccountKey.json"):
+                try:
+                    with open("serviceAccountKey.json") as f:
+                        info = json.load(f)
+                    FirebaseRepository._db_instance = firestore.Client.from_service_account_info(info, project=self.project_id)
+                    logger.info(f"✅ Local Mode: Conectado a '{self.project_id}' vía JSON")
+                except Exception as e:
+                    logger.error(f"❌ Error con serviceAccountKey.json: {e}, usando Application Default.")
+                    FirebaseRepository._db_instance = firestore.Client(project=self.project_id)
+            else:
+                logger.info(f"Entorno Cloud / ADC Detectado. Conectando nativamente al proyecto '{self.project_id}'")
+                FirebaseRepository._db_instance = firestore.Client(project=self.project_id)
+        
+        self.db = FirebaseRepository._db_instance
             
-        # Variables que tus métodos actuales (de tu compañero) necesitan para no tronar
         self.base_url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents"
-        self.headers = {"Content-Type": "application/json"}
+        
+        # Forzamos también el Connection: close en los headers manuales
+        self.headers = {"Content-Type": "application/json", "Connection": "close"}
 
     def obtener_config_empresa(self, empresa_id: str):
         """Si Firebase falla, retorna todo en False para detener procesos."""
@@ -100,7 +128,7 @@ class FirebaseRepository:
             "email": f.get("email_enabled", {}).get("booleanValue", False),
             "whatsapp": f.get("whatsapp_enabled", {}).get("booleanValue", False)
         }
-    
+
 #region Helpers para peticiones seguras con reintentos
 
     def _peticion_segura(self, method: str, url: str, **kwargs):
@@ -117,18 +145,36 @@ class FirebaseRepository:
                 doc_id_param = next((v for k, v in params if k == "documentId"), None)
             elif isinstance(params, dict): 
                 doc_id_param = params.get("documentId")
+                
+            # Rescatar el ID si viene pegado directamente en la URL
+            if not doc_id_param and "documentId=" in path_raw:
+                doc_id_param = path_raw.split("documentId=")[1].split("&")[0]
             
             # 1. Resolver Queries
             if ":runQuery" in path_raw:
+                from google.cloud import firestore
                 query_body = kwargs.get("json", {}).get("structuredQuery", {})
                 coll_id = query_body.get("from", [{}])[0].get("collectionId", "plantillas")
-                where_clause = query_body.get("where", {}).get("fieldFilter", {})
-                field = where_clause.get("field", {}).get("fieldPath", "categoria")
-                value = where_clause.get("value", {}).get("stringValue")
                 
-                # ✅ LA LÍNEA MÁGICA ARREGLADA: Usamos .document(path)
-                docs = self.db.document(path).collection(coll_id).where(field, "==", value).stream()
+                ref = self.db.document(path).collection(coll_id) if path else self.db.collection(coll_id)
                 
+                # Filtro Where
+                f_filter = query_body.get("where", {}).get("fieldFilter", {})
+                if f_filter:
+                    field = f_filter.get("field", {}).get("fieldPath")
+                    val = f_filter.get("value", {}).get("stringValue")
+                    if field and val:
+                        ref = ref.where(field, "==", val)
+                
+                # Filtro OrderBy (Para logs)
+                order_by_list = query_body.get("orderBy", [])
+                for order in order_by_list:
+                    f_path = order.get("field", {}).get("fieldPath")
+                    direction = firestore.Query.DESCENDING if order.get("direction") == "DESCENDING" else firestore.Query.ASCENDING
+                    if f_path:
+                        ref = ref.order_by(f_path, direction=direction)
+                
+                docs = ref.stream()
                 data = [{"document": {"name": d.reference.path, "fields": self._formatear_a_rest(d.to_dict())}} for d in docs]
             
             # 2. Resolver GET
@@ -645,7 +691,7 @@ class FirebaseRepository:
 #endregion
 
 class NotificationGateway:
-    """Maneja la comunicación pura con MailerSend."""
+    """Maneja la comunicación pura con MailerSend y Respond.io (APIs Externas)."""
     @staticmethod
     def enviar_email(payload: dict):
         api_key = os.getenv("MAILERSEND_API_KEY")
@@ -654,8 +700,14 @@ class NotificationGateway:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        
-        return requests.post(url, headers=headers, json=payload, timeout=10)
+        try:
+            return requests.post(url, headers=headers, json=payload, timeout=10)
+        except Exception as e:
+            logger.error(f"⚠️ Error de red aislado en enviar_email: {e}")
+            class ErrorMock:
+                status_code = 500
+                text = str(e)
+            return ErrorMock()
 
     @staticmethod
     def enviar_email_bulk(payloads: List[dict]):
@@ -665,7 +717,14 @@ class NotificationGateway:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        return requests.post(url, headers=headers, json=payloads, timeout=20)
+        try:
+            return requests.post(url, headers=headers, json=payloads, timeout=20)
+        except Exception as e:
+            logger.error(f"⚠️ Error de red aislado en enviar_email_bulk: {e}")
+            class ErrorMock:
+                status_code = 500
+                text = str(e)
+            return ErrorMock()
     
     @staticmethod
     def enviar_whatsapp(
@@ -682,7 +741,6 @@ class NotificationGateway:
         
         identifier = quote(f"phone:{numero}")
         url = f"https://api.respond.io/v2/contact/{identifier}/message"
-        
         
         components = []
         if header_document_link:
@@ -721,7 +779,14 @@ class NotificationGateway:
         }
         
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        return requests.post(url, headers=headers, json=payload, timeout=10)
+        try:
+            return requests.post(url, headers=headers, json=payload, timeout=10)
+        except Exception as e:
+            logger.error(f"⚠️ Error de red aislado en enviar_whatsapp a {numero}: {e}")
+            class ErrorMock:
+                status_code = 500
+                text = str(e)
+            return ErrorMock()
 
 class StaticNotificationUseCase:
     def __init__(self, gateway: NotificationGateway):
@@ -832,6 +897,10 @@ class StaticWAUseCase:
             nombre = data_sql.get(f"{{c{i}.client_name}}")
             telefono = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "").replace("-", "")
             if not nombre or not telefono: continue
+
+            # Previene envío múltiple si varios co-propietarios comparten el mismo número
+            if telefono in wa_enviados_folio: continue
+            wa_enviados_folio.add(telefono)
 
             parametros_finales = []
             for var_nombre in config_plantilla["variables"]:
@@ -969,7 +1038,14 @@ class NotificationUseCase:
         self.repo = repo
         self.gateway = gateway
 
-    async def ejecutar_barrido_automatico(self, empresa_id: str, dias: int, categoria: str, db: Session, tipo: str = "normal", simular: bool = False):
+    async def ejecutar_barrido_automatico(self, empresa_id: str, dias: int, categoria: str, db: Session, tipo: str = "normal", simular: bool = False, lock_ref=None):
+        def broadcast_log(msg: str):
+            logger.info(msg)
+            if lock_ref:
+                try: lock_ref.update({"current_log": msg})
+                except: pass
+
+        broadcast_log(f"BARRIDO_START: {categoria}")
         pack_empresa = PROVIDERS.get(empresa_id, {})
         extraer_datos = pack_empresa.get("get")
         if not extraer_datos:
@@ -1014,20 +1090,25 @@ class NotificationUseCase:
                 "texto_base": f_wa.get("mensaje", {}).get("stringValue", ""),
                 "variables": [v.get("stringValue") for v in f_wa.get("variables", {}).get("arrayValue", {}).get("values", [])]
             }
+        # 2. Data Retrieval
         fecha_t = (datetime.now(ZoneInfo("America/Mexico_City")) + timedelta(days=dias)).strftime('%Y-%m-%d')
+        get_func = pack_empresa.get("get_deudores") if tipo == "deudores" else pack_empresa.get("get_pendientes")
+        
         try:
-            if tipo == "deudores":
-                registros = pack_empresa.get("get_deudores")(db, fecha_t)
-            else:
-                registros = pack_empresa.get("get_pendientes")(db, fecha_t)
+            registros = get_func(db, fecha_t)
+            # 🔥 LOG CRÍTICO: Aquí es donde gritamos cuántos trajo SQL
+            total_encontrados = len(registros)
+            broadcast_log(f"SQL_QUERY_SUCCESS: category='{categoria}', folios_found={total_encontrados}")
         except Exception as e:
+            broadcast_log(f"SQL_QUERY_ERROR: {str(e)}")
             self.repo.registrar_log_falla(empresa_id, f"Error SQL: {str(e)}", "DATABASE")
             raise
         
         reporte_detallado = []
         pdf_service = GenerarPDFUseCase(self.repo)
 
-        for row in registros:
+        for idx, row in enumerate(registros, 1):
+            broadcast_log(f"PROCESSING: Folio {row} ({idx}/{len(registros)})")
             data_sql = extraer_datos(row, db)
 
             if not data_sql:
@@ -1132,6 +1213,8 @@ class NotificationUseCase:
                         })
                         if res_mail.status_code not in [200, 201, 202]:
                             self.repo.registrar_log_falla(empresa_id, f"Email falló ({res_mail.status_code}) para {email}", "MAIL_PROVIDER")
+                        
+                        broadcast_log(f"DISPATCH_SUCCESS: Folio {row} enviado.")
                         res_status = f"Status: {res_mail.status_code} | {res_mail.text[:100]}"
                     
                     resultado_envio["email"] = res_status

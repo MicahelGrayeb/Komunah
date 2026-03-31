@@ -11,6 +11,7 @@ from .routers.notificacionesMS import NotificationUseCase, FirebaseRepository, N
 from .database import SessionLocal 
 import logging
 from zoneinfo import ZoneInfo
+from datetime import datetime
 from .services.sync_service import AutoSyncManager
 
 logging.basicConfig(level=logging.INFO)
@@ -137,56 +138,74 @@ app.add_middleware(
     allow_headers=["*"],
 ) 
 
-def _ejecutar_con_reintentos(loop, coro_func, label, max_intentos=3):
-    """Ejecuta una coroutine con reintentos ante errores de red."""
-    import time as _time
-    for intento in range(1, max_intentos + 1):
-        try:
-            resultado = loop.run_until_complete(coro_func())
-            logger.info(f"✅ {label} completado (intento {intento})")
-            return resultado
-        except Exception as e:
-            logger.warning(f"⚠️ {label} falló intento {intento}/{max_intentos}: {str(e)[:120]}")
-            if intento < max_intentos:
-                _time.sleep(5)
-            else:
-                logger.error(f"❌ {label} falló después de {max_intentos} intentos")
-    return None
-
 def tarea_diaria_notificaciones():  
-    """Lógica del Cron Job."""
+    """Lógica distribuida: El ganador ejecuta, los clones reportan en su consola."""
     import asyncio
+    import time as _time
     db = SessionLocal()
     try:
-        logger.info("⏰ Cron Job: Iniciando proceso de barrido automático...")
         repo = FirebaseRepository()
+        hoy_str = datetime.now(ZoneInfo("America/Mexico_City")).strftime('%Y-%m-%d')
+        config = repo.obtener_config_recordatorios("komunah")
+        lock_id = f"{hoy_str}_{config['hora']}_{config['minuto']}"
+        lock_ref = repo.db.collection("empresas").document("komunah").collection("configuracion").document("lock_cron")
+        
+        doc = lock_ref.get()
+        
+        # --- MODO ESPEJO (Para los otros clones) ---
+        if doc.exists and doc.to_dict().get("last_run_id") == lock_id:
+            logger.info(f"🔗 [CLONE_SYNC] Vinculado a ejecución activa: {lock_id}")
+            
+            last_msg = ""
+            while True:
+                status_doc = lock_ref.get()
+                if not status_doc.exists: break
+                status = status_doc.to_dict()
+                state = status.get("state")
+                msg = status.get("current_log", "")
+                
+                # Solo imprimimos en consola si el ganador escribió algo nuevo
+                if msg != last_msg:
+                    logger.info(f"📡 [REMOTE_LOG]: {msg}")
+                    last_msg = msg
+                
+                if state in ["COMPLETED", "FAILED"]:
+                    logger.info(f"✅ [CLONE_SYNC] Ejecución finalizada. Cerrando log espejo.")
+                    break
+                _time.sleep(2) # Revisa la pizarra cada 2 segundos
+            return
+
+        # --- MODO GANADOR (El que hace la chamba) ---
+        lock_ref.set({
+            "last_run_id": lock_id,
+            "state": "RUNNING",
+            "current_log": "Iniciando proceso...",
+            "timestamp": datetime.now(ZoneInfo("America/Mexico_City")).isoformat()
+        }, merge=True)
+
+        logger.info(f"🔥 [MASTER] Tomando control de la ejecución: {lock_id}")
         gateway = NotificationGateway()
         use_case = NotificationUseCase(repo, gateway)
-        
-        config = repo.obtener_config_recordatorios("komunah")
-        logger.info(f"📋 Config: dias_1={config['dias_1']}, dias_2={config['dias_2']}, hora={config['hora']}:{config['minuto']}")
         
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            _ejecutar_con_reintentos(loop, 
-                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago", db, "normal"),
-                "Barrido dias_1 normal")
-            _ejecutar_con_reintentos(loop, 
-                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago Vencido", db, "deudores"),
-                "Barrido dias_1 deudores")
-            _ejecutar_con_reintentos(loop, 
-                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago", db, "normal"),
-                "Barrido dias_2 normal")
-            _ejecutar_con_reintentos(loop, 
-                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago Vencido", db, "deudores"),
-                "Barrido dias_2 deudores")
+            # 🚀 Inciando las fases del Ganador
+            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago", db, "normal", lock_ref=lock_ref))
+            loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago Vencido", db, "deudores", lock_ref=lock_ref))
+            
+            if config["dias_1"] != config["dias_2"]:
+                loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago", db, "normal", lock_ref=lock_ref))
+                loop.run_until_complete(use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago Vencido", db, "deudores", lock_ref=lock_ref))
+
+            lock_ref.update({"state": "COMPLETED", "current_log": "Barrido terminado exitosamente."})
+            logger.info(f"🏆 [MASTER_DONE] Ejecución {lock_id} finalizada.")
         finally:
             loop.close()
             
-        logger.info("✅ Cron Job: Proceso finalizado con éxito.")
     except Exception as e:
-        logger.error(f"❌ Error en el Cron Job: {str(e)}")
+        logger.error(f"❌ [CRITICAL] Error en main: {str(e)}")
+        if 'lock_ref' in locals(): lock_ref.update({"state": "FAILED", "current_log": f"Error: {str(e)}"})
     finally:
         db.close()
 
