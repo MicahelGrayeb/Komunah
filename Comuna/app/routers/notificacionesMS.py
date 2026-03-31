@@ -608,6 +608,7 @@ class FirebaseRepository:
         if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
         if p.contenido: fields["contenido"] = {"stringValue": p.contenido}; mask.append("contenido")
         if p.categoria: fields["categoria"] = {"stringValue": p.categoria}; mask.append("categoria")
+        if p.subcategorianexo: fields["subcategorianexo"] = {"stringValue": p.subcategorianexo}; mask.append("subcategorianexo")
         
         if hasattr(p, 'tamanoDocumento') and p.tamanoDocumento:
             fields["tamanoDocumento"] = {"stringValue": p.tamanoDocumento}
@@ -2812,10 +2813,7 @@ def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_adm
     return {"status": "eliminada", "id": doc_id}
 
 @router_documento.post("/generar-documento-dinamico")
-async def api_generar_subir_documento_dinamico(
-    payload: DocumentoDinamicoGeneracionSchema,
-    user: dict = Depends(es_usuario),
-):
+async def api_generar_subir_documento_dinamico(payload: DocumentoDinamicoGeneracionSchema, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     logger.info(
         "[PDF_DINAMICO] Endpoint /generar-subir | empresa_id=%s | doc_id=%s",
         payload.empresa_id,
@@ -2826,6 +2824,8 @@ async def api_generar_subir_documento_dinamico(
     return await generador.generar_por_doc_id(
         empresa_id=payload.empresa_id.strip(),
         doc_id=payload.doc_id.strip(),
+        folio=(payload.folio or "").strip() or None,
+        db=db,
         subir_bucket=True,
     )
 
@@ -2844,6 +2844,7 @@ def listar_anexos(empresa_id: str, user: dict = Depends(es_admin)):
             "id": d["name"].split("/")[-1],
             "nombre": f.get("nombre", {}).get("stringValue", ""),
             "categoria": f.get("categoria", {}).get("stringValue", ""),
+            "subcategorianexo": f.get("subcategorianexo", {}).get("stringValue", ""),
             "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
             "static": f.get("static", {}).get("booleanValue", False),
             "tags": [v.get("stringValue") for v in f.get("tags", {}).get("arrayValue", {}).get("values", [])],
@@ -2861,6 +2862,7 @@ def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[AnexosBase] = Bo
         "id": {"stringValue": nombre_id},
         "nombre": {"stringValue": datos_json.nombre},
         "categoria": {"stringValue": datos_json.categoria},
+        "subcategorianexo": {"stringValue": datos_json.subcategorianexo},
         "contenido": {"stringValue": datos_json.contenido},
         "static": {"booleanValue": False},
         "tamanoDocumento": {"stringValue": datos_json.tamanoDocumento},
@@ -2901,10 +2903,7 @@ def eliminar_anexo(empresa_id: str, doc_id: str, user: dict = Depends(es_admin))
     return {"status": "eliminada", "id": doc_id}
 
 @router_anexo.post("/generar-documento-anexo")
-async def api_generar_subir_anexo_dinamico(
-    payload: DocumentoDinamicoGeneracionSchema,
-    user: dict = Depends(es_usuario),
-):
+async def api_generar_subir_anexo_dinamico(payload: DocumentoDinamicoGeneracionSchema, db: Session = Depends(get_db),user: dict = Depends(es_usuario)):
     logger.info(
         "[PDF_ANEXO] Endpoint /generar-anexo | empresa_id=%s | doc_id=%s",
         payload.empresa_id,
@@ -2915,8 +2914,9 @@ async def api_generar_subir_anexo_dinamico(
     return await generador.generar_por_doc_id(
         empresa_id=payload.empresa_id.strip(),
         doc_id=payload.doc_id.strip(),
+        folio=(payload.folio or "").strip() or None,
+        db=db,
         subir_bucket=True,
     )
-
 
 #endregion 

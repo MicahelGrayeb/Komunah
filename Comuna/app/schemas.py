@@ -552,6 +552,7 @@ class AnexosBase(BaseModel):
     # FirmasCoopropietarios: Optional[bool] = None
     # HojaMebretadaProyecto: Optional[bool] = None
     categoria: str
+    subcategorianexo: Optional[str] = None
     # encabezado: Optional[str] = None
     contenido: str
     # footer: Optional[str] = None
@@ -565,6 +566,7 @@ class AnexosUpdate(BaseModel):
     # FirmasCoopropietarios: Optional[bool] = None
     # HojaMebretadaProyecto: Optional[bool] = None
     categoria: str
+    subcategorianexo: Optional[str] = None
     # encabezado: Optional[str] = None
     contenido: str
     # footer: Optional[str] = None
@@ -609,6 +611,7 @@ class DocumentosSchemaGeneracion(BaseModel):
 class DocumentoDinamicoGeneracionSchema(BaseModel):
     empresa_id: str
     doc_id: str
+    folio: Optional[str] = None
 
 class DocumentosFiltroSchema(BaseModel):
     categoria: Optional[str] = None
