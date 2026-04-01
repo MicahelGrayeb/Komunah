@@ -1,4 +1,4 @@
-import os
+﻿import os
 import requests
 import re
 import base64
@@ -33,27 +33,7 @@ from ..models import Venta, Cliente
 from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase, GenerarPDFDinamico, GenerarPDFAnexo
 from datetime import datetime, date, timedelta
 
-# --- EL MARTILLAZO CORREGIDO: PARCHE GLOBAL QUE SÍ RESPETA LA AUTH ---
-import google.auth.transport.requests
 
-# Guardamos la referencia a la clase original de Google para no romper la cadena de auth
-OriginalAuthorizedSession = google.auth.transport.requests.AuthorizedSession
-
-class CloseConnectionSession(OriginalAuthorizedSession):
-    def __init__(self, *args, **kwargs):
-        # Súper importante: aceptamos las credenciales y se las pasamos a Google
-        super().__init__(*args, **kwargs)
-
-    def request(self, *args, **kwargs):
-        # Mantenemos tu protección de cerrar conexiones para evitar errores en Cloud Run
-        headers = kwargs.get('headers', {})
-        headers['Connection'] = 'close'
-        kwargs['headers'] = headers
-        return super().request(*args, **kwargs)
-
-# Aplicamos el parche inyectando nuestra clase mejorada
-google.auth.transport.requests.AuthorizedSession = CloseConnectionSession
-# ---------------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
 
@@ -698,7 +678,8 @@ class NotificationGateway:
         url = "https://api.mailersend.com/v1/email"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Connection": "close"
         }
         try:
             return requests.post(url, headers=headers, json=payload, timeout=10)
@@ -715,7 +696,8 @@ class NotificationGateway:
         url = "https://api.mailersend.com/v1/bulk-email"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Connection": "close"
         }
         try:
             return requests.post(url, headers=headers, json=payloads, timeout=20)
@@ -778,7 +760,11 @@ class NotificationGateway:
             }
         }
         
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {token}", 
+            "Content-Type": "application/json",
+            "Connection": "close"
+        }
         try:
             return requests.post(url, headers=headers, json=payload, timeout=10)
         except Exception as e:
