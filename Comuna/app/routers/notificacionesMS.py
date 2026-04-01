@@ -30,7 +30,7 @@ import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 from argparse import Namespace
 from ..models import Venta, Cliente
-from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase, GenerarPDFDinamico, GenerarPDFAnexo
+from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase, GenerarPDFDinamico
 from datetime import datetime, date, timedelta
 
 logger = logging.getLogger(__name__)
@@ -2815,16 +2815,17 @@ def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_adm
 @router_documento.post("/generar-documento-dinamico")
 async def api_generar_subir_documento_dinamico(payload: DocumentoDinamicoGeneracionSchema, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     logger.info(
-        "[PDF_DINAMICO] Endpoint /generar-subir | empresa_id=%s | doc_id=%s",
+        "[PDF_DINAMICO] Endpoint /generar-subir | empresa_id=%s | id_plantilla=%s",
         payload.empresa_id,
-        payload.doc_id,
+        payload.id_plantilla,
     )
 
     generador = GenerarPDFDinamico(FirebaseRepository())
-    return await generador.generar_por_doc_id(
+    return await generador.generar_pdf_por_id_plantilla(
         empresa_id=payload.empresa_id.strip(),
-        doc_id=payload.doc_id.strip(),
+        id_plantilla=payload.id_plantilla.strip(),
         folio=(payload.folio or "").strip() or None,
+        coleccion="DocumentosDinamicos",
         db=db,
         subir_bucket=True,
     )
@@ -2905,16 +2906,17 @@ def eliminar_anexo(empresa_id: str, doc_id: str, user: dict = Depends(es_admin))
 @router_anexo.post("/generar-documento-anexo")
 async def api_generar_subir_anexo_dinamico(payload: DocumentoDinamicoGeneracionSchema, db: Session = Depends(get_db),user: dict = Depends(es_usuario)):
     logger.info(
-        "[PDF_ANEXO] Endpoint /generar-anexo | empresa_id=%s | doc_id=%s",
+        "[PDF_ANEXO] Endpoint /generar-anexo | empresa_id=%s | id_plantilla=%s",
         payload.empresa_id,
-        payload.doc_id,
+        payload.id_plantilla,
     )
 
-    generador = GenerarPDFAnexo(FirebaseRepository())
-    return await generador.generar_por_doc_id(
+    generador = GenerarPDFDinamico(FirebaseRepository())
+    return await generador.generar_pdf_por_id_plantilla(
         empresa_id=payload.empresa_id.strip(),
-        doc_id=payload.doc_id.strip(),
+        id_plantilla=payload.id_plantilla.strip(),
         folio=(payload.folio or "").strip() or None,
+        coleccion="Anexos",
         db=db,
         subir_bucket=True,
     )

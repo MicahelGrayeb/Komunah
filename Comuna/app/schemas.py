@@ -610,8 +610,9 @@ class DocumentosSchemaGeneracion(BaseModel):
 
 class DocumentoDinamicoGeneracionSchema(BaseModel):
     empresa_id: str
-    doc_id: str
+    id_plantilla: str
     folio: Optional[str] = None
+    coleccion: Optional[str] = None
 
 class DocumentosFiltroSchema(BaseModel):
     categoria: Optional[str] = None
