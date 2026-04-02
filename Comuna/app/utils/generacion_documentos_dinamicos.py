@@ -441,7 +441,7 @@ class GenerarPDFUseCase:
                 valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
                 variables_html[plazo_key] = valor_plazo
 
-            if categoria.strip().lower() == "cotizaciones":
+            if fields.get("categoria", {}).get("stringValue", "").strip().lower() == "cotizaciones":
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)
@@ -668,7 +668,7 @@ class GenerarPDFUseCase:
                     valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
                     variables_html[plazo_key] = valor_plazo
 
-                if anexo_doc.get("fields", {}).get("subcategorianexo", {}).get("stringValue", "").strip().lower() == "cotizaciones":
+                if fields.get("subcategorianexo", {}).get("stringValue", "").strip().lower() == "cotizaciones":
                     logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
                     html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                     variables_html.update(totales)
@@ -1049,10 +1049,11 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
 
             if subir_bucket:
                 categoria = fields.get("categoria", {}).get("stringValue", "general")
+                subcategorianexo = fields.get("subcategorianexo", {}).get("stringValue", "general")
                 if coleccion == "DocumentosDinamicos":
                     ruta = f"Komunah/Documentos/Completos/{self._normalizar_fragmento(categoria)}/{self._normalizar_fragmento(cliente)}"
                 else:
-                    ruta = f"Komunah/Documentos/Anexos/{self._normalizar_fragmento(categoria)}/{self._normalizar_fragmento(cliente)}"
+                    ruta = f"Komunah/Documentos/Anexos/{self._normalizar_fragmento(subcategorianexo)}/{self._normalizar_fragmento(cliente)}"
                 respuesta["url_descarga"] = self._subir_pdf_a_bucket(pdf_final_bytes, ruta, nombre_pdf)
             respuesta.pop("content", None)
             return respuesta
@@ -1112,7 +1113,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
                 variables_html[plazo_key] = valor_plazo
 
-            if anexo_doc.get("fields", {}).get("subcategorianexo", {}).get("stringValue", "").strip().lower() == "cotizaciones":
+            if fields.get("subcategorianexo", {}).get("stringValue", "").strip().lower() == "cotizaciones":
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)

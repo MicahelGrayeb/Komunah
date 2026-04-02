@@ -149,7 +149,7 @@ class FirebaseRepository:
                 if doc_id_param: # Crear con ID específico
                     self.db.collection(path).document(doc_id_param).set(clean_data)
                 else: # Actualizar existente
-                    self.db.document(path).set(clean_data, merge=True)
+                    self.db.document(path).update(clean_data)
                 data = {"fields": payload}
                 
             # 4. DELETE
