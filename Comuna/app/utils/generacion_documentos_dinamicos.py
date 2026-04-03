@@ -17,7 +17,7 @@ from ..utils.datos_proveedores import (
 from fastapi import HTTPException
 from google.cloud import storage
 from playwright.async_api import async_playwright
-from ..models import Amortizacion
+from ..models import Amortizacion, Venta
 
 logger = logging.getLogger(__name__)
 BUCKET_NAME = "bucket-grupo-komunah-juridico"
@@ -33,6 +33,8 @@ def _get_providers():
 class GenerarPDFUseCase:
     def __init__(self, repo):
         self.repo = repo
+
+#region Funciones auxiliares de normalización, formateo y construcción de HTML
 
     @staticmethod
     def _normalizar_fragmento(valor: Any, fallback: str = "N/A") -> str:
@@ -171,6 +173,145 @@ class GenerarPDFUseCase:
         logger.info("[PDF_GENERADOR] Salida _obtener_ids_anexos_desde_fields | total_ids=%s", len(ids_unicos))
         return ids_unicos
 
+    @staticmethod
+    def _es_booleano_activo(valor: Any) -> bool:
+        if isinstance(valor, bool):
+            return valor
+        if valor is None:
+            return False
+        return str(valor).strip().lower() in {"true", "1", "si", "yes"}
+
+    @staticmethod
+    def _normalizar_lista_nombres(nombres: List[Any]) -> List[str]:
+        resultado: List[str] = []
+        for nombre in nombres or []:
+            nombre_txt = str(nombre).strip() if nombre is not None else ""
+            if nombre_txt and nombre_txt.lower() not in {"none", "null", "n/a", "na"}:
+                resultado.append(nombre_txt)
+        return list(dict.fromkeys(resultado))
+
+    def _construir_bloque_firmas_html(self, nombres: List[str], titulo: str) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _construir_bloque_firmas_html | titulo=%s | total_nombres=%s", titulo, len(nombres or []))
+        if not nombres:
+            logger.info("[PDF_FIRMAS] Salida _construir_bloque_firmas_html | resultado=bloque_vacio")
+            return ""
+
+        firmas = []
+        for nombre in nombres:
+            firmas.append(
+                f"""
+                <div style=\"break-inside: avoid; min-height: 90px;\">
+                    <div style=\"border-top: 1px solid #222; width: 100%; margin-top: 44px;\"></div>
+                    <div style=\"margin-top: 8px; font-size: 12px; text-align: center;\">{nombre}</div>
+                </div>
+                """
+            )
+
+        bloque = f"""
+        <section style=\"margin-top: 40px; page-break-inside: avoid;\">
+            <h3 style=\"margin: 0 0 20px 0; font-size: 14px;\">{titulo}</h3>
+            <div style=\"display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 34px 42px;\">
+                {''.join(firmas)}
+            </div>
+        </section>
+        """
+        logger.info("[PDF_FIRMAS] Salida _construir_bloque_firmas_html | resultado=bloque_generado | total_firmas=%s", len(firmas))
+        return bloque
+
+    @staticmethod
+    def _insertar_al_final_del_documento(html_raw: str, bloque_html: str) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _insertar_al_final_del_documento | html_len=%s | bloque_len=%s", len(html_raw or ""), len(bloque_html or ""))
+        if not bloque_html:
+            logger.info("[PDF_FIRMAS] Salida _insertar_al_final_del_documento | resultado=sin_cambios")
+            return html_raw
+
+        if "</body>" in html_raw:
+            resultado = html_raw.replace("</body>", f"{bloque_html}</body>", 1)
+            logger.info("[PDF_FIRMAS] Salida _insertar_al_final_del_documento | ancla=body")
+            return resultado
+
+        if "</html>" in html_raw:
+            resultado = html_raw.replace("</html>", f"{bloque_html}</html>", 1)
+            logger.info("[PDF_FIRMAS] Salida _insertar_al_final_del_documento | ancla=html")
+            return resultado
+
+        resultado = f"{html_raw}\n{bloque_html}"
+        logger.info("[PDF_FIRMAS] Salida _insertar_al_final_del_documento | ancla=append_final")
+        return resultado
+
+    def _construir_seccion_firmantes_empresa(self, html_raw: str, empresa_id: str, db: Session) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _construir_seccion_firmantes_empresa | empresa=%s", empresa_id)
+        del db  # Se mantiene por compatibilidad de firma con el flujo actual.
+        try:
+            logger.info("[PDF_FIRMAS] Paso: consultar coleccion firmantes-empresa")
+            docs = self.repo.listar_firmantes_empresa(empresa_id)
+            logger.info("[PDF_FIRMAS] Paso: documentos firmantes-empresa recibidos=%s", len(docs or []))
+
+            nombres = []
+            for doc in docs or []:
+                fields = doc.get("fields", {})
+                activo = fields.get("activo", {}).get("booleanValue")
+                if not self._es_booleano_activo(activo):
+                    continue
+                nombre = fields.get("nombre", {}).get("stringValue")
+                if nombre:
+                    nombres.append(nombre)
+
+            nombres = self._normalizar_lista_nombres(nombres)
+            logger.info("[PDF_FIRMAS] Paso: firmantes empresa activos normalizados=%s", len(nombres))
+            bloque = self._construir_bloque_firmas_html(nombres, "Firmantes de Empresa")
+            resultado = self._insertar_al_final_del_documento(html_raw, bloque)
+            logger.info("[PDF_FIRMAS] Salida _construir_seccion_firmantes_empresa | firmas_agregadas=%s", len(nombres))
+            return resultado
+        except Exception as e:
+            logger.exception("[PDF_FIRMAS] Error _construir_seccion_firmantes_empresa | empresa=%s | error=%s", empresa_id, str(e))
+            return html_raw
+
+    def _construir_seccion_firmantes_coopropietarios(self, html_raw: str, folio: str, db: Session) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _construir_seccion_firmantes_coopropietarios | folio=%s", folio)
+        try:
+            logger.info("[PDF_FIRMAS] Paso: consultar venta por folio para cliente y copropietarios")
+            venta = db.query(Venta).filter(Venta.folio == str(folio)).first()
+            if not venta:
+                logger.warning("[PDF_FIRMAS] Sin datos de venta para firmas de copropietarios | folio=%s", folio)
+                return html_raw
+
+            nombres = [
+                venta.cliente,
+                venta.cliente_2,
+                venta.cliente_3,
+                venta.cliente_4,
+                venta.cliente_5,
+                venta.cliente_6,
+            ]
+            nombres = self._normalizar_lista_nombres(nombres)
+            logger.info("[PDF_FIRMAS] Paso: firmantes cliente/copropietarios normalizados=%s", len(nombres))
+            bloque = self._construir_bloque_firmas_html(nombres, "Firmas de Cliente y Copropietarios")
+            resultado = self._insertar_al_final_del_documento(html_raw, bloque)
+            logger.info("[PDF_FIRMAS] Salida _construir_seccion_firmantes_coopropietarios | firmas_agregadas=%s", len(nombres))
+            return resultado
+        except Exception as e:
+            logger.exception("[PDF_FIRMAS] Error _construir_seccion_firmantes_coopropietarios | folio=%s | error=%s", folio, str(e))
+            return html_raw
+
+    def _construir_seccion_firmantes_personalizados(self, html_raw: str, fields: dict, db: Session) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _construir_seccion_firmantes_personalizados")
+        del db  # Se mantiene por compatibilidad de firma con el flujo actual.
+        try:
+            logger.info("[PDF_FIRMAS] Paso: leer array FirmantesPersonalizados desde fields")
+            valores = fields.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])
+            logger.info("[PDF_FIRMAS] Paso: elementos crudos en FirmantesPersonalizados=%s", len(valores or []))
+            nombres = [item.get("stringValue") for item in valores if isinstance(item, dict)]
+            nombres = self._normalizar_lista_nombres(nombres)
+            logger.info("[PDF_FIRMAS] Paso: firmantes personalizados normalizados=%s", len(nombres))
+            bloque = self._construir_bloque_firmas_html(nombres, "Firmantes Personalizados")
+            resultado = self._insertar_al_final_del_documento(html_raw, bloque)
+            logger.info("[PDF_FIRMAS] Salida _construir_seccion_firmantes_personalizados | firmas_agregadas=%s", len(nombres))
+            return resultado
+        except Exception as e:
+            logger.exception("[PDF_FIRMAS] Error _construir_seccion_firmantes_personalizados | error=%s", str(e))
+            return html_raw
+
     def _construir_tabla_pagos_cotizaciones(self, html_raw: str, folio: str, db: Session):
         logger.info("[PDF_COTIZACIONES] Entrada _construir_tabla_pagos_cotizaciones | folio=%s", folio)
         try:
@@ -304,6 +445,10 @@ class GenerarPDFUseCase:
         )
         return html_con_filas, totales
 
+#endregion
+
+#region Funciones auxiliares de obtención de plantillas y manejo de bucket
+
     def _obtener_plantillas_por_categoria(self, empresa_id: str, categoria: str):
         logger.info(
             "[PDF_GENERADOR] Entrada _obtener_plantillas_por_categoria | empresa=%s | categoria=%s",
@@ -389,7 +534,9 @@ class GenerarPDFUseCase:
             )
             raise HTTPException(status_code=500, detail=f"Error al subir PDF al bucket: {str(e)}")
 
-    #Logica principal de generación de PDF
+#endregion
+
+#region Logica principal de generación de PDF
 
     async def generar_pdf_por_categoria(self, empresa_id: str, categoria: str, folio: str, db: Session, subir_bucket: bool = False):
         logger.info(
@@ -549,7 +696,7 @@ class GenerarPDFUseCase:
             
             categoria_plantilla = fields.get("categoria", {}).get("stringValue", "")
 
-            if categoria_plantilla.tolower() == "cotizaciones":
+            if fields.get("categoria", {}).get("stringValue", "").strip().lower() == "cotizaciones":
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones desde ID")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)
@@ -735,7 +882,9 @@ class GenerarPDFUseCase:
                 )
                 raise HTTPException(status_code=500, detail=f"Error generando anexo {id_anexo} para folio {folio}: {str(e)}")
 
-    #Llamadas principales
+#endregion
+
+#region Llamadas principales
 
     async def generar_pdfs_desde_plantillas(self, empresa_id: str, ids_plantillas: Optional[List[str]], folio: str, db: Session, subir_bucket: bool = False):
         """Genera una lista de PDFs usando una lista de IDs de plantillas jurídicas."""
@@ -881,6 +1030,8 @@ class GenerarPDFUseCase:
                 )
                 raise HTTPException(status_code=500, detail=f"Error en generar_pdfs_desde_anexos (folio={folio}): {str(e)}")
 
+#endregion
+
 class GenerarPDFDinamico(GenerarPDFUseCase):
     async def generar_pdf_por_id_plantilla(self, empresa_id: str, id_plantilla: str, folio: str, coleccion: str, db: Session, subir_bucket: bool):
         """Genera una lista de PDFs usando una lista de IDs de plantillas jurídicas."""
@@ -963,6 +1114,15 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)
 
+            if fields.get("FirmantesEmpresa", {}).get("booleanValue", False) == True:
+                html_raw = self._construir_seccion_firmantes_empresa(html_raw, empresa_id, db)
+            elif fields.get("FirmasCoopropietarios", {}).get("booleanValue", False) == True:
+                html_raw = self._construir_seccion_firmantes_coopropietarios(html_raw, folio, db)
+            elif bool(fields.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])) and fields.get("FirmantesEmpresa", {}).get("booleanValue", False) == False:
+                html_raw = self._construir_seccion_firmantes_personalizados(html_raw, fields, db)
+            else:
+                pass
+            
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
 
@@ -1050,10 +1210,15 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
             if subir_bucket:
                 categoria = fields.get("categoria", {}).get("stringValue", "general")
                 subcategorianexo = fields.get("subcategorianexo", {}).get("stringValue", "general")
+
                 if coleccion == "DocumentosDinamicos":
-                    ruta = f"Komunah/Documentos/Completos/{self._normalizar_fragmento(categoria)}/{self._normalizar_fragmento(cliente)}"
+                    if fields.get("tieneAnexos", {}).get("booleanValue", False) == True:
+                        ruta = f"Komunah/Documentos/Completos/{self._normalizar_fragmento(categoria)}/{self._normalizar_fragmento(cliente)}"
+                    else:
+                        ruta = f"Komunah/Documentos/UnoSolo/{self._normalizar_fragmento(categoria)}/{self._normalizar_fragmento(cliente)}"
                 else:
                     ruta = f"Komunah/Documentos/Anexos/{self._normalizar_fragmento(subcategorianexo)}/{self._normalizar_fragmento(cliente)}"
+
                 respuesta["url_descarga"] = self._subir_pdf_a_bucket(pdf_final_bytes, ruta, nombre_pdf)
             respuesta.pop("content", None)
             return respuesta
@@ -1117,6 +1282,15 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)
+
+            if fields.get("FirmantesEmpresa", {}).get("booleanValue", False) == True:
+                html_raw = self._construir_seccion_firmantes_empresa(html_raw, empresa_id, db)
+            elif fields.get("FirmasCoopropietarios", {}).get("booleanValue", False) == True:
+                html_raw = self._construir_seccion_firmantes_coopropietarios(html_raw, folio, db)
+            elif bool(fields.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])) and fields.get("FirmantesEmpresa", {}).get("booleanValue", False) == False:
+                html_raw = self._construir_seccion_firmantes_personalizados(html_raw, fields, db)
+            else:
+                pass
 
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML para anexo")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)   
