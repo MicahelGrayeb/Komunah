@@ -139,9 +139,11 @@ app.add_middleware(
 ) 
 
 def tarea_diaria_notificaciones():  
-    """Lógica distribuida: El ganador ejecuta, los clones reportan en su consola."""
+    """Lógica distribuida con lock atómico: Solo UN Cloud Run ejecuta, los demás observan."""
     import asyncio
     import time as _time
+    from google.cloud import firestore as firestore_lib
+
     db = SessionLocal()
     try:
         repo = FirebaseRepository()
@@ -150,21 +152,72 @@ def tarea_diaria_notificaciones():
         lock_id = f"{hoy_str}_{config['hora']}_{config['minuto']}"
         lock_ref = repo.db.collection("empresas").document("komunah").collection("configuracion").document("lock_cron")
         
-        doc = lock_ref.get()
-        
+        # ══════════════════════════════════════════════════════
+        # LOCK ATÓMICO: Transacción de Firestore
+        # Garantiza que solo UNA instancia gane, sin importar
+        # cuántas lean el lock al mismo tiempo.
+        # ══════════════════════════════════════════════════════
+        LOCK_TIMEOUT_SECONDS = 900  # 15 minutos
+
+        @firestore_lib.transactional
+        def intentar_tomar_lock(transaction):
+            ahora = datetime.now(ZoneInfo("America/Mexico_City"))
+            snapshot = lock_ref.get(transaction=transaction)
+            
+            if snapshot.exists:
+                data = snapshot.to_dict()
+                
+                if data.get("last_run_id") == lock_id:
+                    state = data.get("state", "")
+                    ts = data.get("timestamp", "")
+                    
+                    # Si está RUNNING, verificar si el lock está muerto (timeout)
+                    if state == "RUNNING" and ts:
+                        try:
+                            lock_time = datetime.fromisoformat(ts)
+                            if lock_time.tzinfo is None:
+                                lock_time = lock_time.replace(tzinfo=ZoneInfo("America/Mexico_City"))
+                            elapsed = (ahora - lock_time).total_seconds()
+                            if elapsed > LOCK_TIMEOUT_SECONDS:
+                                logger.warning(f"⏰ Lock expirado ({elapsed:.0f}s). Reclamando control...")
+                                transaction.set(lock_ref, {
+                                    "last_run_id": lock_id,
+                                    "state": "RUNNING",
+                                    "current_log": f"Reclamado tras timeout de {elapsed:.0f}s",
+                                    "timestamp": ahora.isoformat()
+                                })
+                                return "GANADOR"
+                        except Exception as e:
+                            logger.error(f"⚠️ Error verificando timeout del lock: {e}")
+                    
+                    # Lock existe para esta ejecución y está activo o terminado → ESPEJO
+                    return "ESPEJO"
+            
+            # No hay lock o es de otra ejecución → TOMAR
+            transaction.set(lock_ref, {
+                "last_run_id": lock_id,
+                "state": "RUNNING",
+                "current_log": "Iniciando proceso...",
+                "timestamp": ahora.isoformat()
+            })
+            return "GANADOR"
+
+        transaction = repo.db.transaction()
+        resultado_lock = intentar_tomar_lock(transaction)
+
         # --- MODO ESPEJO (Para los otros clones) ---
-        if doc.exists and doc.to_dict().get("last_run_id") == lock_id:
+        if resultado_lock == "ESPEJO":
             logger.info(f"🔗 [CLONE_SYNC] Vinculado a ejecución activa: {lock_id}")
             
             last_msg = ""
-            while True:
+            timeout_espejo = _time.time() + LOCK_TIMEOUT_SECONDS
+            while _time.time() < timeout_espejo:
                 status_doc = lock_ref.get()
                 if not status_doc.exists: break
                 status = status_doc.to_dict()
                 state = status.get("state")
                 msg = status.get("current_log", "")
                 
-                # Solo imprimimos en consola si el ganador escribió algo nuevo
                 if msg != last_msg:
                     logger.info(f"📡 [REMOTE_LOG]: {msg}")
                     last_msg = msg
@@ -172,17 +225,10 @@ def tarea_diaria_notificaciones():
                 if state in ["COMPLETED", "FAILED"]:
                     logger.info(f"✅ [CLONE_SYNC] Ejecución finalizada. Cerrando log espejo.")
                     break
-                _time.sleep(2) # Revisa la pizarra cada 2 segundos
+                _time.sleep(2)
             return
 
         # --- MODO GANADOR (El que hace la chamba) ---
-        lock_ref.set({
-            "last_run_id": lock_id,
-            "state": "RUNNING",
-            "current_log": "Iniciando proceso...",
-            "timestamp": datetime.now(ZoneInfo("America/Mexico_City")).isoformat()
-        }, merge=True)
-
         logger.info(f"🔥 [MASTER] Tomando control de la ejecución: {lock_id}")
         gateway = NotificationGateway()
         use_case = NotificationUseCase(repo, gateway)

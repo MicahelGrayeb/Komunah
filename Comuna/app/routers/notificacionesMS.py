@@ -1,4 +1,4 @@
-﻿import os
+import os
 import requests
 import re
 import base64
@@ -1094,6 +1094,7 @@ class NotificationUseCase:
         pdf_service = GenerarPDFUseCase(self.repo)
 
         for idx, row in enumerate(registros, 1):
+          try:
             broadcast_log(f"PROCESSING: Folio {row} ({idx}/{len(registros)})")
             data_sql = extraer_datos(row, db)
 
@@ -1254,6 +1255,11 @@ class NotificationUseCase:
                     resultado_envio["wa"] = res_wa_status
 
                 reporte_detallado.append(resultado_envio)
+
+          except Exception as e_folio:
+            broadcast_log(f"ERROR_FOLIO: Folio {row} falló con excepción: {str(e_folio)}")
+            self.repo.registrar_log_falla(empresa_id, f"Folio {row}: excepción no esperada: {str(e_folio)}", "FOLIO_EXCEPTION")
+            continue
 
 
         return {
