@@ -687,6 +687,7 @@ class FirebaseRepository:
         
         if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
         if p.puesto: fields["puesto"] = {"stringValue": p.puesto}; mask.append("puesto")
+        if p.departamento: fields["departamento"] = {"stringValue": p.departamento}; mask.append("departamento")
         if p.email: fields["email"] = {"stringValue": p.email}; mask.append("email")
         if p.activo is not None: fields["activo"] = {"booleanValue": bool(p.activo)}; mask.append("activo")
         
@@ -703,7 +704,8 @@ class FirebaseRepository:
         doc = self.obtener_un_doc_completo_firmantes_empresa(empresa_id, doc_id)
         if not doc: return {doc_id: "N/A"}
         nombre = doc.get("fields", {}).get("nombre", {}).get("stringValue", "N/A")
-        return {doc_id: nombre}
+        departamento = doc.get("fields", {}).get("departamento", {}).get("stringValue", "N/A")
+        return {doc_id: nombre, "departamento": departamento}
 
     def _get_firmantes_empresa_mapping_multiple(self, empresa_id: str, ids: List[str]):
         """Busca varios IDs y devuelve un diccionario {ID: Nombre}."""
@@ -3024,6 +3026,7 @@ def listar_firmantes_empresa(empresa_id: str, user: dict = Depends(es_usuario)):
             "id": d["name"].split("/")[-1],
             "nombre": f.get("nombre", {}).get("stringValue", ""),
             "puesto": f.get("puesto", {}).get("stringValue", ""),
+            "departamento": f.get("departamento", {}).get("stringValue", ""),
             "email": f.get("email", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False)
         })
@@ -3039,8 +3042,9 @@ def agregar_firmante_empresa(empresa_id: str, datos_json: Optional[FirmantesEmpr
         "id": {"stringValue": nombre_id},
         "nombre": {"stringValue": datos_json.nombre},
         "puesto": {"stringValue": datos_json.puesto},
+        "departamento": {"stringValue": datos_json.departamento},
         "email": {"stringValue": datos_json.email},
-        "activo": {"booleanValue": True}
+        "activo": {"booleanValue": False}
         }
     }
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)

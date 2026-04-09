@@ -597,11 +597,13 @@ class AnexosUpdate(BaseModel):
 class FirmantesEmpresaBase(BaseModel):
     nombre: str
     puesto: str
+    departamento: Optional[str] = None
     email: str
 
 class FirmantesEmpresaUpdate(BaseModel):
     nombre: Optional[str] = None
     puesto: Optional[str] = None
+    departamento: Optional[str] = None
     email: Optional[str] = None
     activo: Optional[bool] = None
 
