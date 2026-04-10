@@ -526,7 +526,7 @@ class FirebaseRepository:
                 continue 
             mask.append(key)
             # 1. Tipos Booleanos
-            if key in ["activo", "static", "tieneAnexos", "FirmantesEmpresa", "FirmasCoopropietarios"]:
+            if key in ["activo", "static", "tieneAnexos", "FirmantesEmpresa", "FirmasCoopropietarios", "HojaMembretadaProyecto"]:
                 fields[key] = {"booleanValue": bool(value)}
             # 2. Listas (como los tags)
             elif key in ["tags", "FirmantesPersonalizados"]:
@@ -605,16 +605,24 @@ class FirebaseRepository:
     def actualizar_plantilla_anexos(self, empresa_id: str, doc_id: str, p: Any):
         fields = {}
         mask = []
-        
+
         if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
         if p.contenido: fields["contenido"] = {"stringValue": p.contenido}; mask.append("contenido")
         if p.categoria: fields["categoria"] = {"stringValue": p.categoria}; mask.append("categoria")
         if p.subcategorianexo: fields["subcategorianexo"] = {"stringValue": p.subcategorianexo}; mask.append("subcategorianexo")
-        
+
+        if p.encabezado is not None:
+            fields["encabezado"] = {"stringValue": p.encabezado}
+            mask.append("encabezado")
+
+        if p.footer is not None:
+            fields["footer"] = {"stringValue": p.footer}
+            mask.append("footer")
+
         if p.FirmantesEmpresa is not None:
             fields["FirmantesEmpresa"] = {"booleanValue": bool(p.FirmantesEmpresa)}
             mask.append("FirmantesEmpresa")
-        
+
         if p.FirmasCoopropietarios is not None:
             fields["FirmasCoopropietarios"] = {"booleanValue": bool(p.FirmasCoopropietarios)}
             mask.append("FirmasCoopropietarios")
@@ -623,6 +631,10 @@ class FirebaseRepository:
             fields["FirmantesPersonalizados"] = {"arrayValue": {"values": [{"stringValue": str(t)} for t in p.FirmantesPersonalizados]}}
             mask.append("FirmantesPersonalizados")
 
+        if hasattr(p, 'HojaMembretadaProyecto') and p.HojaMembretadaProyecto is not None:
+            fields["HojaMembretadaProyecto"] = {"booleanValue": bool(p.HojaMembretadaProyecto)}
+            mask.append("HojaMembretadaProyecto")
+
         if hasattr(p, 'tamanoDocumento') and p.tamanoDocumento:
             fields["tamanoDocumento"] = {"stringValue": p.tamanoDocumento}
             mask.append("tamanoDocumento")
@@ -630,12 +642,12 @@ class FirebaseRepository:
         if hasattr(p, 'tags') and p.tags is not None:
             fields["tags"] = {"arrayValue": {"values": [{"stringValue": t} for t in p.tags]}}
             mask.append("tags")
-        
+
         if not mask: return None
-        
+
         query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}?{query_params}"
-        
+
         return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
 
     def _get_anexo_mapping_single(self, empresa_id: str, doc_id: str):
@@ -1513,6 +1525,7 @@ class UtilsNotifications:
         datos_modelo=None,
         datos_json: Optional[str] = None,
         archivos: Optional[List[UploadFile]] = None,
+        archivos_membretado: Optional[List[UploadFile]] = None,
         allow_empty_payload: bool = False,
     ):
         if datos_json:
@@ -1542,7 +1555,20 @@ class UtilsNotifications:
                         "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
                     }
 
-        return payload, archivos_map, archivos_meta
+        ImagenMembretada_map = {}
+        ImagenMembretada_meta = {}
+        if archivos_membretado:
+            for f in archivos_membretado:
+                if f and f.filename:
+                    contenido = await f.read()
+                    ImagenMembretada_map[f.filename] = base64.b64encode(contenido).decode("utf-8")
+                    mime_type = f.content_type or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
+                    ImagenMembretada_meta[f.filename] = {
+                        "mime_type": mime_type,
+                        "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
+                    }
+
+        return payload, archivos_map, archivos_meta, ImagenMembretada_map, ImagenMembretada_meta
 
     @staticmethod
     def _obtener_adjuntos_archivos_subidos(fields: dict) -> List[dict]:
@@ -2690,6 +2716,7 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_usuario)):
             "FirmantesEmpresa": f.get("FirmantesEmpresa", {}).get("booleanValue", False),
             "FirmasCoopropietarios": f.get("FirmasCoopropietarios", {}).get("booleanValue", False),
             "FirmantesPersonalizados": [v.get("stringValue") for v in f.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])],
+            "HojaMembretadaProyecto": f.get("HojaMembretadaProyecto", {}).get("booleanValue", False),
             "activo": f.get("activo", {}).get("booleanValue", False),
             "static": f.get("static", {}).get("booleanValue", False),
             "tieneAnexos": f.get("tieneAnexos", {}).get("booleanValue", False),
@@ -2698,6 +2725,8 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_usuario)):
             },
             "tags": [v.get("stringValue") for v in f.get("tags", {}).get("arrayValue", {}).get("values", [])],
             "html": f.get("html", {}).get("stringValue", ""),
+            "encabezado": f.get("encabezado", {}).get("stringValue", ""),
+            "footer": f.get("footer", {}).get("stringValue", ""),
             "archivos_subidos": {
                 k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()
             },
@@ -2706,18 +2735,28 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_usuario)):
                     meta_key: meta_val.get("stringValue")
                     for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
                 }                for k, info in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            "ImagenMembretada": {
+                k: v.get("stringValue") for k, v in f.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            "ImagenMembretada_meta": {
+                k: {
+                    meta_key: meta_val.get("stringValue")
+                    for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
+                }                for k, info in f.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
             }
         })
     return resultado
 
 @router_documento.post("/Crear", status_code=201)
-async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
+async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), archivos_membretado: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
     # 1. Obtenemos los datos del normalizador
-    data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+    data_obj, archivos_map, archivos_meta, archivos_map_membretado, archivos_meta_membretado= await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=DocumentosDinamicosBase,
         datos_modelo=None,
         datos_json=datos_json,
         archivos=archivos,
+        archivos_membretado=archivos_membretado
     )
     
     if hasattr(data_obj, "model_dump"):
@@ -2760,6 +2799,7 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
                     "values": [{"stringValue": v} for v in data.get("FirmantesPersonalizados", [])]
                 }
             },
+            "HojaMembretadaProyecto": {"booleanValue": bool(data.get("HojaMembretadaProyecto", False))},
             "activo": {"booleanValue": bool(data.get("activo", False))},
             "static": {"booleanValue": False},
             "anexos": anexos_firestore,
@@ -2769,7 +2809,9 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
                     "values": [{"stringValue": t} for t in data.get("tags", [])]
                 }
             },
-            "html": {"stringValue": data.get("html", "")}
+            "encabezado": {"stringValue": data.get("encabezado", "") or ""},
+            "html": {"stringValue": data.get("html", "")},
+            "footer": {"stringValue": data.get("footer", "") or ""},
         }
     }
 
@@ -2793,6 +2835,27 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
                 }
             }
         }
+
+    if archivos_map_membretado:
+        payload["fields"]["ImagenMembretada"] = {
+            "mapValue": {
+                "fields": {k: {"stringValue": v} for k, v in archivos_map_membretado.items()}
+            }
+        }
+        payload["fields"]["ImagenMembretada_meta"] = {
+            "mapValue": {
+                "fields": {
+                    k: {
+                        "mapValue": {
+                            "fields": {
+                                "mime_type": {"stringValue": v["mime_type"]},
+                                "tipo_visual": {"stringValue": v["tipo_visual"]},
+                            }
+                        }
+                    } for k, v in archivos_meta_membretado.items()
+                }
+            }
+        }
     
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     if r.status_code == 200 and data.get("activo"):
@@ -2801,13 +2864,14 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
     return {"status": "creada", "id": nombre_id}
 
 @router_documento.patch("/Actualizar")
-async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
+async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), archivos_membretado: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
     # 1. Normalizar datos
-    data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+    data_obj, archivos_map, archivos_meta, archivos_map_membretado, archivos_meta_membretado= await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=DocumentosDinamicosUpdate,
         datos_modelo=None,
         datos_json=datos_json,
         archivos=archivos,
+        archivos_membretado=archivos_membretado
     )
     
     # 2. CONVERSIÓN CRÍTICA: Convertir objeto Pydantic a Diccionario
@@ -2818,6 +2882,9 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
     # 3. Actualizar datos principales
     res = repo.actualizar_plantilla_documentos(empresa_id, doc_id, data_obj)
     
+    #region 4 y 5: Procesar archivos adjuntos y hoja membretada
+
+    # 4. Procesar archivos si existen
     archivos_viejos = data.get("archivos_subidos", {})
     meta_vieja = data.get("archivos_subidos_meta", {})
 
@@ -2825,7 +2892,6 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
     archivos_finales = {**archivos_viejos, **archivos_map}
     meta_final = {**meta_vieja, **archivos_meta}
 
-    # 4. Procesar archivos si existen
     if archivos_finales:
         url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
         payload_files = {
@@ -2868,17 +2934,60 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
         if res_files.status_code != 200:
             raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos: {res_files.text}")
 
-    # 5. Lógica de activación única
-    if res and res.status_code == 200:
-        # Usamos .get() de forma segura sobre el diccionario 'data'
-        if data.get("activo") is True:
-            doc = repo.obtener_un_doc_completo_documentos(empresa_id, doc_id)
-            # Firestore devuelve una estructura compleja, accedemos con cuidado
-            fields = doc.get("fields", {})
-            cat = fields.get("categoria", {}).get("stringValue")
-            if cat:
-                TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_juridico")
+    # 5. Procesar hoja membretada si existen
+    ImagenMembretada_vieja = data.get("ImagenMembretada", {})
+    metaMembretada_vieja = data.get("ImagenMembretada_meta", {})
+
+    # Unimos (los nuevos sobreescriben si tienen el mismo nombre)
+    Membretada_final = {**ImagenMembretada_vieja, **archivos_map_membretado}
+    Membretada_meta_final = {**metaMembretada_vieja, **archivos_meta_membretado}
+
+    if Membretada_final:
+        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
+        payload_files = {
+            "fields": {
+                "ImagenMembretada": {
+                    "mapValue": {
+                        "fields": {k: {"stringValue": v} for k, v in Membretada_final.items()}
+                    }
+                },
+                "ImagenMembretada_meta": {
+                    "mapValue": {
+                        "fields": {
+                            k: {
+                                "mapValue": {
+                                    "fields": {
+                                        "mime_type": {"stringValue": v["mime_type"]},
+                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
+                                    }
+                                }
+                            } for k, v in Membretada_meta_final.items()
+                        }
+                    }
+                }
+            }
+        }
         
+        # Corregimos la updateMask para incluir AMBOS campos
+        params = [
+            ("updateMask.fieldPaths", "ImagenMembretada"),
+            ("updateMask.fieldPaths", "ImagenMembretada_meta")
+        ]
+        
+        res_files = requests.patch(
+            url,
+            json=payload_files,
+            params=params,
+            headers=repo.headers,
+            timeout=10,
+        )
+        if res_files.status_code != 200:
+            raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos: {res_files.text}")
+
+    #endregion
+
+    # 6. Lógica de activación única
+    if res and res.status_code == 200:
         return {"status": "actualizada", "id": doc_id}
     
     raise HTTPException(status_code=res.status_code if res else 500, detail="No se pudo actualizar en Firestore")
@@ -2934,50 +3043,152 @@ def listar_anexos(empresa_id: str, user: dict = Depends(es_usuario)):
             "FirmantesEmpresa": f.get("FirmantesEmpresa", {}).get("booleanValue", False),
             "FirmasCoopropietarios": f.get("FirmasCoopropietarios", {}).get("booleanValue", False),
             "FirmantesPersonalizados": [v.get("stringValue") for v in f.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])],
+            "HojaMembretadaProyecto": f.get("HojaMembretadaProyecto", {}).get("booleanValue", False),
             "static": f.get("static", {}).get("booleanValue", False),
             "tags": [v.get("stringValue") for v in f.get("tags", {}).get("arrayValue", {}).get("values", [])],
-            "contenido": f.get("contenido", {}).get("stringValue", "")
+            "encabezado": f.get("encabezado", {}).get("stringValue", ""),
+            "contenido": f.get("contenido", {}).get("stringValue", ""),
+            "footer": f.get("footer", {}).get("stringValue", ""),
+            "ImagenMembretada": {
+                k: v.get("stringValue") for k, v in f.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            "ImagenMembretada_meta": {
+                k: {
+                    meta_key: meta_val.get("stringValue")
+                    for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
+                }                for k, info in f.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
+            }
         })
     return resultado
 
 @router_anexo.post("/Crear-anexo", status_code=201)
-def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[AnexosBase] = Body(default=None), user: dict = Depends(es_usuario)):
+async def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos_membretado: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
+    data_obj, _, _, archivos_map_membretado, archivos_meta_membretado = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=AnexosBase,
+        datos_modelo=None,
+        datos_json=datos_json,
+        archivos=None,
+        archivos_membretado=archivos_membretado
+    )
+
+    if hasattr(data_obj, "model_dump"):
+        data = data_obj.model_dump()
+    else:
+        data = data_obj.dict()
+
     repo = FirebaseRepository()
     nombre_id = repo.generar_siguiente_id_anexos(empresa_id)
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo?documentId={nombre_id}"
-    
+
     payload = {"fields": {
         "id": {"stringValue": nombre_id},
-        "nombre": {"stringValue": datos_json.nombre},
-        "categoria": {"stringValue": datos_json.categoria},
-        "subcategorianexo": {"stringValue": datos_json.subcategorianexo},
-        "contenido": {"stringValue": datos_json.contenido},
-        "FirmantesEmpresa": {"booleanValue": datos_json.FirmantesEmpresa},
-        "FirmasCoopropietarios": {"booleanValue": datos_json.FirmasCoopropietarios},
-        "FirmantesPersonalizados": {"arrayValue": {"values": [{"stringValue": v} for v in datos_json.FirmantesPersonalizados]}},
+        "nombre": {"stringValue": data.get("nombre", "")},
+        "categoria": {"stringValue": data.get("categoria", "")},
+        "subcategorianexo": {"stringValue": data.get("subcategorianexo", "")},
+        "contenido": {"stringValue": data.get("contenido", "")},
+        "encabezado": {"stringValue": data.get("encabezado", "") or ""},
+        "footer": {"stringValue": data.get("footer", "") or ""},
+        "HojaMembretadaProyecto": {"booleanValue": bool(data.get("HojaMembretadaProyecto", False))},
+        "FirmantesEmpresa": {"booleanValue": bool(data.get("FirmantesEmpresa", False))},
+        "FirmasCoopropietarios": {"booleanValue": bool(data.get("FirmasCoopropietarios", False))},
+        "FirmantesPersonalizados": {"arrayValue": {"values": [{"stringValue": v} for v in data.get("FirmantesPersonalizados", [])]}},
         "static": {"booleanValue": False},
-        "tamanoDocumento": {"stringValue": datos_json.tamanoDocumento},
-        "tags": {"arrayValue": {"values": [{"stringValue": t} for t in datos_json.tags]}}
+        "tamanoDocumento": {"stringValue": data.get("tamanoDocumento", "")},
+        "tags": {"arrayValue": {"values": [{"stringValue": t} for t in data.get("tags", [])]}}
         }
     }
+
+    if archivos_map_membretado:
+        payload["fields"]["ImagenMembretada"] = {
+            "mapValue": {
+                "fields": {k: {"stringValue": v} for k, v in archivos_map_membretado.items()}
+            }
+        }
+        payload["fields"]["ImagenMembretada_meta"] = {
+            "mapValue": {
+                "fields": {
+                    k: {
+                        "mapValue": {
+                            "fields": {
+                                "mime_type": {"stringValue": v["mime_type"]},
+                                "tipo_visual": {"stringValue": v["tipo_visual"]},
+                            }
+                        }
+                    } for k, v in archivos_meta_membretado.items()
+                }
+            }
+        }
+
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
-    if r.status_code == 200 and datos_json:
-        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, datos_json.categoria, "plantillas_anexo")
+    if r.status_code == 200 and data:
+        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, data.get("categoria"), "plantillas_anexo")
     return {"status": "Anexo creado", "id": nombre_id}
 
 @router_anexo.patch("/Actualizar-anexo")
-def actualizar_anexo(empresa_id: str, doc_id: str, datos_json: Optional[AnexosUpdate] = Body(default=None), user: dict = Depends(es_usuario)):
+async def actualizar_anexo(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos_membretado: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
+    data_obj, _, _, archivos_map_membretado, archivos_meta_membretado = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=AnexosUpdate,
+        datos_modelo=None,
+        datos_json=datos_json,
+        archivos=None,
+        archivos_membretado=archivos_membretado
+    )
+
+    data = data_obj.model_dump(exclude_unset=True) if hasattr(data_obj, "model_dump") else data_obj.dict(exclude_unset=True)
+
     repo = FirebaseRepository()
-    res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, datos_json)
-    
+    res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, data_obj)
+
+    ImagenMembretada_vieja = data.get("ImagenMembretada", {})
+    metaMembretada_vieja = data.get("ImagenMembretada_meta", {})
+
+    # Unimos (los nuevos sobreescriben si tienen el mismo nombre)
+    Membretada_final = {**ImagenMembretada_vieja, **archivos_map_membretado}
+    Membretada_meta_final = {**metaMembretada_vieja, **archivos_meta_membretado}
+
+    # Procesar ImagenMembretada si existen archivos
+    if Membretada_final:
+        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}"
+        payload_files = {
+            "fields": {
+                "ImagenMembretada": {
+                    "mapValue": {
+                        "fields": {k: {"stringValue": v} for k, v in Membretada_final.items()}
+                    }
+                },
+                "ImagenMembretada_meta": {
+                    "mapValue": {
+                        "fields": {
+                            k: {
+                                "mapValue": {
+                                    "fields": {
+                                        "mime_type": {"stringValue": v["mime_type"]},
+                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
+                                    }
+                                }
+                            } for k, v in Membretada_meta_final.items()
+                        }
+                    }
+                }
+            }
+        }
+        params = [
+            ("updateMask.fieldPaths", "ImagenMembretada"),
+            ("updateMask.fieldPaths", "ImagenMembretada_meta")
+        ]
+        res_files = requests.patch(
+            url,
+            json=payload_files,
+            params=params,
+            headers=repo.headers,
+            timeout=10,
+        )
+        if res_files.status_code != 200:
+            raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos membretado: {res_files.text}")
+
     if res and res.status_code == 200:
-        doc = repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
-        cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
-        if cat:
-                TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_anexo")
         return {"status": "Anexo actualizado", "id": doc_id}
-    
-    # Manejo de error por si falla la API de Google
+
     raise HTTPException(status_code=res.status_code, detail="No se pudo actualizar en Firestore")
 
 @router_anexo.delete("/Eliminar-anexo")

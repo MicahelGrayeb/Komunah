@@ -190,6 +190,24 @@ class GenerarPDFUseCase:
                 resultado.append(nombre_txt)
         return list(dict.fromkeys(resultado))
 
+    @staticmethod
+    def _inyectar_membretada_fondo(html: str, imagen_base64: str) -> str:
+        """Inyecta una imagen como fondo fijo con opacidad 40% en el HTML."""
+        if not html or not imagen_base64:
+            return html
+
+        # Crear div de fondo con la imagen en base64
+        fondo_html = f"""<div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background-image: url('data:image/png;base64,{imagen_base64}'); background-size: cover; background-attachment: fixed; opacity: 0.4; z-index: -1; pointer-events: none;"></div>"""
+
+        # Buscar el tag <body y insertar el div inmediatamente después
+        match = re.search(r"<body[^>]*>", html, re.IGNORECASE)
+        if match:
+            pos = match.end()
+            return html[:pos] + fondo_html + html[pos:]
+
+        # Si no hay <body>, inserta al inicio del HTML
+        return fondo_html + html
+
     def _construir_bloque_firmas_html(self, nombres: List[str], titulo: str) -> str:
         logger.info("[PDF_FIRMAS] Entrada _construir_bloque_firmas_html | titulo=%s | total_nombres=%s", titulo, len(nombres or []))
         if not nombres:
@@ -595,9 +613,38 @@ class GenerarPDFUseCase:
 
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas y generar PDF")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+            # Aplicar fondo membretada si está habilitada
+            hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
+            if hoja_membretada:
+                logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
+                imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                if imagen_map:
+                    # Obtener la primera imagen disponible
+                    primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
+                    if primera_imagen_b64:
+                        html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+
+            encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+            footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+            encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+            footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
             nombre_plantilla = fields.get("categoria", {}).get("stringValue", "documento")
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
             nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')} - {self._normalizar_fragmento(cliente, 'Cliente')}.pdf"
+
+            pdf_kwargs = {
+                "format": tamanoDocumento,
+                "print_background": True,
+                "prefer_css_page_size": True,
+                "scale": 1.0,
+                "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
+            }
+            if encabezado_final or footer_final:
+                pdf_kwargs["display_header_footer"] = True
+                pdf_kwargs["header_template"] = encabezado_final or "<span></span>"
+                pdf_kwargs["footer_template"] = footer_final or "<span></span>"
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -606,7 +653,7 @@ class GenerarPDFUseCase:
                 await page.emulate_media(media="screen")
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(format=tamanoDocumento, print_background=True)
+                pdf_bytes = await page.pdf(**pdf_kwargs)
                 await browser.close()
 
             respuesta = {
@@ -704,9 +751,38 @@ class GenerarPDFUseCase:
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
+            # Aplicar fondo membretada si está habilitada
+            hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
+            if hoja_membretada:
+                logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
+                imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                if imagen_map:
+                    # Obtener la primera imagen disponible
+                    primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
+                    if primera_imagen_b64:
+                        html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+
+            encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+            footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+            encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+            footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
             nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
             nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')}.pdf"
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+            pdf_kwargs = {
+                "format": tamanoDocumento,
+                "print_background": True,
+                "prefer_css_page_size": True,
+                "scale": 1.0,
+                "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
+            }
+            if encabezado_final or footer_final:
+                pdf_kwargs["display_header_footer"] = True
+                pdf_kwargs["header_template"] = encabezado_final or "<span></span>"
+                pdf_kwargs["footer_template"] = footer_final or "<span></span>"
+
             logger.info("[PDF_GENERADOR] Paso: render PDF con Playwright")
             async with async_playwright() as p:
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -715,7 +791,7 @@ class GenerarPDFUseCase:
                 await page.emulate_media(media="screen")
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(format=tamanoDocumento, print_background=True)
+                pdf_bytes = await page.pdf(**pdf_kwargs)
                 await browser.close()
 
             respuesta = {
@@ -819,13 +895,41 @@ class GenerarPDFUseCase:
                     logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
                     html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                     variables_html.update(totales)
-                
+
                 logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML para anexo")
-                html_final = self._reemplazar_etiquetas(html_raw, variables_html)   
+                html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+                # Aplicar fondo membretada si está habilitada
+                hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
+                if hoja_membretada:
+                    logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
+                    imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                    if imagen_map:
+                        # Obtener la primera imagen disponible
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
                 nombre_anexo = fields.get("nombre", {}).get("stringValue", "anexo")
                 nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, fallback='anexo')}.pdf"
                 tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+                encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+                footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+                encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+                footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
+                pdf_kwargs = {
+                    "format": tamano_documento,
+                    "print_background": True,
+                    "prefer_css_page_size": True,
+                    "scale": 1.0,
+                    "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
+                }
+                if encabezado_final or footer_final:
+                    pdf_kwargs["display_header_footer"] = True
+                    pdf_kwargs["header_template"] = encabezado_final or "<span></span>"
+                    pdf_kwargs["footer_template"] = footer_final or "<span></span>"
 
                 logger.info("[PDF_GENERADOR] Paso: render PDF de anexo con Playwright")
                 async with async_playwright() as p:
@@ -835,7 +939,7 @@ class GenerarPDFUseCase:
                     await page.emulate_media(media="screen")
                     await page.wait_for_load_state("networkidle")
                     await page.wait_for_timeout(400)
-                    pdf_bytes = await page.pdf(format=tamano_documento, print_background=True)
+                    pdf_bytes = await page.pdf(**pdf_kwargs)
                     await browser.close()
 
                 respuesta = {
@@ -1122,9 +1226,38 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 html_raw = self._construir_seccion_firmantes_personalizados(html_raw, fields, db)
             else:
                 pass
-            
+
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+            # Aplicar fondo membretada si está habilitada
+            hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
+            if hoja_membretada:
+                logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
+                imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                if imagen_map:
+                    # Obtener la primera imagen disponible
+                    primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
+                    if primera_imagen_b64:
+                        html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+
+            encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+            footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+            encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+            footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+            pdf_kwargs_principal = {
+                "format": tamanoDocumento,
+                "print_background": True,
+                "prefer_css_page_size": True,
+                "scale": 1.0,
+                "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
+            }
+            if encabezado_final or footer_final:
+                pdf_kwargs_principal["display_header_footer"] = True
+                pdf_kwargs_principal["header_template"] = encabezado_final or "<span></span>"
+                pdf_kwargs_principal["footer_template"] = footer_final or "<span></span>"
 
             # Iniciamos Playwright una sola vez para ser eficientes
             async with async_playwright() as p:
@@ -1135,13 +1268,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 # Render Principal
                 await page.set_content(html_final, wait_until="networkidle")
 
-                pdf_bytes_principal = await page.pdf(
-                    format=tamanoDocumento, 
-                    print_background=True, 
-                    prefer_css_page_size=True, 
-                    scale=1.0,
-                    margin={"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"}
-                )
+                pdf_bytes_principal = await page.pdf(**pdf_kwargs_principal)
 
                 merger = PdfWriter()
                 merger.append(io.BytesIO(pdf_bytes_principal))
@@ -1293,11 +1420,39 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 pass
 
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML para anexo")
-            html_final = self._reemplazar_etiquetas(html_raw, variables_html)   
+            html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+            # Aplicar fondo membretada si está habilitada
+            hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
+            if hoja_membretada:
+                logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
+                imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                if imagen_map:
+                    # Obtener la primera imagen disponible
+                    primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
+                    if primera_imagen_b64:
+                        html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
             nombre_anexo = fields.get("nombre", {}).get("stringValue", "anexo")
             nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, fallback='anexo')}.pdf"
             tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+            encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+            footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+            encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+            footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
+            pdf_kwargs_anexo = {
+                "format": tamano_documento,
+                "print_background": True,
+                "prefer_css_page_size": True,
+                "scale": 1.0,
+                "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
+            }
+            if encabezado_final or footer_final:
+                pdf_kwargs_anexo["display_header_footer"] = True
+                pdf_kwargs_anexo["header_template"] = encabezado_final or "<span></span>"
+                pdf_kwargs_anexo["footer_template"] = footer_final or "<span></span>"
 
             logger.info("[PDF_GENERADOR] Paso: render PDF de anexo con Playwright")
             async with async_playwright() as p:
@@ -1305,13 +1460,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                 page = await browser.new_page()
                 await page.emulate_media(media="screen")
                 await page.set_content(html_final, wait_until="networkidle")
-                pdf_bytes = await page.pdf(
-                    format=tamano_documento, 
-                    print_background=True, 
-                    prefer_css_page_size=True, 
-                    scale=1.0, 
-                    margin={"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"}
-                )
+                pdf_bytes = await page.pdf(**pdf_kwargs_anexo)
                 await browser.close()
 
             respuesta = {
