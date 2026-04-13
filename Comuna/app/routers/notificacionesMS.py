@@ -1010,9 +1010,8 @@ class StaticEmailFolioUseCase:
             if email in emails_enviados_folio: continue
             emails_enviados_folio.add(email)
 
-            cleaner = NotificationUseCase(self.repo, self.gateway)
-            asunto_listo = cleaner._limpiar(f_email.get("asunto", {}).get("stringValue", ""), data_sql, nombre, email, phone)
-            html_listo = cleaner._limpiar(f_email.get("html", {}).get("stringValue", ""), data_sql, nombre, email, phone)
+            asunto_listo = UtilsNotifications._limpiar(f_email.get("asunto", {}).get("stringValue", ""), data_sql, nombre, email, phone)
+            html_listo = UtilsNotifications._limpiar(f_email.get("html", {}).get("stringValue", ""), data_sql, nombre, email, phone)
 
 
             res = self.gateway.enviar_email({
@@ -1049,302 +1048,6 @@ class TemplateUseCase:
         res = repo.query_categoria(empresa_id, categoria)
         if not isinstance(res, list): return 0
         return len([item for item in res if "document" in item])
-
-class NotificationUseCase:
-    def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
-        self.repo = repo
-        self.gateway = gateway
-
-    async def ejecutar_barrido_automatico(self, empresa_id: str, dias: int, categoria: str, db: Session, tipo: str = "normal", simular: bool = False):
-        pack_empresa = PROVIDERS.get(empresa_id, {})
-        extraer_datos = pack_empresa.get("get")
-        if not extraer_datos:
-            self.repo.registrar_log_falla(empresa_id, f"Empresa '{empresa_id}' no configurada.", "CONFIG")
-            raise HTTPException(status_code=400, detail=f"Empresa '{empresa_id}' no configurada.")
-
-        config = self.repo.obtener_config_empresa(empresa_id)
-        sistema_email_ok = config.get("email")
-        sistema_wa_ok = config.get("whatsapp")
-
-        if not config.get("proyecto"):
-            self.repo.registrar_log_falla(empresa_id, f"Barrido cancelado: Proyecto desactivado en configuración global", "AUTO_BARRIDO")
-            return {"status": "off", "msj": "Proyecto desactivado"}
-
-        p_email_raw = UtilsNotifications._buscar_documento_plantilla(
-            self.repo,
-            empresa_id,
-            categoria,
-            "plantillas",
-        )
-        p_email = p_email_raw.get("fields", {}) if p_email_raw else None
-
-        p_wa_raw = UtilsNotifications._buscar_documento_plantilla(
-            self.repo,
-            empresa_id,
-            categoria,
-            "plantillas_whatsapp",
-        )
-        
-        if config.get("email") and not p_email:
-            self.repo.registrar_log_falla(empresa_id, f"Email activado pero no hay plantilla activa para '{categoria}'", "AUTO_BARRIDO")
-        
-        if config.get("whatsapp") and not p_wa_raw:
-            self.repo.registrar_log_falla(empresa_id, f"WhatsApp activado pero no hay plantilla activa para '{categoria}'", "AUTO_BARRIDO")
-            
-        p_wa = None
-        if p_wa_raw:
-            f_wa = p_wa_raw["fields"]
-            p_wa = {
-                "id_respond": f_wa.get("id_respond", {}).get("stringValue"),
-                "lenguaje": f_wa.get("lenguaje", {}).get("stringValue"),
-                "texto_base": f_wa.get("mensaje", {}).get("stringValue", ""),
-                "variables": [v.get("stringValue") for v in f_wa.get("variables", {}).get("arrayValue", {}).get("values", [])]
-            }
-        fecha_t = (datetime.now(ZoneInfo("America/Mexico_City")) + timedelta(days=dias)).strftime('%Y-%m-%d')
-        try:
-            if tipo == "deudores":
-                registros = pack_empresa.get("get_deudores")(db, fecha_t)
-            else:
-                registros = pack_empresa.get("get_pendientes")(db, fecha_t)
-        except Exception as e:
-            self.repo.registrar_log_falla(empresa_id, f"Error SQL: {str(e)}", "DATABASE")
-            raise
-        
-        reporte_detallado = []
-        pdf_service = GenerarPDFUseCase(self.repo)
-
-        for row in registros:
-            data_sql = extraer_datos(row, db)
-
-            if not data_sql:
-                self.repo.registrar_log_falla(empresa_id, f"El folio {row} no trajo info de SQL", "DATOS_SQL")
-                continue
-
-            if data_sql.get("{sys.etapa_activa}") == "0":
-                motivo = data_sql.get("{sys.bloqueo_motivo}", "Bloqueo por configuración de Etapa/Proyecto")
-                self.repo.registrar_log_falla(empresa_id, f"Folio {row} saltado: {motivo}", "BLOQUEO_ADMINISTRATIVO")
-                continue
-
-            # --- GENERACIÓN DE PDFs POR FOLIO (una sola vez por folio, no por integrante) ---
-
-            # PDFs para EMAIL: si la plantilla tiene documentos_adjuntos, los generamos dinámicamente
-            adjuntos_email_dinamicos = []
-            if p_email and sistema_email_ok:
-                hijos_email = p_email.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {})
-                if hijos_email:
-                    for doc_id in hijos_email.keys():
-                        try:
-                            pdf_gen = await pdf_service.generar_pdf_barrido_automatico(empresa_id, doc_id, str(row), db)
-                            adjuntos_email_dinamicos.append({"content": pdf_gen["content"], "filename": pdf_gen["filename"]})
-                        except Exception:
-                            self.repo.registrar_log_falla(empresa_id, f"Folio {row}: falló generación de PDF adjunto '{doc_id}' para email.", "PDF_GEN")
-                            continue
-                else:
-                    # Fallback: adjuntos por URL estáticos (comportamiento anterior)
-                    adjuntos_raw = p_email.get("adjuntos_url", {}).get("arrayValue", {}).get("values", [])
-                    for adj in adjuntos_raw:
-                        info_archivo = self._descargar_a_base64(adj.get("stringValue"))
-                        if info_archivo:
-                            adjuntos_email_dinamicos.append(info_archivo)
-
-                adjuntos_email_dinamicos.extend(UtilsNotifications._obtener_adjuntos_archivos_subidos(p_email))
-
-            # PDF para WHATSAPP: si la plantilla tiene documento_adjunto_id, lo generamos y subimos al bucket
-            link_wa_doc = None
-            nom_wa_doc = None
-            if p_wa_raw and sistema_wa_ok:
-                hijos_wa = p_wa_raw["fields"].get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {})
-                if hijos_wa:
-                    pid_wa = list(hijos_wa.keys())[0]
-                    try:
-                        pdf_wa = await pdf_service.generar_pdf_barrido_automatico(empresa_id, pid_wa, str(row), db)
-                        link_wa_doc = GenerarPDFUseCase._subir_pdf_a_bucket(
-                            base64.b64decode(pdf_wa["content"]),
-                            f"Komunah/AutoWA/{row}",
-                            pdf_wa["filename"]
-                        )
-                        nom_wa_doc = pdf_wa["filename"]
-                    except Exception:
-                        self.repo.registrar_log_falla(empresa_id, f"Folio {row}: falló generación de PDF para WhatsApp.", "PDF_GEN")
-
-                if not link_wa_doc:
-                    archivo_subido_wa = UtilsNotifications._obtener_primer_archivo_subido_como_link(
-                        p_wa_raw["fields"],
-                        f"Komunah/AutoWA/{row}",
-                    )
-                    if archivo_subido_wa:
-                        link_wa_doc = archivo_subido_wa.get("url_descarga")
-                        nom_wa_doc = archivo_subido_wa.get("filename")
-
-            emails_enviados_folio = set()
-            wa_enviados_folio = set()
-
-            for i in range(1, 7):
-                nombre = data_sql.get(f"{{c{i}.client_name}}")
-                if not nombre: continue
-                
-                email = data_sql.get(f"{{g{i}.email}}")
-                phone = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "").replace("-", "")
-                acepta_email_lote = str(data_sql.get(f"{{g{i}.permite_email_lote}}")) in ["1", "True"]
-                acepta_wa_lote = str(data_sql.get(f"{{g{i}.permite_whatsapp_lote}}")) in ["1", "True"]
-    
-                resultado_envio = {"cliente": nombre, "folio": row, "email": "n/a", "wa": "n/a"}
-                        
-                if not sistema_email_ok:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Switch Global OFF.", "GLOBAL_OFF")
-                    resultado_envio["email"] = "GLOBAL_OFF"
-                elif not p_email:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Sin plantilla activa.", "PLANTILLA_OFF")
-                    resultado_envio["email"] = "NO_TEMPLATE"
-                elif not acepta_email_lote:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Usuario apagó switch de lote {row}.", "USER_LOTE_OFF")
-                    resultado_envio["email"] = "LOTE_OFF"
-                elif not email:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: No tiene correo registrado.", "DATA_MISSING")
-                    resultado_envio["email"] = "NO_DATA"
-                elif email in emails_enviados_folio:
-                    resultado_envio["email"] = "DUPLICADO_EN_ESTE_FOLIO"
-                else:
-                    emails_enviados_folio.add(email)
-                    if simular:
-                        res_status = f"SIMULADO_OK ({len(adjuntos_email_dinamicos)} PDFs listos)"
-                    else:
-                        res_mail = self.gateway.enviar_email({
-                            "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": f"Notificaciones {empresa_id}"},
-                            "to": [{"email": email, "name": nombre}],
-                            "subject": self._limpiar(p_email["asunto"]["stringValue"], data_sql, nombre, email, phone),
-                            "html": self._limpiar(p_email["html"]["stringValue"], data_sql, nombre, email, phone),
-                            "attachments": adjuntos_email_dinamicos
-                        })
-                        if res_mail.status_code not in [200, 201, 202]:
-                            self.repo.registrar_log_falla(empresa_id, f"Email falló ({res_mail.status_code}) para {email}", "MAIL_PROVIDER")
-                        res_status = f"Status: {res_mail.status_code} | {res_mail.text[:100]}"
-                    
-                    resultado_envio["email"] = res_status
-
-                if not sistema_wa_ok:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Switch Global OFF en Firebase.", "GLOBAL_OFF")
-                    resultado_envio["wa"] = "GLOBAL_OFF"
-                elif not p_wa:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: No hay plantilla activa.", "PLANTILLA_OFF")
-                    resultado_envio["wa"] = "NO_TEMPLATE"
-                elif not acepta_wa_lote:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Lote bloqueado en SQL.", "USER_LOTE_OFF")
-                    resultado_envio["wa"] = "LOTE_OFF"
-                elif not phone:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Falta número de teléfono.", "DATA_MISSING")
-                    resultado_envio["wa"] = "NO_PHONE"
-                elif phone in wa_enviados_folio:
-                    resultado_envio["wa"] = "DUPLICADO_EN_ESTE_FOLIO"
-                else:
-                    wa_enviados_folio.add(phone)
-                    parametros_dinamicos = []
-                    for var_nombre in p_wa["variables"]:
-                        if var_nombre in ["{cl.cliente}", "{cliente}", "{v.cliente}"]:
-                            valor = nombre
-                        elif var_nombre == "{email_cliente}":
-                            valor = email
-                        elif var_nombre == "{telefono_cliente}": 
-                            valor = phone
-                        else:
-                            valor = data_sql.get(var_nombre, "N/A")
-                        parametros_dinamicos.append(valor)
-
-                    num_wa = phone if "+" in phone else f"+521{phone}"
-                    texto_completo = p_wa["texto_base"]
-                    for idx, v_nombre in enumerate(p_wa["variables"], 1):
-                        texto_completo = texto_completo.replace(v_nombre, f"{{{{{idx}}}}}")
-
-                    if simular:
-                        res_wa_status = f"SIMULADO_OK (PDF: {nom_wa_doc if nom_wa_doc else 'Sin adjunto'})"
-                    else:
-                        res_wa = self.gateway.enviar_whatsapp(
-                            num_wa, p_wa["id_respond"], p_wa["lenguaje"], parametros_dinamicos,
-                            texto_cuerpo=texto_completo,
-                            header_document_link=link_wa_doc,
-                            header_document_filename=nom_wa_doc
-                        )
-                        if res_wa.status_code not in [200, 201, 202]:
-                            self.repo.registrar_log_falla(empresa_id, f"WhatsApp falló ({res_wa.status_code}) para {phone}", "WA_PROVIDER")
-                        res_wa_status = f"Status: {res_wa.status_code}"
-                        
-                    resultado_envio["wa"] = res_wa_status
-
-                reporte_detallado.append(resultado_envio)
-
-
-        return {
-            "status": "proceso_finalizado",
-            "fecha_buscada": fecha_t,
-            "total_intentos": len(reporte_detallado),
-            "reporte": reporte_detallado,
-            "DEBUG": {
-                "plantilla_email_activa": p_email is not None,
-                "plantilla_wa_activa": p_wa is not None,
-                "config": config
-            }
-        }
-    
-    
-
-    def _limpiar(self, texto, vars, nombre, email_persona, tel_persona):
-        if not texto:
-            return texto
-
-        data = dict(vars or {})
-        # Soporte case-insensitive para etiquetas del HTML.
-        for k, v in list(data.items()):
-            data[str(k).lower()] = v
-
-        # Variables generales fijas del diccionario maestro.
-        data["{cliente}"] = nombre or data.get("{cliente}") or data.get("{cl.cliente}") or ""
-        data["{email_cliente}"] = str(email_persona or data.get("{email_cliente}") or data.get("{g1.email}") or "")
-        data["{telefono_cliente}"] = str(tel_persona or data.get("{telefono_cliente}") or data.get("{g1.telefono}") or "")
-
-        # 1. CAMBIO: Buscamos etiquetas de forma selectiva (solo Alfanuméricos y puntos)
-        regex_etiquetas = r"\{[a-zA-Z0-9_\.]+\}"
-        
-        etiquetas_en_texto = set(re.findall(regex_etiquetas, texto))
-        for tag in etiquetas_en_texto:
-            valor = data.get(tag)
-            if valor is None:
-                valor = data.get(tag.lower())
-            if valor is not None:
-                texto = texto.replace(tag, str(valor))
-
-        # 2. Verificación de pendientes (ya era específica, la dejamos igual o similar)
-        pendientes = set(re.findall(regex_etiquetas, texto))
-        conocidas_no_resueltas = [
-            t for t in pendientes
-            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
-        ]
-        
-        if conocidas_no_resueltas:
-            logger.info(
-                "[PDF] Etiquetas conocidas sin valor en _limpiar | total=%s | muestra=%s",
-                len(conocidas_no_resueltas),
-                conocidas_no_resueltas[:8],
-            )
-
-        # 3. CAMBIO CRÍTICO: Limpieza final selectiva. 
-        # Solo borra lo que parece una etiqueta de variable, ignorando bloques CSS.
-        return re.sub(regex_etiquetas, "", texto)
-
-    def _descargar_a_base64(self, url: str):
-        """Descarga un archivo de internet y lo convierte al formato que pide MailerSend."""
-        try:
-            import base64
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                nombre = url.split("/")[-1].split("?")[0]
-                return {
-                    "content": base64.b64encode(r.content).decode('utf-8'),
-                    "filename": nombre
-                }
-        except Exception as e:
-            print(f"Error descargando adjunto: {e}")
-            return None
-
 class StaticDualUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
         self.repo = repo
@@ -1388,7 +1091,6 @@ class StaticEmailClusterUseCase:
 
         reporte_global = []
         conteo = {"exitosos": 0, "bloqueados_sys": 0, "omitidos_user": 0, "excluidos_manual": 0}
-        procesador = NotificationUseCase(self.repo, self.gateway)
         ids_documentos = [str(doc_id).strip() for doc_id in (getattr(datos, "array_documentos", []) or []) if str(doc_id).strip()]
         logger.info("[CLUSTER] Documentos dinamicos solicitados=%s", len(ids_documentos))
 
@@ -1457,8 +1159,8 @@ class StaticEmailClusterUseCase:
                     continue
 
                 # Limpieza con tus etiquetas {cliente}, {cl.monto}, etc.
-                asunto_final = procesador._limpiar(datos.asunto, data_sql, nombre, email, phone)
-                html_final = procesador._limpiar(datos.contenido_html, data_sql, nombre, email, phone)
+                asunto_final = UtilsNotifications._limpiar(datos.asunto, data_sql, nombre, email, phone)
+                html_final = UtilsNotifications._limpiar(datos.contenido_html, data_sql, nombre, email, phone)
 
                 # Si es envío REAL y tiene permiso, armamos el objeto para la cola
                 if not datos.simular and permiso:
@@ -1519,6 +1221,51 @@ class StaticEmailClusterUseCase:
         return {"modo": "SIMULACION" if datos.simular else "REAL", "resumen": conteo, "detalles": reporte_global}
 
 class UtilsNotifications:
+    @staticmethod
+    def _limpiar(texto, vars, nombre, email_persona, tel_persona):
+        """Reemplaza etiquetas dinámicas en plantillas."""
+        if not texto:
+            return texto
+
+        data = dict(vars or {})
+        # Soporte case-insensitive para etiquetas del HTML.
+        for k, v in list(data.items()):
+            data[str(k).lower()] = v
+
+        # Variables generales fijas del diccionario maestro.
+        data["{cliente}"] = nombre or data.get("{cliente}") or data.get("{cl.cliente}") or ""
+        data["{email_cliente}"] = str(email_persona or data.get("{email_cliente}") or data.get("{g1.email}") or "")
+        data["{telefono_cliente}"] = str(tel_persona or data.get("{telefono_cliente}") or data.get("{g1.telefono}") or "")
+
+        # 1. CAMBIO: Buscamos etiquetas de forma selectiva (solo Alfanuméricos y puntos)
+        regex_etiquetas = r"\{[a-zA-Z0-9_\.]+\}"
+
+        etiquetas_en_texto = set(re.findall(regex_etiquetas, texto))
+        for tag in etiquetas_en_texto:
+            valor = data.get(tag)
+            if valor is None:
+                valor = data.get(tag.lower())
+            if valor is not None:
+                texto = texto.replace(tag, str(valor))
+
+        # 2. Verificación de pendientes (ya era específica, la dejamos igual o similar)
+        pendientes = set(re.findall(regex_etiquetas, texto))
+        conocidas_no_resueltas = [
+            t for t in pendientes
+            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
+        ]
+
+        if conocidas_no_resueltas:
+            logger.info(
+                "[PDF] Etiquetas conocidas sin valor en _limpiar | total=%s | muestra=%s",
+                len(conocidas_no_resueltas),
+                conocidas_no_resueltas[:8],
+            )
+
+        # 3. CAMBIO CRÍTICO: Limpieza final selectiva.
+        # Solo borra lo que parece una etiqueta de variable, ignorando bloques CSS.
+        return re.sub(regex_etiquetas, "", texto)
+
     @staticmethod
     async def _normalizar_payload_y_archivos(
         model_cls,
@@ -2111,26 +1858,6 @@ async def api_enviar_ambos_manual(
     
     return await use_case.ejecutar_envio_dual(empresa_id, datos_wa, datos, db)
 
-@router.post("/auto-notificar/{empresa_id}")
-async def api_disparar_barrido(
-    empresa_id: str, 
-    dias: int, 
-    categoria: str,  
-    tipo: str = "normal",
-    simular: bool = False,
-    db: Session = Depends(get_db),
-    user: dict = Depends(es_usuario)
-):
-    """
-    Barrido Automático Inteligente:
-    1. Busca folios por fecha.
-    2. Genera los PDFs vinculados dinámicamente desde Firebase (documentos_adjuntos / documento_adjunto_id).
-    3. Simula o Envía según el parámetro 'simular'.
-    """
-    repo = FirebaseRepository()
-    gateway = NotificationGateway()
-    use_case = NotificationUseCase(repo, gateway)
-    return await use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo, simular=simular)
 
 EJEMPLO_FINAL = {
     "clusters": ["Planta Baja", "Etapa 1"],
@@ -2836,28 +2563,48 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
             }
         }
 
+    r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"Error creando plantilla: {r.text}")
+
     if archivos_map_membretado:
-        payload["fields"]["ImagenMembretada"] = {
-            "mapValue": {
-                "fields": {k: {"stringValue": v} for k, v in archivos_map_membretado.items()}
-            }
-        }
-        payload["fields"]["ImagenMembretada_meta"] = {
-            "mapValue": {
-                "fields": {
-                    k: {
-                        "mapValue": {
-                            "fields": {
-                                "mime_type": {"stringValue": v["mime_type"]},
-                                "tipo_visual": {"stringValue": v["tipo_visual"]},
-                            }
+        url_doc = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{nombre_id}"
+        payload_membretado = {
+            "fields": {
+                "ImagenMembretada": {
+                    "mapValue": {
+                        "fields": {k: {"stringValue": v} for k, v in archivos_map_membretado.items()}
+                    }
+                },
+                "ImagenMembretada_meta": {
+                    "mapValue": {
+                        "fields": {
+                            k: {
+                                "mapValue": {
+                                    "fields": {
+                                        "mime_type": {"stringValue": v["mime_type"]},
+                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
+                                    }
+                                }
+                            } for k, v in archivos_meta_membretado.items()
                         }
-                    } for k, v in archivos_meta_membretado.items()
+                    }
                 }
             }
         }
-    
-    r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
+        res_membretado = requests.patch(
+            url_doc,
+            json=payload_membretado,
+            params=[
+                ("updateMask.fieldPaths", "ImagenMembretada"),
+                ("updateMask.fieldPaths", "ImagenMembretada_meta"),
+            ],
+            headers=repo.headers,
+            timeout=10,
+        )
+        if res_membretado.status_code != 200:
+            raise HTTPException(status_code=res_membretado.status_code, detail=f"Error subiendo imagen membretada: {res_membretado.text}")
+
     if r.status_code == 200 and data.get("activo"):
         TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, data.get("categoria"), "plantillas_juridico")
         
@@ -2969,15 +2716,11 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
         }
         
         # Corregimos la updateMask para incluir AMBOS campos
-        params = [
-            ("updateMask.fieldPaths", "ImagenMembretada"),
-            ("updateMask.fieldPaths", "ImagenMembretada_meta")
-        ]
-        
+        url_with_mask = f"{url}?updateMask.fieldPaths=ImagenMembretada&updateMask.fieldPaths=ImagenMembretada_meta"
+
         res_files = requests.patch(
-            url,
+            url_with_mask,
             json=payload_files,
-            params=params,
             headers=repo.headers,
             timeout=10,
         )

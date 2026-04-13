@@ -3,22 +3,17 @@ import uvicorn
 import firebase_admin
 from firebase_admin import credentials, firestore
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware  
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from .routers.notificacionesMS import NotificationUseCase, FirebaseRepository, NotificationGateway
-from .database import SessionLocal 
+from .database import SessionLocal
 import logging
-from zoneinfo import ZoneInfo
-from .services.sync_service import AutoSyncManager
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)    
+logger = logging.getLogger(__name__)
 
 
 load_dotenv()
-JOB_ID_BARRIDO = "barrido_automatico_diario"
 APP_MODE = os.getenv("APP_MODE", "FULL")
 
 from .routers import (
@@ -57,56 +52,6 @@ if not firebase_admin._apps:
     except Exception as e:
         print(f"⚠️ Advertencia: No se pudo iniciar Firebase: {e}")
 
-def sincronizar_horario_cron(scheduler_instancia):
-    """
-    Revisa Firebase cada 60 segundos. 
-    Solo reprograma si Firebase responde correctamente (ignora defaults).
-    """
-    def verificar_y_actualizar():
-        import time as _time_sync
-        inicio = _time_sync.time()
-        try:
-            logger.info("🕒 SYNC: Iniciando verificación de configuración en Firebase...")
-            repo = FirebaseRepository()
-            config = repo.obtener_config_recordatorios_seguro("komunah")
-            
-            duracion = _time_sync.time() - inicio
-            
-            # Si Firebase no respondió bien, NO reprogramar
-            if config is None:
-                logger.warning(f"⚠️ SYNC: Firebase no respondió tras {duracion:.2f}s, saltando verificación.")
-                return
-            
-            nueva_h = int(config["hora"])
-            nueva_m = int(config["minuto"])
-
-            job = scheduler_instancia.get_job(JOB_ID_BARRIDO)
-            if job:
-                hora_actual_str = str(job.trigger.fields[5])
-                min_actual_str = str(job.trigger.fields[6])
-
-                logger.info(f"🔍 SYNC: Cron actual={hora_actual_str}:{min_actual_str} | Firebase={nueva_h}:{nueva_m:02d} (t={duracion:.2f}s)")
-
-                if hora_actual_str != str(nueva_h) or min_actual_str != str(nueva_m):
-                    logger.info(f"🔄 SYNC: Cambio detectado en Firebase ({nueva_h}:{nueva_m:02d}). Ajustando Cron...")
-                    scheduler_instancia.reschedule_job(
-                        JOB_ID_BARRIDO, 
-                        trigger='cron', 
-                        hour=nueva_h, 
-                        minute=nueva_m
-                    )
-                    logger.info(f"✅ Cron reprogramado exitosamente a {nueva_h}:{nueva_m:02d}.")
-                else:
-                    logger.info(f"✅ SYNC: Sin cambios, horario correcto (t={duracion:.2f}s).")
-            else:
-                logger.warning(f"⚠️ SYNC: No se encontró el job '{JOB_ID_BARRIDO}' en el scheduler.")
-        except Exception as e:
-            duracion = _time_sync.time() - inicio
-            logger.error(f"❌ Error en sincronización tras {duracion:.2f}s: {e}")
-
-    scheduler_instancia.add_job(verificar_y_actualizar, 'interval', minutes=1, id="sync_config_job")
-
-        
 # --- CONFIGURACIÓN DE FASTAPI ---
 if APP_MODE == "NOTIFICACIONES":
     app = FastAPI(
@@ -137,90 +82,6 @@ app.add_middleware(
     allow_headers=["*"],
 ) 
 
-def _ejecutar_con_reintentos(loop, coro_func, label, max_intentos=3):
-    """Ejecuta una coroutine con reintentos ante errores de red."""
-    import time as _time
-    for intento in range(1, max_intentos + 1):
-        try:
-            resultado = loop.run_until_complete(coro_func())
-            logger.info(f"✅ {label} completado (intento {intento})")
-            return resultado
-        except Exception as e:
-            logger.warning(f"⚠️ {label} falló intento {intento}/{max_intentos}: {str(e)[:120]}")
-            if intento < max_intentos:
-                _time.sleep(5)
-            else:
-                logger.error(f"❌ {label} falló después de {max_intentos} intentos")
-    return None
-
-def tarea_diaria_notificaciones():  
-    """Lógica del Cron Job."""
-    import asyncio
-    db = SessionLocal()
-    try:
-        logger.info("⏰ Cron Job: Iniciando proceso de barrido automático...")
-        repo = FirebaseRepository()
-        gateway = NotificationGateway()
-        use_case = NotificationUseCase(repo, gateway)
-        
-        config = repo.obtener_config_recordatorios("komunah")
-        logger.info(f"📋 Config: dias_1={config['dias_1']}, dias_2={config['dias_2']}, hora={config['hora']}:{config['minuto']}")
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            _ejecutar_con_reintentos(loop, 
-                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago", db, "normal"),
-                "Barrido dias_1 normal")
-            _ejecutar_con_reintentos(loop, 
-                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_1"], "Recordatorio de Pago Vencido", db, "deudores"),
-                "Barrido dias_1 deudores")
-            _ejecutar_con_reintentos(loop, 
-                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago", db, "normal"),
-                "Barrido dias_2 normal")
-            _ejecutar_con_reintentos(loop, 
-                lambda: use_case.ejecutar_barrido_automatico("komunah", config["dias_2"], "Recordatorio de Pago Vencido", db, "deudores"),
-                "Barrido dias_2 deudores")
-        finally:
-            loop.close()
-            
-        logger.info("✅ Cron Job: Proceso finalizado con éxito.")
-    except Exception as e:
-        logger.error(f"❌ Error en el Cron Job: {str(e)}")
-    finally:
-        db.close()
-
-@app.on_event("startup")
-def iniciar_mantenimiento():
-    """Cron Job fijo: Se ejecuta todos los días a las 03:30 AM sin cambios."""
-    if APP_MODE in ["NOTIFICACIONES", "FULL"]:
-        logger.info("📡 Mantenimiento activado: Sincronización fija diaria a las 01:10")
-
-        
-@app.on_event("startup")
-def iniciar_scheduler():
-    if APP_MODE in ["NOTIFICACIONES", "FULL"]:
-        mx_tz = ZoneInfo("America/Mexico_City")
-        scheduler = BackgroundScheduler(timezone=mx_tz) 
-        
-        # 1. Carga inicial
-        repo = FirebaseRepository()
-        config = repo.obtener_config_recordatorios("komunah")
-        
-        # 2. Programar el Job principal
-        scheduler.add_job(
-            tarea_diaria_notificaciones, 
-            'cron', 
-            hour=config["hora"], 
-            minute=config["minuto"],
-            id=JOB_ID_BARRIDO
-        ) 
-        
-        # 3. Activar el verificador automático cada minuto (Polling)
-        sincronizar_horario_cron(scheduler)
-        
-        scheduler.start()
-        logger.info(f"🚀 Scheduler iniciado: Barrido configurado a las {config['hora']:02d}:{config['minuto']:02d}")
 
 @app.get("/")
 def home():
@@ -229,7 +90,6 @@ def home():
         "estado": "Online 🟢",
         "modo": "Túnel SSH & Firebase",
         "cors": "Abierto a todo el mundo 🌍",
-        "scheduler": "Activo ⏰" if APP_MODE in ["NOTIFICACIONES", "FULL"] else "Inactivo",
         "docs": "/docs"
     }
 
