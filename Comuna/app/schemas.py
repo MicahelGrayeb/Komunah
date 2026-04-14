@@ -539,6 +539,7 @@ class DocumentosDinamicosBase(BaseModel):
     FirmasCoopropietarios: Optional[bool] = None
     FirmantesPersonalizados: Optional[List[str]] = None
     HojaMembretadaProyecto: Optional[bool] = None
+    membrete_id: Optional[str] = None
 
 
 class DocumentosDinamicosUpdate(BaseModel):
@@ -559,8 +560,7 @@ class DocumentosDinamicosUpdate(BaseModel):
     FirmasCoopropietarios: Optional[bool] = None
     FirmantesPersonalizados: Optional[List[str]] = None
     HojaMembretadaProyecto: Optional[bool] = None
-    ImagenMembretada: Optional[Dict[str, str]] = None
-    ImagenMembretada_meta: Optional[Dict[str, Any]] = None
+    membrete_id: Optional[str] = None
 
 class AnexosBase(BaseModel):
     nombre: str
@@ -576,6 +576,7 @@ class AnexosBase(BaseModel):
     FirmasCoopropietarios: Optional[bool] = None
     FirmantesPersonalizados: Optional[List[str]] = None
     HojaMembretadaProyecto: Optional[bool] = None
+    membrete_id: Optional[str] = None
 
 class AnexosUpdate(BaseModel):
     nombre: str
@@ -591,8 +592,7 @@ class AnexosUpdate(BaseModel):
     FirmasCoopropietarios: Optional[bool] = None
     FirmantesPersonalizados: Optional[List[str]] = None
     HojaMembretadaProyecto: Optional[bool] = None
-    ImagenMembretada: Optional[Dict[str, str]] = None
-    ImagenMembretada_meta: Optional[Dict[str, Any]] = None
+    membrete_id: Optional[str] = None
 
 class FirmantesEmpresaBase(BaseModel):
     nombre: str
@@ -606,6 +606,16 @@ class FirmantesEmpresaUpdate(BaseModel):
     departamento: Optional[str] = None
     email: Optional[str] = None
     activo: Optional[bool] = None
+
+class MembreteParaHoja(BaseModel):
+    nombre: str
+    categoria: str
+
+class MembreteParaHojaUpdate(BaseModel):
+    nombre: Optional[str] = None
+    categoria: Optional[str] = None
+    ImagenMembretada: Optional[Dict[str, str]] = None
+    ImagenMembretada_meta: Optional[Dict[str, Any]] = None
 
 class ReporteExpedientesDetalladoResponse(BaseModel):
     folio: Any = Field(alias="FOLIO")
