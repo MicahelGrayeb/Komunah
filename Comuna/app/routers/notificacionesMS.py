@@ -11,7 +11,8 @@ from ..schemas import (
     WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, 
     RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, 
     DocumentosDinamicosBase, DocumentosDinamicosUpdate, AnexosBase, AnexosUpdate,
-    DocumentoDinamicoGeneracionSchema, FirmantesEmpresaBase, FirmantesEmpresaUpdate
+    DocumentoDinamicoGeneracionSchema, FirmantesEmpresaBase, FirmantesEmpresaUpdate,
+    MembreteParaHoja, MembreteParaHojaUpdate
 )
 from ..utils.datos_proveedores import (
     get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, 
@@ -41,6 +42,7 @@ router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas de Corre
 router_wa = APIRouter(prefix="/v1/plantillas-wa", tags=["CRUD Plantillas de WhatsApp"])
 router_documento = APIRouter(prefix="/v1/plantillas-documento", tags=["CRUD Plantillas de documentos dinamicos"])
 router_anexo = APIRouter(prefix="/v1/plantillas-anexo", tags=["CRUD Plantillas de anexos"])
+router_membrete = APIRouter(prefix="/v1/membrete-hoja", tags=["CRUD Membrete de Hoja"])
 router_firmantes_empresa = APIRouter(prefix="/v1/firmantes-empresa", tags=["CRUD Firmantes de empresa"])
 router_usuario = APIRouter(prefix="/v1/preferencias-usuario", tags=["Switches Clientes"])
 router_globales = APIRouter(prefix="/v1/configuracion-global", tags=["Configuración Global"])
@@ -635,6 +637,10 @@ class FirebaseRepository:
             fields["HojaMembretadaProyecto"] = {"booleanValue": bool(p.HojaMembretadaProyecto)}
             mask.append("HojaMembretadaProyecto")
 
+        if hasattr(p, 'membrete_id') and p.membrete_id is not None:
+            fields["membrete_id"] = {"stringValue": p.membrete_id}
+            mask.append("membrete_id")
+
         if hasattr(p, 'tamanoDocumento') and p.tamanoDocumento:
             fields["tamanoDocumento"] = {"stringValue": p.tamanoDocumento}
             mask.append("tamanoDocumento")
@@ -649,6 +655,56 @@ class FirebaseRepository:
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}?{query_params}"
 
         return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
+
+#endregion
+
+#region CRUD MEMBRETE DE HOJA
+
+    def listar_membretes(self, empresa_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/membrete_hoja"
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json().get("documents", []) if resp else []
+
+    def obtener_membrete(self, empresa_id: str, doc_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}"
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json() if resp else None
+
+    def generar_siguiente_id_membrete(self, empresa_id: str):
+        docs = self.listar_membretes(empresa_id)
+        prefijo = empresa_id[:2].upper()
+        max_num = 0
+        for d in docs:
+            id_doc = d["name"].split("/")[-1]
+            match = re.search(rf"{prefijo}-(\d+)", id_doc)
+            if match:
+                num = int(match.group(1))
+                if num > max_num:
+                    max_num = num
+        return f"{prefijo}-{str(max_num + 1).zfill(4)}"
+
+    def actualizar_membrete(self, empresa_id: str, doc_id: str, p: Any):
+        fields = {}
+        mask = []
+
+        if p.nombre is not None:
+            fields["nombre"] = {"stringValue": p.nombre}
+            mask.append("nombre")
+
+        if p.categoria is not None:
+            fields["categoria"] = {"stringValue": p.categoria}
+            mask.append("categoria")
+
+        if not mask:
+            return None
+
+        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
+        url = f"{self.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}?{query_params}"
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
+
+#endregion
+
+#region CRUD PLANTILLAS DE ANEXO (mapping helpers)
 
     def _get_anexo_mapping_single(self, empresa_id: str, doc_id: str):
         """Busca un solo ID en anexos y devuelve {ID: Nombre}."""
@@ -1272,7 +1328,6 @@ class UtilsNotifications:
         datos_modelo=None,
         datos_json: Optional[str] = None,
         archivos: Optional[List[UploadFile]] = None,
-        archivos_membretado: Optional[List[UploadFile]] = None,
         allow_empty_payload: bool = False,
     ):
         if datos_json:
@@ -1302,20 +1357,7 @@ class UtilsNotifications:
                         "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
                     }
 
-        ImagenMembretada_map = {}
-        ImagenMembretada_meta = {}
-        if archivos_membretado:
-            for f in archivos_membretado:
-                if f and f.filename:
-                    contenido = await f.read()
-                    ImagenMembretada_map[f.filename] = base64.b64encode(contenido).decode("utf-8")
-                    mime_type = f.content_type or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
-                    ImagenMembretada_meta[f.filename] = {
-                        "mime_type": mime_type,
-                        "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
-                    }
-
-        return payload, archivos_map, archivos_meta, ImagenMembretada_map, ImagenMembretada_meta
+        return payload, archivos_map, archivos_meta
 
     @staticmethod
     def _obtener_adjuntos_archivos_subidos(fields: dict) -> List[dict]:
@@ -2444,6 +2486,7 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_usuario)):
             "FirmasCoopropietarios": f.get("FirmasCoopropietarios", {}).get("booleanValue", False),
             "FirmantesPersonalizados": [v.get("stringValue") for v in f.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])],
             "HojaMembretadaProyecto": f.get("HojaMembretadaProyecto", {}).get("booleanValue", False),
+            "membrete_id": f.get("membrete_id", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False),
             "static": f.get("static", {}).get("booleanValue", False),
             "tieneAnexos": f.get("tieneAnexos", {}).get("booleanValue", False),
@@ -2463,27 +2506,17 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_usuario)):
                     for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
                 }                for k, info in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
             },
-            "ImagenMembretada": {
-                k: v.get("stringValue") for k, v in f.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
-            },
-            "ImagenMembretada_meta": {
-                k: {
-                    meta_key: meta_val.get("stringValue")
-                    for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
-                }                for k, info in f.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
-            }
         })
     return resultado
 
 @router_documento.post("/Crear", status_code=201)
-async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), archivos_membretado: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
+async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
     # 1. Obtenemos los datos del normalizador
-    data_obj, archivos_map, archivos_meta, archivos_map_membretado, archivos_meta_membretado= await UtilsNotifications._normalizar_payload_y_archivos(
+    data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=DocumentosDinamicosBase,
         datos_modelo=None,
         datos_json=datos_json,
         archivos=archivos,
-        archivos_membretado=archivos_membretado
     )
     
     if hasattr(data_obj, "model_dump"):
@@ -2527,6 +2560,7 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
                 }
             },
             "HojaMembretadaProyecto": {"booleanValue": bool(data.get("HojaMembretadaProyecto", False))},
+            "membrete_id": {"stringValue": data.get("membrete_id", "") or ""},
             "activo": {"booleanValue": bool(data.get("activo", False))},
             "static": {"booleanValue": False},
             "anexos": anexos_firestore,
@@ -2567,58 +2601,19 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
     if r.status_code != 200:
         raise HTTPException(status_code=r.status_code, detail=f"Error creando plantilla: {r.text}")
 
-    if archivos_map_membretado:
-        url_doc = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{nombre_id}"
-        payload_membretado = {
-            "fields": {
-                "ImagenMembretada": {
-                    "mapValue": {
-                        "fields": {k: {"stringValue": v} for k, v in archivos_map_membretado.items()}
-                    }
-                },
-                "ImagenMembretada_meta": {
-                    "mapValue": {
-                        "fields": {
-                            k: {
-                                "mapValue": {
-                                    "fields": {
-                                        "mime_type": {"stringValue": v["mime_type"]},
-                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
-                                    }
-                                }
-                            } for k, v in archivos_meta_membretado.items()
-                        }
-                    }
-                }
-            }
-        }
-        res_membretado = requests.patch(
-            url_doc,
-            json=payload_membretado,
-            params=[
-                ("updateMask.fieldPaths", "ImagenMembretada"),
-                ("updateMask.fieldPaths", "ImagenMembretada_meta"),
-            ],
-            headers=repo.headers,
-            timeout=10,
-        )
-        if res_membretado.status_code != 200:
-            raise HTTPException(status_code=res_membretado.status_code, detail=f"Error subiendo imagen membretada: {res_membretado.text}")
-
     if r.status_code == 200 and data.get("activo"):
         TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, data.get("categoria"), "plantillas_juridico")
         
     return {"status": "creada", "id": nombre_id}
 
 @router_documento.patch("/Actualizar")
-async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), archivos_membretado: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
+async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
     # 1. Normalizar datos
-    data_obj, archivos_map, archivos_meta, archivos_map_membretado, archivos_meta_membretado= await UtilsNotifications._normalizar_payload_y_archivos(
+    data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=DocumentosDinamicosUpdate,
         datos_modelo=None,
         datos_json=datos_json,
         archivos=archivos,
-        archivos_membretado=archivos_membretado
     )
     
     # 2. CONVERSIÓN CRÍTICA: Convertir objeto Pydantic a Diccionario
@@ -2675,52 +2670,6 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
             url,
             json=payload_files,
             params=params,
-            headers=repo.headers,
-            timeout=10,
-        )
-        if res_files.status_code != 200:
-            raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos: {res_files.text}")
-
-    # 5. Procesar hoja membretada si existen
-    ImagenMembretada_vieja = data.get("ImagenMembretada", {})
-    metaMembretada_vieja = data.get("ImagenMembretada_meta", {})
-
-    # Unimos (los nuevos sobreescriben si tienen el mismo nombre)
-    Membretada_final = {**ImagenMembretada_vieja, **archivos_map_membretado}
-    Membretada_meta_final = {**metaMembretada_vieja, **archivos_meta_membretado}
-
-    if Membretada_final:
-        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
-        payload_files = {
-            "fields": {
-                "ImagenMembretada": {
-                    "mapValue": {
-                        "fields": {k: {"stringValue": v} for k, v in Membretada_final.items()}
-                    }
-                },
-                "ImagenMembretada_meta": {
-                    "mapValue": {
-                        "fields": {
-                            k: {
-                                "mapValue": {
-                                    "fields": {
-                                        "mime_type": {"stringValue": v["mime_type"]},
-                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
-                                    }
-                                }
-                            } for k, v in Membretada_meta_final.items()
-                        }
-                    }
-                }
-            }
-        }
-        
-        # Corregimos la updateMask para incluir AMBOS campos
-        url_with_mask = f"{url}?updateMask.fieldPaths=ImagenMembretada&updateMask.fieldPaths=ImagenMembretada_meta"
-
-        res_files = requests.patch(
-            url_with_mask,
-            json=payload_files,
             headers=repo.headers,
             timeout=10,
         )
@@ -2787,31 +2736,22 @@ def listar_anexos(empresa_id: str, user: dict = Depends(es_usuario)):
             "FirmasCoopropietarios": f.get("FirmasCoopropietarios", {}).get("booleanValue", False),
             "FirmantesPersonalizados": [v.get("stringValue") for v in f.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])],
             "HojaMembretadaProyecto": f.get("HojaMembretadaProyecto", {}).get("booleanValue", False),
+            "membrete_id": f.get("membrete_id", {}).get("stringValue", ""),
             "static": f.get("static", {}).get("booleanValue", False),
             "tags": [v.get("stringValue") for v in f.get("tags", {}).get("arrayValue", {}).get("values", [])],
             "encabezado": f.get("encabezado", {}).get("stringValue", ""),
             "contenido": f.get("contenido", {}).get("stringValue", ""),
             "footer": f.get("footer", {}).get("stringValue", ""),
-            "ImagenMembretada": {
-                k: v.get("stringValue") for k, v in f.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
-            },
-            "ImagenMembretada_meta": {
-                k: {
-                    meta_key: meta_val.get("stringValue")
-                    for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
-                }                for k, info in f.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
-            }
         })
     return resultado
 
 @router_anexo.post("/Crear-anexo", status_code=201)
-async def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos_membretado: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
-    data_obj, _, _, archivos_map_membretado, archivos_meta_membretado = await UtilsNotifications._normalizar_payload_y_archivos(
+async def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[str] = Form(default=None), user: dict = Depends(es_usuario)):
+    data_obj, _, _ = await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=AnexosBase,
         datos_modelo=None,
         datos_json=datos_json,
         archivos=None,
-        archivos_membretado=archivos_membretado
     )
 
     if hasattr(data_obj, "model_dump"):
@@ -2832,6 +2772,7 @@ async def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[str] = For
         "encabezado": {"stringValue": data.get("encabezado", "") or ""},
         "footer": {"stringValue": data.get("footer", "") or ""},
         "HojaMembretadaProyecto": {"booleanValue": bool(data.get("HojaMembretadaProyecto", False))},
+        "membrete_id": {"stringValue": data.get("membrete_id", "") or ""},
         "FirmantesEmpresa": {"booleanValue": bool(data.get("FirmantesEmpresa", False))},
         "FirmasCoopropietarios": {"booleanValue": bool(data.get("FirmasCoopropietarios", False))},
         "FirmantesPersonalizados": {"arrayValue": {"values": [{"stringValue": v} for v in data.get("FirmantesPersonalizados", [])]}},
@@ -2841,93 +2782,22 @@ async def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[str] = For
         }
     }
 
-    if archivos_map_membretado:
-        payload["fields"]["ImagenMembretada"] = {
-            "mapValue": {
-                "fields": {k: {"stringValue": v} for k, v in archivos_map_membretado.items()}
-            }
-        }
-        payload["fields"]["ImagenMembretada_meta"] = {
-            "mapValue": {
-                "fields": {
-                    k: {
-                        "mapValue": {
-                            "fields": {
-                                "mime_type": {"stringValue": v["mime_type"]},
-                                "tipo_visual": {"stringValue": v["tipo_visual"]},
-                            }
-                        }
-                    } for k, v in archivos_meta_membretado.items()
-                }
-            }
-        }
-
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
     if r.status_code == 200 and data:
         TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, data.get("categoria"), "plantillas_anexo")
     return {"status": "Anexo creado", "id": nombre_id}
 
 @router_anexo.patch("/Actualizar-anexo")
-async def actualizar_anexo(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos_membretado: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
-    data_obj, _, _, archivos_map_membretado, archivos_meta_membretado = await UtilsNotifications._normalizar_payload_y_archivos(
+async def actualizar_anexo(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), user: dict = Depends(es_usuario)):
+    data_obj, _, _ = await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=AnexosUpdate,
         datos_modelo=None,
         datos_json=datos_json,
         archivos=None,
-        archivos_membretado=archivos_membretado
     )
-
-    data = data_obj.model_dump(exclude_unset=True) if hasattr(data_obj, "model_dump") else data_obj.dict(exclude_unset=True)
 
     repo = FirebaseRepository()
     res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, data_obj)
-
-    ImagenMembretada_vieja = data.get("ImagenMembretada", {})
-    metaMembretada_vieja = data.get("ImagenMembretada_meta", {})
-
-    # Unimos (los nuevos sobreescriben si tienen el mismo nombre)
-    Membretada_final = {**ImagenMembretada_vieja, **archivos_map_membretado}
-    Membretada_meta_final = {**metaMembretada_vieja, **archivos_meta_membretado}
-
-    # Procesar ImagenMembretada si existen archivos
-    if Membretada_final:
-        url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}"
-        payload_files = {
-            "fields": {
-                "ImagenMembretada": {
-                    "mapValue": {
-                        "fields": {k: {"stringValue": v} for k, v in Membretada_final.items()}
-                    }
-                },
-                "ImagenMembretada_meta": {
-                    "mapValue": {
-                        "fields": {
-                            k: {
-                                "mapValue": {
-                                    "fields": {
-                                        "mime_type": {"stringValue": v["mime_type"]},
-                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
-                                    }
-                                }
-                            } for k, v in Membretada_meta_final.items()
-                        }
-                    }
-                }
-            }
-        }
-        params = [
-            ("updateMask.fieldPaths", "ImagenMembretada"),
-            ("updateMask.fieldPaths", "ImagenMembretada_meta")
-        ]
-        res_files = requests.patch(
-            url,
-            json=payload_files,
-            params=params,
-            headers=repo.headers,
-            timeout=10,
-        )
-        if res_files.status_code != 200:
-            raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos membretado: {res_files.text}")
 
     if res and res.status_code == 200:
         return {"status": "Anexo actualizado", "id": doc_id}
@@ -2965,7 +2835,225 @@ async def api_generar_subir_anexo_dinamico(payload: DocumentoDinamicoGeneracionS
         subir_bucket=True,
     )
 
-#endregion 
+#endregion
+
+#region CRUD Membrete de Hoja
+
+@router_membrete.get("/Listar-membretes")
+def listar_membretes(empresa_id: str, user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    docs = repo.listar_membretes(empresa_id)
+    resultado = []
+    for d in docs:
+        f = d.get("fields", {})
+        resultado.append({
+            "id": d["name"].split("/")[-1],
+            "nombre": f.get("nombre", {}).get("stringValue", ""),
+            "categoria": f.get("categoria", {}).get("stringValue", ""),
+            "ImagenMembretada": {
+                k: v.get("stringValue")
+                for k, v in f.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            "ImagenMembretada_meta": {
+                k: {
+                    meta_key: meta_val.get("stringValue")
+                    for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
+                }
+                for k, info in f.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+        })
+    return resultado
+
+
+@router_membrete.get("/Obtener-membrete")
+def obtener_membrete(empresa_id: str, doc_id: str, user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    doc = repo.obtener_membrete(empresa_id, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Membrete no encontrado.")
+    f = doc.get("fields", {})
+    return {
+        "id": doc["name"].split("/")[-1],
+        "nombre": f.get("nombre", {}).get("stringValue", ""),
+        "categoria": f.get("categoria", {}).get("stringValue", ""),
+        "ImagenMembretada": {
+            k: v.get("stringValue")
+            for k, v in f.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
+        },
+        "ImagenMembretada_meta": {
+            k: {
+                meta_key: meta_val.get("stringValue")
+                for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
+            }
+            for k, info in f.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
+        },
+    }
+
+
+@router_membrete.post("/Subir-membrete", status_code=201)
+async def subir_membrete(
+    empresa_id: str,
+    datos_json: Optional[str] = Form(default=None),
+    archivos_membretado: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(es_usuario),
+):
+    if not datos_json:
+        raise HTTPException(status_code=400, detail="Debes enviar datos_json con los datos del membrete.")
+    try:
+        data_obj = MembreteParaHoja(**json.loads(datos_json))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"datos_json inválido: {str(exc)}") from exc
+
+    imagen_map = {}
+    imagen_meta = {}
+    if archivos_membretado:
+        for f in archivos_membretado:
+            if f and f.filename:
+                contenido = await f.read()
+                imagen_map[f.filename] = base64.b64encode(contenido).decode("utf-8")
+                mime_type = f.content_type or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
+                imagen_meta[f.filename] = {
+                    "mime_type": mime_type,
+                    "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
+                }
+
+    repo = FirebaseRepository()
+    nombre_id = repo.generar_siguiente_id_membrete(empresa_id)
+    url = f"{repo.base_url}/empresas/{empresa_id}/membrete_hoja?documentId={nombre_id}"
+
+    payload = {
+        "fields": {
+            "id": {"stringValue": nombre_id},
+            "nombre": {"stringValue": data_obj.nombre},
+            "categoria": {"stringValue": data_obj.categoria},
+        }
+    }
+
+    if imagen_map:
+        payload["fields"]["ImagenMembretada"] = {
+            "mapValue": {"fields": {k: {"stringValue": v} for k, v in imagen_map.items()}}
+        }
+        payload["fields"]["ImagenMembretada_meta"] = {
+            "mapValue": {
+                "fields": {
+                    k: {
+                        "mapValue": {
+                            "fields": {
+                                "mime_type": {"stringValue": v["mime_type"]},
+                                "tipo_visual": {"stringValue": v["tipo_visual"]},
+                            }
+                        }
+                    }
+                    for k, v in imagen_meta.items()
+                }
+            }
+        }
+
+    r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"Error creando membrete: {r.text}")
+
+    return {"status": "Membrete creado", "id": nombre_id}
+
+
+@router_membrete.patch("/Actualizar-membrete")
+async def actualizar_membrete(
+    empresa_id: str,
+    doc_id: str,
+    datos_json: Optional[str] = Form(default=None),
+    archivos_membretado: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(es_usuario),
+):
+    repo = FirebaseRepository()
+    doc = repo.obtener_membrete(empresa_id, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Membrete no encontrado.")
+
+    # Actualizar campos de texto si vienen
+    if datos_json:
+        try:
+            data_obj = MembreteParaHojaUpdate(**json.loads(datos_json))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"datos_json inválido: {str(exc)}") from exc
+        res = repo.actualizar_membrete(empresa_id, doc_id, data_obj)
+        if res and res.status_code not in (200, 204):
+            raise HTTPException(status_code=res.status_code, detail=f"Error actualizando membrete: {res.text}")
+
+    # Procesar imagen si viene
+    if archivos_membretado:
+        f_fields = doc.get("fields", {})
+        imagen_vieja = {
+            k: v.get("stringValue")
+            for k, v in f_fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
+        }
+        meta_vieja = {
+            k: {
+                meta_key: meta_val.get("stringValue")
+                for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
+            }
+            for k, info in f_fields.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
+        }
+
+        imagen_nueva = {}
+        meta_nueva = {}
+        for f in archivos_membretado:
+            if f and f.filename:
+                contenido = await f.read()
+                imagen_nueva[f.filename] = base64.b64encode(contenido).decode("utf-8")
+                mime_type = f.content_type or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
+                meta_nueva[f.filename] = {
+                    "mime_type": mime_type,
+                    "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
+                }
+
+        imagen_final = {**imagen_vieja, **imagen_nueva}
+        meta_final = {**meta_vieja, **meta_nueva}
+
+        url_patch = f"{repo.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}"
+        payload_img = {
+            "fields": {
+                "ImagenMembretada": {
+                    "mapValue": {"fields": {k: {"stringValue": v} for k, v in imagen_final.items()}}
+                },
+                "ImagenMembretada_meta": {
+                    "mapValue": {
+                        "fields": {
+                            k: {
+                                "mapValue": {
+                                    "fields": {
+                                        "mime_type": {"stringValue": v["mime_type"]},
+                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
+                                    }
+                                }
+                            }
+                            for k, v in meta_final.items()
+                        }
+                    }
+                },
+            }
+        }
+        params = [
+            ("updateMask.fieldPaths", "ImagenMembretada"),
+            ("updateMask.fieldPaths", "ImagenMembretada_meta"),
+        ]
+        res_img = requests.patch(url_patch, json=payload_img, params=params, headers=repo.headers, timeout=10)
+        if res_img.status_code != 200:
+            raise HTTPException(status_code=res_img.status_code, detail=f"Error subiendo imagen: {res_img.text}")
+
+    return {"status": "Membrete actualizado", "id": doc_id}
+
+
+@router_membrete.delete("/Eliminar-membrete")
+def eliminar_membrete(empresa_id: str, doc_id: str, user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    doc = repo.obtener_membrete(empresa_id, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Membrete no encontrado.")
+    url = f"{repo.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}"
+    requests.delete(url, headers=repo.headers, timeout=10)
+    return {"status": "Membrete eliminado", "id": doc_id}
+
+#endregion
 
 #region CRUD Firmantes de empresa
 

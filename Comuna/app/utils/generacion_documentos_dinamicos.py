@@ -614,16 +614,15 @@ class GenerarPDFUseCase:
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas y generar PDF")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
-            # Aplicar fondo membretada si está habilitada
-            hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
-            if hoja_membretada:
-                logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
-                imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
-                if imagen_map:
-                    # Obtener la primera imagen disponible
-                    primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
-                    if primera_imagen_b64:
-                        html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+            if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                if membrete_id:
+                    membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                    if membrete_doc:
+                        imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
             encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
             footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
@@ -751,16 +750,15 @@ class GenerarPDFUseCase:
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
-            # Aplicar fondo membretada si está habilitada
-            hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
-            if hoja_membretada:
-                logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
-                imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
-                if imagen_map:
-                    # Obtener la primera imagen disponible
-                    primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
-                    if primera_imagen_b64:
-                        html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+            if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                if membrete_id:
+                    membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                    if membrete_doc:
+                        imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
             encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
             footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
@@ -899,16 +897,15 @@ class GenerarPDFUseCase:
                 logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML para anexo")
                 html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
-                # Aplicar fondo membretada si está habilitada
-                hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
-                if hoja_membretada:
-                    logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
-                    imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
-                    if imagen_map:
-                        # Obtener la primera imagen disponible
-                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
-                        if primera_imagen_b64:
-                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+                if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                    membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                    if membrete_id:
+                        membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                        if membrete_doc:
+                            imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                            primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                            if primera_imagen_b64:
+                                html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
                 nombre_anexo = fields.get("nombre", {}).get("stringValue", "anexo")
                 nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, fallback='anexo')}.pdf"
@@ -1229,16 +1226,15 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
 
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
-            # Aplicar fondo membretada si está habilitada
-            hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
-            if hoja_membretada:
-                logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
-                imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
-                if imagen_map:
-                    # Obtener la primera imagen disponible
-                    primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
-                    if primera_imagen_b64:
-                        html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+            if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                if membrete_id:
+                    membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                    if membrete_doc:
+                        imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
             encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
             footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
@@ -1422,16 +1418,15 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML para anexo")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
-            # Aplicar fondo membretada si está habilitada
-            hoja_membretada = fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False)
-            if hoja_membretada:
-                logger.info("[PDF_GENERADOR] Paso: HojaMembretadaProyecto activa, inyectando fondo")
-                imagen_map = fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
-                if imagen_map:
-                    # Obtener la primera imagen disponible
-                    primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "")
-                    if primera_imagen_b64:
-                        html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+            if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                if membrete_id:
+                    membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                    if membrete_doc:
+                        imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
             nombre_anexo = fields.get("nombre", {}).get("stringValue", "anexo")
             nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, fallback='anexo')}.pdf"
