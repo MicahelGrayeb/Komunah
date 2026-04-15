@@ -104,6 +104,7 @@ if APP_MODE == "NOTIFICACIONES":
     app.include_router(notificacionesMS.router_documento)
     app.include_router(notificacionesMS.router_anexo)
     app.include_router(notificacionesMS.router_firmantes_empresa)
+    app.include_router(notificacionesMS.router_membrete)
     app.include_router(remitentes.router)
 else:
     app.include_router(login.router)

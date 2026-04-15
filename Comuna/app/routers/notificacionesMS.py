@@ -1104,6 +1104,7 @@ class TemplateUseCase:
         res = repo.query_categoria(empresa_id, categoria)
         if not isinstance(res, list): return 0
         return len([item for item in res if "document" in item])
+
 class StaticDualUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
         self.repo = repo
@@ -2864,37 +2865,11 @@ def listar_membretes(empresa_id: str, user: dict = Depends(es_usuario)):
         })
     return resultado
 
-
-@router_membrete.get("/Obtener-membrete")
-def obtener_membrete(empresa_id: str, doc_id: str, user: dict = Depends(es_usuario)):
-    repo = FirebaseRepository()
-    doc = repo.obtener_membrete(empresa_id, doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Membrete no encontrado.")
-    f = doc.get("fields", {})
-    return {
-        "id": doc["name"].split("/")[-1],
-        "nombre": f.get("nombre", {}).get("stringValue", ""),
-        "categoria": f.get("categoria", {}).get("stringValue", ""),
-        "ImagenMembretada": {
-            k: v.get("stringValue")
-            for k, v in f.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
-        },
-        "ImagenMembretada_meta": {
-            k: {
-                meta_key: meta_val.get("stringValue")
-                for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
-            }
-            for k, info in f.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
-        },
-    }
-
-
 @router_membrete.post("/Subir-membrete", status_code=201)
 async def subir_membrete(
     empresa_id: str,
     datos_json: Optional[str] = Form(default=None),
-    archivos_membretado: Optional[List[UploadFile]] = File(None),
+    archivos: Optional[List[UploadFile]] = File(None),
     user: dict = Depends(es_usuario),
 ):
     if not datos_json:
@@ -2906,8 +2881,8 @@ async def subir_membrete(
 
     imagen_map = {}
     imagen_meta = {}
-    if archivos_membretado:
-        for f in archivos_membretado:
+    if archivos:
+        for f in archivos:
             if f and f.filename:
                 contenido = await f.read()
                 imagen_map[f.filename] = base64.b64encode(contenido).decode("utf-8")
@@ -2955,65 +2930,46 @@ async def subir_membrete(
 
     return {"status": "Membrete creado", "id": nombre_id}
 
-
 @router_membrete.patch("/Actualizar-membrete")
 async def actualizar_membrete(
     empresa_id: str,
     doc_id: str,
     datos_json: Optional[str] = Form(default=None),
-    archivos_membretado: Optional[List[UploadFile]] = File(None),
+    archivos: Optional[List[UploadFile]] = File(None),
     user: dict = Depends(es_usuario),
 ):
+    # 1. Normalizar datos
+    data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=MembreteParaHojaUpdate,
+        datos_modelo=None,
+        datos_json=datos_json,
+        archivos=archivos,
+    )
+
+    # 2. CONVERSIÓN CRÍTICA: Convertir objeto Pydantic a Diccionario
+    data = data_obj.model_dump(exclude_unset=True) if hasattr(data_obj, "model_dump") else data_obj.dict(exclude_unset=True)
+
     repo = FirebaseRepository()
-    doc = repo.obtener_membrete(empresa_id, doc_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Membrete no encontrado.")
 
-    # Actualizar campos de texto si vienen
-    if datos_json:
-        try:
-            data_obj = MembreteParaHojaUpdate(**json.loads(datos_json))
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"datos_json inválido: {str(exc)}") from exc
-        res = repo.actualizar_membrete(empresa_id, doc_id, data_obj)
-        if res and res.status_code not in (200, 204):
-            raise HTTPException(status_code=res.status_code, detail=f"Error actualizando membrete: {res.text}")
+    # 3. Actualizar datos principales
+    res = repo.actualizar_membrete(empresa_id, doc_id, data_obj)
 
-    # Procesar imagen si viene
-    if archivos_membretado:
-        f_fields = doc.get("fields", {})
-        imagen_vieja = {
-            k: v.get("stringValue")
-            for k, v in f_fields.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
-        }
-        meta_vieja = {
-            k: {
-                meta_key: meta_val.get("stringValue")
-                for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
-            }
-            for k, info in f_fields.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
-        }
+    # 4. Procesar archivos si existen
+    archivos_viejos = data.get("ImagenMembretada", {})
+    meta_vieja = data.get("ImagenMembretada_meta", {})
 
-        imagen_nueva = {}
-        meta_nueva = {}
-        for f in archivos_membretado:
-            if f and f.filename:
-                contenido = await f.read()
-                imagen_nueva[f.filename] = base64.b64encode(contenido).decode("utf-8")
-                mime_type = f.content_type or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
-                meta_nueva[f.filename] = {
-                    "mime_type": mime_type,
-                    "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
-                }
+    # Unimos (los nuevos sobreescriben si tienen el mismo nombre)
+    archivos_finales = {**archivos_viejos, **archivos_map}
+    meta_final = {**meta_vieja, **archivos_meta}
 
-        imagen_final = {**imagen_vieja, **imagen_nueva}
-        meta_final = {**meta_vieja, **meta_nueva}
-
-        url_patch = f"{repo.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}"
-        payload_img = {
+    if archivos_finales:
+        url = f"{repo.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}"
+        payload_files = {
             "fields": {
                 "ImagenMembretada": {
-                    "mapValue": {"fields": {k: {"stringValue": v} for k, v in imagen_final.items()}}
+                    "mapValue": {
+                        "fields": {k: {"stringValue": v} for k, v in archivos_finales.items()}
+                    }
                 },
                 "ImagenMembretada_meta": {
                     "mapValue": {
@@ -3025,23 +2981,30 @@ async def actualizar_membrete(
                                         "tipo_visual": {"stringValue": v["tipo_visual"]},
                                     }
                                 }
-                            }
-                            for k, v in meta_final.items()
+                            } for k, v in meta_final.items()
                         }
                     }
-                },
+                }
             }
         }
+        
+        # Corregimos la updateMask para incluir AMBOS campos
         params = [
             ("updateMask.fieldPaths", "ImagenMembretada"),
-            ("updateMask.fieldPaths", "ImagenMembretada_meta"),
+            ("updateMask.fieldPaths", "ImagenMembretada_meta")
         ]
-        res_img = requests.patch(url_patch, json=payload_img, params=params, headers=repo.headers, timeout=10)
-        if res_img.status_code != 200:
-            raise HTTPException(status_code=res_img.status_code, detail=f"Error subiendo imagen: {res_img.text}")
+        
+        res_files = requests.patch(
+            url,
+            json=payload_files,
+            params=params,
+            headers=repo.headers,
+            timeout=10,
+        )
+        if res_files.status_code != 200:
+            raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos: {res_files.text}")
 
     return {"status": "Membrete actualizado", "id": doc_id}
-
 
 @router_membrete.delete("/Eliminar-membrete")
 def eliminar_membrete(empresa_id: str, doc_id: str, user: dict = Depends(es_usuario)):
