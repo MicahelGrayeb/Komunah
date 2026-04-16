@@ -24,7 +24,15 @@ engine = None
 def start_tunnel():
     """Función para iniciar o reiniciar el túnel SSH"""
     global tunnel_server, engine
-    
+
+    # Si DATABASE_URL está definida (Docker / Cloud Run), la usamos directamente.
+    # Ignoramos SSH_HOST aunque esté en el .env para no intentar un túnel innecesario.
+    direct_url = os.getenv("DATABASE_URL")
+    if direct_url:
+        print(f"⚡ DATABASE_URL detectada, conexión directa (sin túnel SSH).")
+        engine = create_engine(direct_url, pool_recycle=3600, pool_pre_ping=True)
+        return
+
     if SSH_HOST and SSH_USER and SSH_PASS:
         try:
             # Si ya hay un túnel y no está activo, lo cerramos antes de reabrir

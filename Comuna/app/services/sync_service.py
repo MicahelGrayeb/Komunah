@@ -4,7 +4,7 @@ import logging
 import pandas as pd
 from datetime import datetime
 from google.cloud import bigquery
-from google.oauth2 import credentials
+from google.oauth2 import service_account
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import DECIMAL, BIGINT, DOUBLE, TEXT, VARCHAR
 
@@ -23,21 +23,23 @@ class AutoSyncManager:
             except Exception as e:
                 logger.warning(f"Nota Firebase: {e}")
 
-        # 2. Configuración BigQuery
-        os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+        # 2. Configuración BigQuery — Service Account permanente (no expira nunca)
         self.project_id = 'adaracrm-replicacq6pearyt88g'
         self.dataset_id = 'adaracrm_komunah'
         self.billing_project = 'comuna-480820'
 
         json_data = os.environ.get("GOOGLE_JSON_KEY")
         if json_data:
-            try:
-                info = json.loads(json_data)
-                creds = credentials.Credentials.from_authorized_user_info(info)
-                self.client = bigquery.Client(credentials=creds, project=self.billing_project)
-            except Exception as e:
-                self.client = bigquery.Client(project=self.billing_project)
+            info = json.loads(json_data)
+            # Service Account Key: autónoma, nunca expira, no requiere re-autenticación
+            creds = service_account.Credentials.from_service_account_info(
+                info,
+                scopes=["https://www.googleapis.com/auth/bigquery"]
+            )
+            self.client = bigquery.Client(credentials=creds, project=self.billing_project)
         else:
+            # Fallback: Application Default Credentials
+            # (funciona si GOOGLE_APPLICATION_CREDENTIALS apunta al JSON en el servidor)
             self.client = bigquery.Client(project=self.billing_project)
 
         from app.database import SessionLocal
