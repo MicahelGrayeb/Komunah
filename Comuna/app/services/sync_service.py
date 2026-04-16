@@ -4,7 +4,7 @@ import logging
 import pandas as pd
 from datetime import datetime
 from google.cloud import bigquery
-from google.oauth2 import service_account, credentials as oauth2_credentials
+from google.oauth2 import service_account
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import DECIMAL, BIGINT, DOUBLE, TEXT, VARCHAR
 
@@ -28,31 +28,9 @@ class AutoSyncManager:
         self.dataset_id = 'adaracrm_komunah'
         self.billing_project = 'comuna-480820'
 
-        json_data = os.environ.get("GOOGLE_JSON_KEY")
-        if json_data:
-            info = json.loads(json_data)
-            tipo = info.get("type", "")
-            if tipo == "service_account":
-                # Permanente: nunca expira, nunca necesita re-autenticación
-                creds = service_account.Credentials.from_service_account_info(
-                    info,
-                    scopes=["https://www.googleapis.com/auth/bigquery"]
-                )
-            elif tipo == "authorized_user":
-                # Token de usuario con refresh_token (temporal hasta conseguir SA)
-                creds = oauth2_credentials.Credentials(
-                    token=None,
-                    refresh_token=info["refresh_token"],
-                    token_uri="https://oauth2.googleapis.com/token",
-                    client_id=info["client_id"],
-                    client_secret=info["client_secret"],
-                )
-            else:
-                raise ValueError(f"GOOGLE_JSON_KEY tiene tipo desconocido: '{tipo}'")
-            self.client = bigquery.Client(credentials=creds, project=self.billing_project)
-        else:
-            # Application Default Credentials (Cloud Run usa el SA adjunto automáticamente)
-            self.client = bigquery.Client(project=self.billing_project)
+        # Cloud Run inyecta automáticamente la service account 941525225416-compute
+        # No se necesita JSON, no se necesita re-autenticación, nunca expira
+        self.client = bigquery.Client(project=self.billing_project)
 
         from app.database import SessionLocal
         db = SessionLocal()
