@@ -4,7 +4,8 @@ import logging
 import pandas as pd
 from datetime import datetime
 from google.cloud import bigquery
-from google.oauth2 import service_account
+from google.auth import compute_engine
+import google.auth.transport.requests
 from sqlalchemy import create_engine, text
 from sqlalchemy.types import DECIMAL, BIGINT, DOUBLE, TEXT, VARCHAR
 
@@ -28,9 +29,10 @@ class AutoSyncManager:
         self.dataset_id = 'adaracrm_komunah'
         self.billing_project = 'comuna-480820'
 
-        # Cloud Run inyecta automáticamente la service account 941525225416-compute
-        # No se necesita JSON, no se necesita re-autenticación, nunca expira
-        self.client = bigquery.Client(project=self.billing_project)
+        # Usamos explícitamente el metadata server de Cloud Run
+        # para evitar que GOOGLE_APPLICATION_CREDENTIALS (Firebase) interfiera
+        creds = compute_engine.Credentials()
+        self.client = bigquery.Client(credentials=creds, project=self.billing_project)
 
         from app.database import SessionLocal
         db = SessionLocal()
