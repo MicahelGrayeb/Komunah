@@ -1,4 +1,4 @@
-import os
+﻿import os
 import requests
 import re
 import base64
@@ -11,7 +11,8 @@ from ..schemas import (
     WhatsAppManualSchema, SwitchEtapasSchema, EmailFolioSchema, 
     RecordatoriosUpdate, EmailClusterSchema, SearchboxExpedienteResponse, 
     DocumentosDinamicosBase, DocumentosDinamicosUpdate, AnexosBase, AnexosUpdate,
-    DocumentoDinamicoGeneracionSchema
+    DocumentoDinamicoGeneracionSchema, FirmantesEmpresaBase, FirmantesEmpresaUpdate,
+    MembreteParaHoja, MembreteParaHojaUpdate
 )
 from ..utils.datos_proveedores import (
     get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, 
@@ -30,18 +31,19 @@ import hashlib
 from ..services.security import get_current_user, es_admin, es_super_admin, es_usuario
 from argparse import Namespace
 from ..models import Venta, Cliente
-from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase, GenerarPDFDinamico, GenerarPDFAnexo
+from ..utils.generacion_documentos_dinamicos import GenerarPDFUseCase, GenerarPDFDinamico
 from datetime import datetime, date, timedelta
 
-
-
 logger = logging.getLogger(__name__)
+
 
 router = APIRouter(prefix="/v1/notificaciones", tags=["Motor Envios"])
 router_crud = APIRouter(prefix="/v1/plantillas", tags=["CRUD Plantillas de Correo"])
 router_wa = APIRouter(prefix="/v1/plantillas-wa", tags=["CRUD Plantillas de WhatsApp"])
 router_documento = APIRouter(prefix="/v1/plantillas-documento", tags=["CRUD Plantillas de documentos dinamicos"])
 router_anexo = APIRouter(prefix="/v1/plantillas-anexo", tags=["CRUD Plantillas de anexos"])
+router_membrete = APIRouter(prefix="/v1/membrete-hoja", tags=["CRUD Membrete de Hoja"])
+router_firmantes_empresa = APIRouter(prefix="/v1/firmantes-empresa", tags=["CRUD Firmantes de empresa"])
 router_usuario = APIRouter(prefix="/v1/preferencias-usuario", tags=["Switches Clientes"])
 router_globales = APIRouter(prefix="/v1/configuracion-global", tags=["Configuración Global"])
 
@@ -63,36 +65,29 @@ PROVIDERS = {
 class FirebaseRepository:
     """Maneja la comunicación técnica con Firebase Firestore."""
     
-    _db_instance = None
-
     def __init__(self):
         from google.cloud import firestore
         import json
         
+        # 1. Jalamos el proyecto DIRECTO del .env como pediste
         self.project_id = os.getenv('FIREBASE_PLANTILLAS_PROJECT_ID', '').strip()
-        is_cloud_run = os.getenv('K_SERVICE') is not None
         
-        # 🚀 SINGLETON CRÍTICO: Reutilizar el Cliente de Firestore
-        if FirebaseRepository._db_instance is None:
-            if not is_cloud_run and os.path.exists("serviceAccountKey.json"):
-                try:
-                    with open("serviceAccountKey.json") as f:
-                        info = json.load(f)
-                    FirebaseRepository._db_instance = firestore.Client.from_service_account_info(info, project=self.project_id)
-                    logger.info(f"✅ Local Mode: Conectado a '{self.project_id}' vía JSON")
-                except Exception as e:
-                    logger.error(f"❌ Error con serviceAccountKey.json: {e}, usando Application Default.")
-                    FirebaseRepository._db_instance = firestore.Client(project=self.project_id)
-            else:
-                logger.info(f"Entorno Cloud / ADC Detectado. Conectando nativamente al proyecto '{self.project_id}'")
-                FirebaseRepository._db_instance = firestore.Client(project=self.project_id)
-        
-        self.db = FirebaseRepository._db_instance
+        if os.path.exists("serviceAccountKey.json"):
+            try:
+                with open("serviceAccountKey.json") as f:
+                    info = json.load(f)
+                # Forzamos que use el ID del .env aunque el JSON sea de otro lado
+                self.db = firestore.Client.from_service_account_info(info, project=self.project_id)
+                logger.info(f"✅ FirebaseRepository: Conectado al proyecto '{self.project_id}'")
+            except Exception as e:
+                logger.error(f"❌ Error con serviceAccountKey.json: {e}")
+                self.db = firestore.Client(project=self.project_id)
+        else:
+            self.db = firestore.Client(project=self.project_id)
             
+        # Variables que tus métodos actuales (de tu compañero) necesitan para no tronar
         self.base_url = f"https://firestore.googleapis.com/v1/projects/{self.project_id}/databases/(default)/documents"
-        
-        # Forzamos también el Connection: close en los headers manuales
-        self.headers = {"Content-Type": "application/json", "Connection": "close"}
+        self.headers = {"Content-Type": "application/json"}
 
     def obtener_config_empresa(self, empresa_id: str):
         """Si Firebase falla, retorna todo en False para detener procesos."""
@@ -108,7 +103,7 @@ class FirebaseRepository:
             "email": f.get("email_enabled", {}).get("booleanValue", False),
             "whatsapp": f.get("whatsapp_enabled", {}).get("booleanValue", False)
         }
-
+    
 #region Helpers para peticiones seguras con reintentos
 
     def _peticion_segura(self, method: str, url: str, **kwargs):
@@ -125,36 +120,18 @@ class FirebaseRepository:
                 doc_id_param = next((v for k, v in params if k == "documentId"), None)
             elif isinstance(params, dict): 
                 doc_id_param = params.get("documentId")
-                
-            # Rescatar el ID si viene pegado directamente en la URL
-            if not doc_id_param and "documentId=" in path_raw:
-                doc_id_param = path_raw.split("documentId=")[1].split("&")[0]
             
             # 1. Resolver Queries
             if ":runQuery" in path_raw:
-                from google.cloud import firestore
                 query_body = kwargs.get("json", {}).get("structuredQuery", {})
                 coll_id = query_body.get("from", [{}])[0].get("collectionId", "plantillas")
+                where_clause = query_body.get("where", {}).get("fieldFilter", {})
+                field = where_clause.get("field", {}).get("fieldPath", "categoria")
+                value = where_clause.get("value", {}).get("stringValue")
                 
-                ref = self.db.document(path).collection(coll_id) if path else self.db.collection(coll_id)
+                # ✅ LA LÍNEA MÁGICA ARREGLADA: Usamos .document(path)
+                docs = self.db.document(path).collection(coll_id).where(field, "==", value).stream()
                 
-                # Filtro Where
-                f_filter = query_body.get("where", {}).get("fieldFilter", {})
-                if f_filter:
-                    field = f_filter.get("field", {}).get("fieldPath")
-                    val = f_filter.get("value", {}).get("stringValue")
-                    if field and val:
-                        ref = ref.where(field, "==", val)
-                
-                # Filtro OrderBy (Para logs)
-                order_by_list = query_body.get("orderBy", [])
-                for order in order_by_list:
-                    f_path = order.get("field", {}).get("fieldPath")
-                    direction = firestore.Query.DESCENDING if order.get("direction") == "DESCENDING" else firestore.Query.ASCENDING
-                    if f_path:
-                        ref = ref.order_by(f_path, direction=direction)
-                
-                docs = ref.stream()
                 data = [{"document": {"name": d.reference.path, "fields": self._formatear_a_rest(d.to_dict())}} for d in docs]
             
             # 2. Resolver GET
@@ -175,7 +152,7 @@ class FirebaseRepository:
                 if doc_id_param: # Crear con ID específico
                     self.db.collection(path).document(doc_id_param).set(clean_data)
                 else: # Actualizar existente
-                    self.db.document(path).set(clean_data, merge=True)
+                    self.db.document(path).update(clean_data)
                 data = {"fields": payload}
                 
             # 4. DELETE
@@ -551,10 +528,10 @@ class FirebaseRepository:
                 continue 
             mask.append(key)
             # 1. Tipos Booleanos
-            if key in ["activo", "static", "tieneAnexos"]:
+            if key in ["activo", "static", "tieneAnexos", "FirmantesEmpresa", "FirmasCoopropietarios", "HojaMembretadaProyecto"]:
                 fields[key] = {"booleanValue": bool(value)}
             # 2. Listas (como los tags)
-            elif key == "tags":
+            elif key in ["tags", "FirmantesPersonalizados"]:
                 fields[key] = {"arrayValue": {"values": [{"stringValue": str(t)} for t in value]}}
             # 3. Mapas Especiales (Anexos - siguiendo tu lógica de documentos_adjuntos)
             elif key == "anexos":
@@ -630,12 +607,40 @@ class FirebaseRepository:
     def actualizar_plantilla_anexos(self, empresa_id: str, doc_id: str, p: Any):
         fields = {}
         mask = []
-        
+
         if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
         if p.contenido: fields["contenido"] = {"stringValue": p.contenido}; mask.append("contenido")
         if p.categoria: fields["categoria"] = {"stringValue": p.categoria}; mask.append("categoria")
         if p.subcategorianexo: fields["subcategorianexo"] = {"stringValue": p.subcategorianexo}; mask.append("subcategorianexo")
-        
+
+        if p.encabezado is not None:
+            fields["encabezado"] = {"stringValue": p.encabezado}
+            mask.append("encabezado")
+
+        if p.footer is not None:
+            fields["footer"] = {"stringValue": p.footer}
+            mask.append("footer")
+
+        if p.FirmantesEmpresa is not None:
+            fields["FirmantesEmpresa"] = {"booleanValue": bool(p.FirmantesEmpresa)}
+            mask.append("FirmantesEmpresa")
+
+        if p.FirmasCoopropietarios is not None:
+            fields["FirmasCoopropietarios"] = {"booleanValue": bool(p.FirmasCoopropietarios)}
+            mask.append("FirmasCoopropietarios")
+
+        if p.FirmantesPersonalizados is not None:
+            fields["FirmantesPersonalizados"] = {"arrayValue": {"values": [{"stringValue": str(t)} for t in p.FirmantesPersonalizados]}}
+            mask.append("FirmantesPersonalizados")
+
+        if hasattr(p, 'HojaMembretadaProyecto') and p.HojaMembretadaProyecto is not None:
+            fields["HojaMembretadaProyecto"] = {"booleanValue": bool(p.HojaMembretadaProyecto)}
+            mask.append("HojaMembretadaProyecto")
+
+        if hasattr(p, 'membrete_id') and p.membrete_id is not None:
+            fields["membrete_id"] = {"stringValue": p.membrete_id}
+            mask.append("membrete_id")
+
         if hasattr(p, 'tamanoDocumento') and p.tamanoDocumento:
             fields["tamanoDocumento"] = {"stringValue": p.tamanoDocumento}
             mask.append("tamanoDocumento")
@@ -643,13 +648,63 @@ class FirebaseRepository:
         if hasattr(p, 'tags') and p.tags is not None:
             fields["tags"] = {"arrayValue": {"values": [{"stringValue": t} for t in p.tags]}}
             mask.append("tags")
-        
+
         if not mask: return None
-        
+
         query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
         url = f"{self.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}?{query_params}"
-        
+
         return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
+
+#endregion
+
+#region CRUD MEMBRETE DE HOJA
+
+    def listar_membretes(self, empresa_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/membrete_hoja"
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json().get("documents", []) if resp else []
+
+    def obtener_membrete(self, empresa_id: str, doc_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}"
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json() if resp else None
+
+    def generar_siguiente_id_membrete(self, empresa_id: str):
+        docs = self.listar_membretes(empresa_id)
+        prefijo = empresa_id[:2].upper()
+        max_num = 0
+        for d in docs:
+            id_doc = d["name"].split("/")[-1]
+            match = re.search(rf"{prefijo}-(\d+)", id_doc)
+            if match:
+                num = int(match.group(1))
+                if num > max_num:
+                    max_num = num
+        return f"{prefijo}-{str(max_num + 1).zfill(4)}"
+
+    def actualizar_membrete(self, empresa_id: str, doc_id: str, p: Any):
+        fields = {}
+        mask = []
+
+        if p.nombre is not None:
+            fields["nombre"] = {"stringValue": p.nombre}
+            mask.append("nombre")
+
+        if p.categoria is not None:
+            fields["categoria"] = {"stringValue": p.categoria}
+            mask.append("categoria")
+
+        if not mask:
+            return None
+
+        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
+        url = f"{self.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}?{query_params}"
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
+
+#endregion
+
+#region CRUD PLANTILLAS DE ANEXO (mapping helpers)
 
     def _get_anexo_mapping_single(self, empresa_id: str, doc_id: str):
         """Busca un solo ID en anexos y devuelve {ID: Nombre}."""
@@ -670,25 +725,79 @@ class FirebaseRepository:
 
 #endregion
 
+#region CRUD FIRMANTES EMPRESA
+
+    def listar_firmantes_empresa(self, empresa_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/firmantes-empresa"
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json().get("documents", []) if resp else []
+
+    def obtener_un_doc_completo_firmantes_empresa(self, empresa_id: str, doc_id: str):
+        url = f"{self.base_url}/empresas/{empresa_id}/firmantes-empresa/{doc_id}"
+        resp = self._peticion_segura("GET", url, headers=self.headers, timeout=10)
+        return resp.json() if resp else None
+
+    def generar_siguiente_id_firmantes_empresa(self, empresa_id: str):
+        docs = self.listar_firmantes_empresa(empresa_id)
+        prefijo = empresa_id[:2].upper()
+        max_num = 0
+        for d in docs:
+            id_doc = d["name"].split("/")[-1]
+            match = re.search(rf"{prefijo}-(\d+)", id_doc)
+            if match:
+                num = int(match.group(1))
+                if num > max_num: max_num = num
+        return f"{prefijo}-{str(max_num + 1).zfill(4)}"
+
+    def actualizar_plantilla_firmantes_empresa(self, empresa_id: str, doc_id: str, p: Any):
+        fields = {}
+        mask = []
+        
+        if p.nombre: fields["nombre"] = {"stringValue": p.nombre}; mask.append("nombre")
+        if p.puesto: fields["puesto"] = {"stringValue": p.puesto}; mask.append("puesto")
+        if p.departamento: fields["departamento"] = {"stringValue": p.departamento}; mask.append("departamento")
+        if p.email: fields["email"] = {"stringValue": p.email}; mask.append("email")
+        if p.activo is not None: fields["activo"] = {"booleanValue": bool(p.activo)}; mask.append("activo")
+        
+        if not mask: return None
+        
+        query_params = "&".join([f"updateMask.fieldPaths={m}" for m in mask])
+        url = f"{self.base_url}/empresas/{empresa_id}/firmantes-empresa/{doc_id}?{query_params}"
+        
+        return self._peticion_segura("PATCH", url, json={"fields": fields}, headers=self.headers, timeout=10)
+
+    def _get_firmantes_empresa_mapping_single(self, empresa_id: str, doc_id: str):
+        """Busca un solo ID en firmantes de empresa y devuelve {ID: Nombre}."""
+        if not doc_id or not isinstance(doc_id, str): return None
+        doc = self.obtener_un_doc_completo_firmantes_empresa(empresa_id, doc_id)
+        if not doc: return {doc_id: "N/A"}
+        nombre = doc.get("fields", {}).get("nombre", {}).get("stringValue", "N/A")
+        departamento = doc.get("fields", {}).get("departamento", {}).get("stringValue", "N/A")
+        return {doc_id: nombre, "departamento": departamento}
+
+    def _get_firmantes_empresa_mapping_multiple(self, empresa_id: str, ids: List[str]):
+        """Busca varios IDs y devuelve un diccionario {ID: Nombre}."""
+        resultado = {}
+        for doc_id in (ids or []):
+            mapping = self._get_firmantes_empresa_mapping_single(empresa_id, doc_id)
+            if mapping:
+                resultado.update(mapping)
+        return resultado if resultado else None
+
+#endregion
+
 class NotificationGateway:
-    """Maneja la comunicación pura con MailerSend y Respond.io (APIs Externas)."""
+    """Maneja la comunicación pura con MailerSend."""
     @staticmethod
     def enviar_email(payload: dict):
         api_key = os.getenv("MAILERSEND_API_KEY")
         url = "https://api.mailersend.com/v1/email"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Connection": "close"
+            "Content-Type": "application/json"
         }
-        try:
-            return requests.post(url, headers=headers, json=payload, timeout=10)
-        except Exception as e:
-            logger.error(f"⚠️ Error de red aislado en enviar_email: {e}")
-            class ErrorMock:
-                status_code = 500
-                text = str(e)
-            return ErrorMock()
+        
+        return requests.post(url, headers=headers, json=payload, timeout=10)
 
     @staticmethod
     def enviar_email_bulk(payloads: List[dict]):
@@ -696,17 +805,9 @@ class NotificationGateway:
         url = "https://api.mailersend.com/v1/bulk-email"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Connection": "close"
+            "Content-Type": "application/json"
         }
-        try:
-            return requests.post(url, headers=headers, json=payloads, timeout=20)
-        except Exception as e:
-            logger.error(f"⚠️ Error de red aislado en enviar_email_bulk: {e}")
-            class ErrorMock:
-                status_code = 500
-                text = str(e)
-            return ErrorMock()
+        return requests.post(url, headers=headers, json=payloads, timeout=20)
     
     @staticmethod
     def enviar_whatsapp(
@@ -723,6 +824,7 @@ class NotificationGateway:
         
         identifier = quote(f"phone:{numero}")
         url = f"https://api.respond.io/v2/contact/{identifier}/message"
+        
         
         components = []
         if header_document_link:
@@ -760,19 +862,8 @@ class NotificationGateway:
             }
         }
         
-        headers = {
-            "Authorization": f"Bearer {token}", 
-            "Content-Type": "application/json",
-            "Connection": "close"
-        }
-        try:
-            return requests.post(url, headers=headers, json=payload, timeout=10)
-        except Exception as e:
-            logger.error(f"⚠️ Error de red aislado en enviar_whatsapp a {numero}: {e}")
-            class ErrorMock:
-                status_code = 500
-                text = str(e)
-            return ErrorMock()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        return requests.post(url, headers=headers, json=payload, timeout=10)
 
 class StaticNotificationUseCase:
     def __init__(self, gateway: NotificationGateway):
@@ -884,10 +975,6 @@ class StaticWAUseCase:
             telefono = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "").replace("-", "")
             if not nombre or not telefono: continue
 
-            # Previene envío múltiple si varios co-propietarios comparten el mismo número
-            if telefono in wa_enviados_folio: continue
-            wa_enviados_folio.add(telefono)
-
             parametros_finales = []
             for var_nombre in config_plantilla["variables"]:
                 if var_nombre in ["{cl.cliente}", "{cliente}", "{v.cliente}"]:
@@ -979,9 +1066,8 @@ class StaticEmailFolioUseCase:
             if email in emails_enviados_folio: continue
             emails_enviados_folio.add(email)
 
-            cleaner = NotificationUseCase(self.repo, self.gateway)
-            asunto_listo = cleaner._limpiar(f_email.get("asunto", {}).get("stringValue", ""), data_sql, nombre, email, phone)
-            html_listo = cleaner._limpiar(f_email.get("html", {}).get("stringValue", ""), data_sql, nombre, email, phone)
+            asunto_listo = UtilsNotifications._limpiar(f_email.get("asunto", {}).get("stringValue", ""), data_sql, nombre, email, phone)
+            html_listo = UtilsNotifications._limpiar(f_email.get("html", {}).get("stringValue", ""), data_sql, nombre, email, phone)
 
 
             res = self.gateway.enviar_email({
@@ -1018,321 +1104,6 @@ class TemplateUseCase:
         res = repo.query_categoria(empresa_id, categoria)
         if not isinstance(res, list): return 0
         return len([item for item in res if "document" in item])
-
-class NotificationUseCase:
-    def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
-        self.repo = repo
-        self.gateway = gateway
-
-    async def ejecutar_barrido_automatico(self, empresa_id: str, dias: int, categoria: str, db: Session, tipo: str = "normal", simular: bool = False, lock_ref=None):
-        def broadcast_log(msg: str):
-            logger.info(msg)
-            if lock_ref:
-                try: lock_ref.update({"current_log": msg})
-                except: pass
-
-        broadcast_log(f"BARRIDO_START: {categoria}")
-        pack_empresa = PROVIDERS.get(empresa_id, {})
-        extraer_datos = pack_empresa.get("get")
-        if not extraer_datos:
-            self.repo.registrar_log_falla(empresa_id, f"Empresa '{empresa_id}' no configurada.", "CONFIG")
-            raise HTTPException(status_code=400, detail=f"Empresa '{empresa_id}' no configurada.")
-
-        config = self.repo.obtener_config_empresa(empresa_id)
-        sistema_email_ok = config.get("email")
-        sistema_wa_ok = config.get("whatsapp")
-
-        if not config.get("proyecto"):
-            self.repo.registrar_log_falla(empresa_id, f"Barrido cancelado: Proyecto desactivado en configuración global", "AUTO_BARRIDO")
-            return {"status": "off", "msj": "Proyecto desactivado"}
-
-        p_email_raw = UtilsNotifications._buscar_documento_plantilla(
-            self.repo,
-            empresa_id,
-            categoria,
-            "plantillas",
-        )
-        p_email = p_email_raw.get("fields", {}) if p_email_raw else None
-
-        p_wa_raw = UtilsNotifications._buscar_documento_plantilla(
-            self.repo,
-            empresa_id,
-            categoria,
-            "plantillas_whatsapp",
-        )
-        
-        if config.get("email") and not p_email:
-            self.repo.registrar_log_falla(empresa_id, f"Email activado pero no hay plantilla activa para '{categoria}'", "AUTO_BARRIDO")
-        
-        if config.get("whatsapp") and not p_wa_raw:
-            self.repo.registrar_log_falla(empresa_id, f"WhatsApp activado pero no hay plantilla activa para '{categoria}'", "AUTO_BARRIDO")
-            
-        p_wa = None
-        if p_wa_raw:
-            f_wa = p_wa_raw["fields"]
-            p_wa = {
-                "id_respond": f_wa.get("id_respond", {}).get("stringValue"),
-                "lenguaje": f_wa.get("lenguaje", {}).get("stringValue"),
-                "texto_base": f_wa.get("mensaje", {}).get("stringValue", ""),
-                "variables": [v.get("stringValue") for v in f_wa.get("variables", {}).get("arrayValue", {}).get("values", [])]
-            }
-        # 2. Data Retrieval
-        fecha_t = (datetime.now(ZoneInfo("America/Mexico_City")) + timedelta(days=dias)).strftime('%Y-%m-%d')
-        get_func = pack_empresa.get("get_deudores") if tipo == "deudores" else pack_empresa.get("get_pendientes")
-        
-        try:
-            registros = get_func(db, fecha_t)
-            # 🔥 LOG CRÍTICO: Aquí es donde gritamos cuántos trajo SQL
-            total_encontrados = len(registros)
-            broadcast_log(f"SQL_QUERY_SUCCESS: category='{categoria}', folios_found={total_encontrados}")
-        except Exception as e:
-            broadcast_log(f"SQL_QUERY_ERROR: {str(e)}")
-            self.repo.registrar_log_falla(empresa_id, f"Error SQL: {str(e)}", "DATABASE")
-            raise
-        
-        reporte_detallado = []
-        pdf_service = GenerarPDFUseCase(self.repo)
-
-        for idx, row in enumerate(registros, 1):
-          try:
-            broadcast_log(f"PROCESSING: Folio {row} ({idx}/{len(registros)})")
-            data_sql = extraer_datos(row, db)
-
-            if not data_sql:
-                self.repo.registrar_log_falla(empresa_id, f"El folio {row} no trajo info de SQL", "DATOS_SQL")
-                continue
-
-            if data_sql.get("{sys.etapa_activa}") == "0":
-                motivo = data_sql.get("{sys.bloqueo_motivo}", "Bloqueo por configuración de Etapa/Proyecto")
-                self.repo.registrar_log_falla(empresa_id, f"Folio {row} saltado: {motivo}", "BLOQUEO_ADMINISTRATIVO")
-                continue
-
-            # --- GENERACIÓN DE PDFs POR FOLIO (una sola vez por folio, no por integrante) ---
-
-            # PDFs para EMAIL: si la plantilla tiene documentos_adjuntos, los generamos dinámicamente
-            adjuntos_email_dinamicos = []
-            if p_email and sistema_email_ok:
-                hijos_email = p_email.get("documentos_adjuntos", {}).get("mapValue", {}).get("fields", {})
-                if hijos_email:
-                    for doc_id in hijos_email.keys():
-                        try:
-                            pdf_gen = await pdf_service.generar_pdf_barrido_automatico(empresa_id, doc_id, str(row), db)
-                            adjuntos_email_dinamicos.append({"content": pdf_gen["content"], "filename": pdf_gen["filename"]})
-                        except Exception:
-                            self.repo.registrar_log_falla(empresa_id, f"Folio {row}: falló generación de PDF adjunto '{doc_id}' para email.", "PDF_GEN")
-                            continue
-                else:
-                    # Fallback: adjuntos por URL estáticos (comportamiento anterior)
-                    adjuntos_raw = p_email.get("adjuntos_url", {}).get("arrayValue", {}).get("values", [])
-                    for adj in adjuntos_raw:
-                        info_archivo = self._descargar_a_base64(adj.get("stringValue"))
-                        if info_archivo:
-                            adjuntos_email_dinamicos.append(info_archivo)
-
-                adjuntos_email_dinamicos.extend(UtilsNotifications._obtener_adjuntos_archivos_subidos(p_email))
-
-            # PDF para WHATSAPP: si la plantilla tiene documento_adjunto_id, lo generamos y subimos al bucket
-            link_wa_doc = None
-            nom_wa_doc = None
-            if p_wa_raw and sistema_wa_ok:
-                hijos_wa = p_wa_raw["fields"].get("documento_adjunto_id", {}).get("mapValue", {}).get("fields", {})
-                if hijos_wa:
-                    pid_wa = list(hijos_wa.keys())[0]
-                    try:
-                        pdf_wa = await pdf_service.generar_pdf_barrido_automatico(empresa_id, pid_wa, str(row), db)
-                        link_wa_doc = GenerarPDFUseCase._subir_pdf_a_bucket(
-                            base64.b64decode(pdf_wa["content"]),
-                            f"Komunah/AutoWA/{row}",
-                            pdf_wa["filename"]
-                        )
-                        nom_wa_doc = pdf_wa["filename"]
-                    except Exception:
-                        self.repo.registrar_log_falla(empresa_id, f"Folio {row}: falló generación de PDF para WhatsApp.", "PDF_GEN")
-
-                if not link_wa_doc:
-                    archivo_subido_wa = UtilsNotifications._obtener_primer_archivo_subido_como_link(
-                        p_wa_raw["fields"],
-                        f"Komunah/AutoWA/{row}",
-                    )
-                    if archivo_subido_wa:
-                        link_wa_doc = archivo_subido_wa.get("url_descarga")
-                        nom_wa_doc = archivo_subido_wa.get("filename")
-
-            emails_enviados_folio = set()
-            wa_enviados_folio = set()
-
-            for i in range(1, 7):
-                nombre = data_sql.get(f"{{c{i}.client_name}}")
-                if not nombre: continue
-                
-                email = data_sql.get(f"{{g{i}.email}}")
-                phone = data_sql.get(f"{{g{i}.telefono}}", "").replace(" ", "").replace("-", "")
-                acepta_email_lote = str(data_sql.get(f"{{g{i}.permite_email_lote}}")) in ["1", "True"]
-                acepta_wa_lote = str(data_sql.get(f"{{g{i}.permite_whatsapp_lote}}")) in ["1", "True"]
-    
-                resultado_envio = {"cliente": nombre, "folio": row, "email": "n/a", "wa": "n/a"}
-                        
-                if not sistema_email_ok:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Switch Global OFF.", "GLOBAL_OFF")
-                    resultado_envio["email"] = "GLOBAL_OFF"
-                elif not p_email:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Sin plantilla activa.", "PLANTILLA_OFF")
-                    resultado_envio["email"] = "NO_TEMPLATE"
-                elif not acepta_email_lote:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: Usuario apagó switch de lote {row}.", "USER_LOTE_OFF")
-                    resultado_envio["email"] = "LOTE_OFF"
-                elif not email:
-                    self.repo.registrar_log_falla(empresa_id, f"Email omitido para {nombre}: No tiene correo registrado.", "DATA_MISSING")
-                    resultado_envio["email"] = "NO_DATA"
-                elif email in emails_enviados_folio:
-                    resultado_envio["email"] = "DUPLICADO_EN_ESTE_FOLIO"
-                else:
-                    emails_enviados_folio.add(email)
-                    if simular:
-                        res_status = f"SIMULADO_OK ({len(adjuntos_email_dinamicos)} PDFs listos)"
-                    else:
-                        res_mail = self.gateway.enviar_email({
-                            "from": {"email": os.getenv("MAILERSEND_SENDER"), "name": f"Notificaciones {empresa_id}"},
-                            "to": [{"email": email, "name": nombre}],
-                            "subject": self._limpiar(p_email["asunto"]["stringValue"], data_sql, nombre, email, phone),
-                            "html": self._limpiar(p_email["html"]["stringValue"], data_sql, nombre, email, phone),
-                            "attachments": adjuntos_email_dinamicos
-                        })
-                        if res_mail.status_code not in [200, 201, 202]:
-                            self.repo.registrar_log_falla(empresa_id, f"Email falló ({res_mail.status_code}) para {email}", "MAIL_PROVIDER")
-                        
-                        broadcast_log(f"DISPATCH_SUCCESS: Folio {row} enviado.")
-                        res_status = f"Status: {res_mail.status_code} | {res_mail.text[:100]}"
-                    
-                    resultado_envio["email"] = res_status
-
-                if not sistema_wa_ok:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Switch Global OFF en Firebase.", "GLOBAL_OFF")
-                    resultado_envio["wa"] = "GLOBAL_OFF"
-                elif not p_wa:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: No hay plantilla activa.", "PLANTILLA_OFF")
-                    resultado_envio["wa"] = "NO_TEMPLATE"
-                elif not acepta_wa_lote:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Lote bloqueado en SQL.", "USER_LOTE_OFF")
-                    resultado_envio["wa"] = "LOTE_OFF"
-                elif not phone:
-                    self.repo.registrar_log_falla(empresa_id, f"WA saltado para {nombre}: Falta número de teléfono.", "DATA_MISSING")
-                    resultado_envio["wa"] = "NO_PHONE"
-                elif phone in wa_enviados_folio:
-                    resultado_envio["wa"] = "DUPLICADO_EN_ESTE_FOLIO"
-                else:
-                    wa_enviados_folio.add(phone)
-                    parametros_dinamicos = []
-                    for var_nombre in p_wa["variables"]:
-                        if var_nombre in ["{cl.cliente}", "{cliente}", "{v.cliente}"]:
-                            valor = nombre
-                        elif var_nombre == "{email_cliente}":
-                            valor = email
-                        elif var_nombre == "{telefono_cliente}": 
-                            valor = phone
-                        else:
-                            valor = data_sql.get(var_nombre, "N/A")
-                        parametros_dinamicos.append(valor)
-
-                    num_wa = phone if "+" in phone else f"+521{phone}"
-                    texto_completo = p_wa["texto_base"]
-                    for idx, v_nombre in enumerate(p_wa["variables"], 1):
-                        texto_completo = texto_completo.replace(v_nombre, f"{{{{{idx}}}}}")
-
-                    if simular:
-                        res_wa_status = f"SIMULADO_OK (PDF: {nom_wa_doc if nom_wa_doc else 'Sin adjunto'})"
-                    else:
-                        res_wa = self.gateway.enviar_whatsapp(
-                            num_wa, p_wa["id_respond"], p_wa["lenguaje"], parametros_dinamicos,
-                            texto_cuerpo=texto_completo,
-                            header_document_link=link_wa_doc,
-                            header_document_filename=nom_wa_doc
-                        )
-                        if res_wa.status_code not in [200, 201, 202]:
-                            self.repo.registrar_log_falla(empresa_id, f"WhatsApp falló ({res_wa.status_code}) para {phone}", "WA_PROVIDER")
-                        res_wa_status = f"Status: {res_wa.status_code}"
-                        
-                    resultado_envio["wa"] = res_wa_status
-
-                reporte_detallado.append(resultado_envio)
-
-          except Exception as e_folio:
-            broadcast_log(f"ERROR_FOLIO: Folio {row} falló con excepción: {str(e_folio)}")
-            self.repo.registrar_log_falla(empresa_id, f"Folio {row}: excepción no esperada: {str(e_folio)}", "FOLIO_EXCEPTION")
-            continue
-
-
-        return {
-            "status": "proceso_finalizado",
-            "fecha_buscada": fecha_t,
-            "total_intentos": len(reporte_detallado),
-            "reporte": reporte_detallado,
-            "DEBUG": {
-                "plantilla_email_activa": p_email is not None,
-                "plantilla_wa_activa": p_wa is not None,
-                "config": config
-            }
-        }
-    
-    
-
-    def _limpiar(self, texto, vars, nombre, email_persona, tel_persona):
-        if not texto:
-            return texto
-
-        data = dict(vars or {})
-        # Soporte case-insensitive para etiquetas del HTML.
-        for k, v in list(data.items()):
-            data[str(k).lower()] = v
-
-        # Variables generales fijas del diccionario maestro.
-        data["{cliente}"] = nombre or data.get("{cliente}") or data.get("{cl.cliente}") or ""
-        data["{email_cliente}"] = str(email_persona or data.get("{email_cliente}") or data.get("{g1.email}") or "")
-        data["{telefono_cliente}"] = str(tel_persona or data.get("{telefono_cliente}") or data.get("{g1.telefono}") or "")
-
-        # 1. CAMBIO: Buscamos etiquetas de forma selectiva (solo Alfanuméricos y puntos)
-        regex_etiquetas = r"\{[a-zA-Z0-9_\.]+\}"
-        
-        etiquetas_en_texto = set(re.findall(regex_etiquetas, texto))
-        for tag in etiquetas_en_texto:
-            valor = data.get(tag)
-            if valor is None:
-                valor = data.get(tag.lower())
-            if valor is not None:
-                texto = texto.replace(tag, str(valor))
-
-        # 2. Verificación de pendientes (ya era específica, la dejamos igual o similar)
-        pendientes = set(re.findall(regex_etiquetas, texto))
-        conocidas_no_resueltas = [
-            t for t in pendientes
-            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
-        ]
-        
-        if conocidas_no_resueltas:
-            logger.info(
-                "[PDF] Etiquetas conocidas sin valor en _limpiar | total=%s | muestra=%s",
-                len(conocidas_no_resueltas),
-                conocidas_no_resueltas[:8],
-            )
-
-        # 3. CAMBIO CRÍTICO: Limpieza final selectiva. 
-        # Solo borra lo que parece una etiqueta de variable, ignorando bloques CSS.
-        return re.sub(regex_etiquetas, "", texto)
-
-    def _descargar_a_base64(self, url: str):
-        """Descarga un archivo de internet y lo convierte al formato que pide MailerSend."""
-        try:
-            import base64
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                nombre = url.split("/")[-1].split("?")[0]
-                return {
-                    "content": base64.b64encode(r.content).decode('utf-8'),
-                    "filename": nombre
-                }
-        except Exception as e:
-            print(f"Error descargando adjunto: {e}")
-            return None
 
 class StaticDualUseCase:
     def __init__(self, repo: FirebaseRepository, gateway: NotificationGateway):
@@ -1377,7 +1148,6 @@ class StaticEmailClusterUseCase:
 
         reporte_global = []
         conteo = {"exitosos": 0, "bloqueados_sys": 0, "omitidos_user": 0, "excluidos_manual": 0}
-        procesador = NotificationUseCase(self.repo, self.gateway)
         ids_documentos = [str(doc_id).strip() for doc_id in (getattr(datos, "array_documentos", []) or []) if str(doc_id).strip()]
         logger.info("[CLUSTER] Documentos dinamicos solicitados=%s", len(ids_documentos))
 
@@ -1446,8 +1216,8 @@ class StaticEmailClusterUseCase:
                     continue
 
                 # Limpieza con tus etiquetas {cliente}, {cl.monto}, etc.
-                asunto_final = procesador._limpiar(datos.asunto, data_sql, nombre, email, phone)
-                html_final = procesador._limpiar(datos.contenido_html, data_sql, nombre, email, phone)
+                asunto_final = UtilsNotifications._limpiar(datos.asunto, data_sql, nombre, email, phone)
+                html_final = UtilsNotifications._limpiar(datos.contenido_html, data_sql, nombre, email, phone)
 
                 # Si es envío REAL y tiene permiso, armamos el objeto para la cola
                 if not datos.simular and permiso:
@@ -1508,6 +1278,51 @@ class StaticEmailClusterUseCase:
         return {"modo": "SIMULACION" if datos.simular else "REAL", "resumen": conteo, "detalles": reporte_global}
 
 class UtilsNotifications:
+    @staticmethod
+    def _limpiar(texto, vars, nombre, email_persona, tel_persona):
+        """Reemplaza etiquetas dinámicas en plantillas."""
+        if not texto:
+            return texto
+
+        data = dict(vars or {})
+        # Soporte case-insensitive para etiquetas del HTML.
+        for k, v in list(data.items()):
+            data[str(k).lower()] = v
+
+        # Variables generales fijas del diccionario maestro.
+        data["{cliente}"] = nombre or data.get("{cliente}") or data.get("{cl.cliente}") or ""
+        data["{email_cliente}"] = str(email_persona or data.get("{email_cliente}") or data.get("{g1.email}") or "")
+        data["{telefono_cliente}"] = str(tel_persona or data.get("{telefono_cliente}") or data.get("{g1.telefono}") or "")
+
+        # 1. CAMBIO: Buscamos etiquetas de forma selectiva (solo Alfanuméricos y puntos)
+        regex_etiquetas = r"\{[a-zA-Z0-9_\.]+\}"
+
+        etiquetas_en_texto = set(re.findall(regex_etiquetas, texto))
+        for tag in etiquetas_en_texto:
+            valor = data.get(tag)
+            if valor is None:
+                valor = data.get(tag.lower())
+            if valor is not None:
+                texto = texto.replace(tag, str(valor))
+
+        # 2. Verificación de pendientes (ya era específica, la dejamos igual o similar)
+        pendientes = set(re.findall(regex_etiquetas, texto))
+        conocidas_no_resueltas = [
+            t for t in pendientes
+            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
+        ]
+
+        if conocidas_no_resueltas:
+            logger.info(
+                "[PDF] Etiquetas conocidas sin valor en _limpiar | total=%s | muestra=%s",
+                len(conocidas_no_resueltas),
+                conocidas_no_resueltas[:8],
+            )
+
+        # 3. CAMBIO CRÍTICO: Limpieza final selectiva.
+        # Solo borra lo que parece una etiqueta de variable, ignorando bloques CSS.
+        return re.sub(regex_etiquetas, "", texto)
+
     @staticmethod
     async def _normalizar_payload_y_archivos(
         model_cls,
@@ -2086,26 +1901,6 @@ async def api_enviar_ambos_manual(
     
     return await use_case.ejecutar_envio_dual(empresa_id, datos_wa, datos, db)
 
-@router.post("/auto-notificar/{empresa_id}")
-async def api_disparar_barrido(
-    empresa_id: str, 
-    dias: int, 
-    categoria: str,  
-    tipo: str = "normal",
-    simular: bool = False,
-    db: Session = Depends(get_db),
-    user: dict = Depends(es_usuario)
-):
-    """
-    Barrido Automático Inteligente:
-    1. Busca folios por fecha.
-    2. Genera los PDFs vinculados dinámicamente desde Firebase (documentos_adjuntos / documento_adjunto_id).
-    3. Simula o Envía según el parámetro 'simular'.
-    """
-    repo = FirebaseRepository()
-    gateway = NotificationGateway()
-    use_case = NotificationUseCase(repo, gateway)
-    return await use_case.ejecutar_barrido_automatico(empresa_id, dias, categoria, db, tipo=tipo, simular=simular)
 
 EJEMPLO_FINAL = {
     "clusters": ["Planta Baja", "Etapa 1"],
@@ -2677,7 +2472,7 @@ def api_busqueda_expedientes(db: Session = Depends(get_db), user: dict = Depends
 #region CRUD Plantillas para documentos dinamicos (PDFs)
 
 @router_documento.get("/Documentos")
-def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
+def listar_documentos(empresa_id: str, user: dict = Depends(es_usuario)):
     repo = FirebaseRepository()
     docs = repo.listar_plantillas_documentos(empresa_id)
     resultado = []
@@ -2688,6 +2483,11 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
             "nombre": f.get("nombre", {}).get("stringValue", ""),
             "categoria": f.get("categoria", {}).get("stringValue", ""),
             "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
+            "FirmantesEmpresa": f.get("FirmantesEmpresa", {}).get("booleanValue", False),
+            "FirmasCoopropietarios": f.get("FirmasCoopropietarios", {}).get("booleanValue", False),
+            "FirmantesPersonalizados": [v.get("stringValue") for v in f.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])],
+            "HojaMembretadaProyecto": f.get("HojaMembretadaProyecto", {}).get("booleanValue", False),
+            "membrete_id": f.get("membrete_id", {}).get("stringValue", ""),
             "activo": f.get("activo", {}).get("booleanValue", False),
             "static": f.get("static", {}).get("booleanValue", False),
             "tieneAnexos": f.get("tieneAnexos", {}).get("booleanValue", False),
@@ -2696,6 +2496,8 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
             },
             "tags": [v.get("stringValue") for v in f.get("tags", {}).get("arrayValue", {}).get("values", [])],
             "html": f.get("html", {}).get("stringValue", ""),
+            "encabezado": f.get("encabezado", {}).get("stringValue", ""),
+            "footer": f.get("footer", {}).get("stringValue", ""),
             "archivos_subidos": {
                 k: v.get("stringValue") for k, v in f.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {}).items()
             },
@@ -2704,12 +2506,12 @@ def listar_documentos(empresa_id: str, user: dict = Depends(es_admin)):
                     meta_key: meta_val.get("stringValue")
                     for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
                 }                for k, info in f.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {}).items()
-            }
+            },
         })
     return resultado
 
 @router_documento.post("/Crear", status_code=201)
-async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_admin)):
+async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
     # 1. Obtenemos los datos del normalizador
     data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=DocumentosDinamicosBase,
@@ -2751,6 +2553,15 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
             "nombre": {"stringValue": data.get("nombre", "")},
             "categoria": {"stringValue": data.get("categoria", "")},
             "tamanoDocumento": {"stringValue": data.get("tamanoDocumento", "Letter")},
+            "FirmantesEmpresa": {"booleanValue": bool(data.get("FirmantesEmpresa", False))},
+            "FirmasCoopropietarios": {"booleanValue": bool(data.get("FirmasCoopropietarios", False))},
+            "FirmantesPersonalizados": {
+                "arrayValue": {
+                    "values": [{"stringValue": v} for v in data.get("FirmantesPersonalizados", [])]
+                }
+            },
+            "HojaMembretadaProyecto": {"booleanValue": bool(data.get("HojaMembretadaProyecto", False))},
+            "membrete_id": {"stringValue": data.get("membrete_id", "") or ""},
             "activo": {"booleanValue": bool(data.get("activo", False))},
             "static": {"booleanValue": False},
             "anexos": anexos_firestore,
@@ -2760,7 +2571,9 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
                     "values": [{"stringValue": t} for t in data.get("tags", [])]
                 }
             },
-            "html": {"stringValue": data.get("html", "")}
+            "encabezado": {"stringValue": data.get("encabezado", "") or ""},
+            "html": {"stringValue": data.get("html", "")},
+            "footer": {"stringValue": data.get("footer", "") or ""},
         }
     }
 
@@ -2784,15 +2597,18 @@ async def crear_plantilla_documento(empresa_id: str, datos_json: Optional[str] =
                 }
             }
         }
-    
+
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"Error creando plantilla: {r.text}")
+
     if r.status_code == 200 and data.get("activo"):
         TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, data.get("categoria"), "plantillas_juridico")
         
     return {"status": "creada", "id": nombre_id}
 
 @router_documento.patch("/Actualizar")
-async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_admin)):
+async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), archivos: Optional[List[UploadFile]] = File(None), user: dict = Depends(es_usuario)):
     # 1. Normalizar datos
     data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
         model_cls=DocumentosDinamicosUpdate,
@@ -2809,6 +2625,9 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
     # 3. Actualizar datos principales
     res = repo.actualizar_plantilla_documentos(empresa_id, doc_id, data_obj)
     
+    #region 4 y 5: Procesar archivos adjuntos y hoja membretada
+
+    # 4. Procesar archivos si existen
     archivos_viejos = data.get("archivos_subidos", {})
     meta_vieja = data.get("archivos_subidos_meta", {})
 
@@ -2816,7 +2635,6 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
     archivos_finales = {**archivos_viejos, **archivos_map}
     meta_final = {**meta_vieja, **archivos_meta}
 
-    # 4. Procesar archivos si existen
     if archivos_finales:
         url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_juridico/{doc_id}"
         payload_files = {
@@ -2859,23 +2677,16 @@ async def actualizar_documento(empresa_id: str, doc_id: str, datos_json: Optiona
         if res_files.status_code != 200:
             raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos: {res_files.text}")
 
-    # 5. Lógica de activación única
+    #endregion
+
+    # 6. Lógica de activación única
     if res and res.status_code == 200:
-        # Usamos .get() de forma segura sobre el diccionario 'data'
-        if data.get("activo") is True:
-            doc = repo.obtener_un_doc_completo_documentos(empresa_id, doc_id)
-            # Firestore devuelve una estructura compleja, accedemos con cuidado
-            fields = doc.get("fields", {})
-            cat = fields.get("categoria", {}).get("stringValue")
-            if cat:
-                TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_juridico")
-        
         return {"status": "actualizada", "id": doc_id}
     
     raise HTTPException(status_code=res.status_code if res else 500, detail="No se pudo actualizar en Firestore")
 
 @router_documento.delete("/Eliminar")
-def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
+def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_usuario)):
     repo = FirebaseRepository()
     doc = repo.obtener_un_doc_completo_documentos(empresa_id, doc_id)
     if not doc: raise HTTPException(status_code=404, detail="No existe.")
@@ -2890,16 +2701,17 @@ def eliminar_documento(empresa_id: str, doc_id: str, user: dict = Depends(es_adm
 @router_documento.post("/generar-documento-dinamico")
 async def api_generar_subir_documento_dinamico(payload: DocumentoDinamicoGeneracionSchema, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):
     logger.info(
-        "[PDF_DINAMICO] Endpoint /generar-subir | empresa_id=%s | doc_id=%s",
+        "[PDF_DINAMICO] Endpoint /generar-subir | empresa_id=%s | id_plantilla=%s",
         payload.empresa_id,
-        payload.doc_id,
+        payload.id_plantilla,
     )
 
     generador = GenerarPDFDinamico(FirebaseRepository())
-    return await generador.generar_por_doc_id(
+    return await generador.generar_pdf_por_id_plantilla(
         empresa_id=payload.empresa_id.strip(),
-        doc_id=payload.doc_id.strip(),
+        id_plantilla=payload.id_plantilla.strip(),
         folio=(payload.folio or "").strip() or None,
+        coleccion="DocumentosDinamicos",
         db=db,
         subir_bucket=True,
     )
@@ -2909,7 +2721,7 @@ async def api_generar_subir_documento_dinamico(payload: DocumentoDinamicoGenerac
 #region CRUD Plantillas para anexos
 
 @router_anexo.get("/Listar-anexos")
-def listar_anexos(empresa_id: str, user: dict = Depends(es_admin)):
+def listar_anexos(empresa_id: str, user: dict = Depends(es_usuario)):
     repo = FirebaseRepository()
     docs = repo.listar_plantillas_anexo(empresa_id)
     resultado = []
@@ -2921,51 +2733,80 @@ def listar_anexos(empresa_id: str, user: dict = Depends(es_admin)):
             "categoria": f.get("categoria", {}).get("stringValue", ""),
             "subcategorianexo": f.get("subcategorianexo", {}).get("stringValue", ""),
             "tamanoDocumento": f.get("tamanoDocumento", {}).get("stringValue", ""),
+            "FirmantesEmpresa": f.get("FirmantesEmpresa", {}).get("booleanValue", False),
+            "FirmasCoopropietarios": f.get("FirmasCoopropietarios", {}).get("booleanValue", False),
+            "FirmantesPersonalizados": [v.get("stringValue") for v in f.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])],
+            "HojaMembretadaProyecto": f.get("HojaMembretadaProyecto", {}).get("booleanValue", False),
+            "membrete_id": f.get("membrete_id", {}).get("stringValue", ""),
             "static": f.get("static", {}).get("booleanValue", False),
             "tags": [v.get("stringValue") for v in f.get("tags", {}).get("arrayValue", {}).get("values", [])],
-            "contenido": f.get("contenido", {}).get("stringValue", "")
+            "encabezado": f.get("encabezado", {}).get("stringValue", ""),
+            "contenido": f.get("contenido", {}).get("stringValue", ""),
+            "footer": f.get("footer", {}).get("stringValue", ""),
         })
     return resultado
 
 @router_anexo.post("/Crear-anexo", status_code=201)
-def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[AnexosBase] = Body(default=None), user: dict = Depends(es_admin)):
+async def crear_plantilla_anexo(empresa_id: str, datos_json: Optional[str] = Form(default=None), user: dict = Depends(es_usuario)):
+    data_obj, _, _ = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=AnexosBase,
+        datos_modelo=None,
+        datos_json=datos_json,
+        archivos=None,
+    )
+
+    if hasattr(data_obj, "model_dump"):
+        data = data_obj.model_dump()
+    else:
+        data = data_obj.dict()
+
     repo = FirebaseRepository()
     nombre_id = repo.generar_siguiente_id_anexos(empresa_id)
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo?documentId={nombre_id}"
-    
+
     payload = {"fields": {
         "id": {"stringValue": nombre_id},
-        "nombre": {"stringValue": datos_json.nombre},
-        "categoria": {"stringValue": datos_json.categoria},
-        "subcategorianexo": {"stringValue": datos_json.subcategorianexo},
-        "contenido": {"stringValue": datos_json.contenido},
+        "nombre": {"stringValue": data.get("nombre", "")},
+        "categoria": {"stringValue": data.get("categoria", "")},
+        "subcategorianexo": {"stringValue": data.get("subcategorianexo", "")},
+        "contenido": {"stringValue": data.get("contenido", "")},
+        "encabezado": {"stringValue": data.get("encabezado", "") or ""},
+        "footer": {"stringValue": data.get("footer", "") or ""},
+        "HojaMembretadaProyecto": {"booleanValue": bool(data.get("HojaMembretadaProyecto", False))},
+        "membrete_id": {"stringValue": data.get("membrete_id", "") or ""},
+        "FirmantesEmpresa": {"booleanValue": bool(data.get("FirmantesEmpresa", False))},
+        "FirmasCoopropietarios": {"booleanValue": bool(data.get("FirmasCoopropietarios", False))},
+        "FirmantesPersonalizados": {"arrayValue": {"values": [{"stringValue": v} for v in data.get("FirmantesPersonalizados", [])]}},
         "static": {"booleanValue": False},
-        "tamanoDocumento": {"stringValue": datos_json.tamanoDocumento},
-        "tags": {"arrayValue": {"values": [{"stringValue": t} for t in datos_json.tags]}}
+        "tamanoDocumento": {"stringValue": data.get("tamanoDocumento", "")},
+        "tags": {"arrayValue": {"values": [{"stringValue": t} for t in data.get("tags", [])]}}
         }
     }
+
     r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
-    if r.status_code == 200 and datos_json:
-        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, datos_json.categoria, "plantillas_anexo")
-    return {"status": "creada", "id": nombre_id}
+    if r.status_code == 200 and data:
+        TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, nombre_id, data.get("categoria"), "plantillas_anexo")
+    return {"status": "Anexo creado", "id": nombre_id}
 
 @router_anexo.patch("/Actualizar-anexo")
-def actualizar_anexo(empresa_id: str, doc_id: str, datos_json: Optional[AnexosUpdate] = Body(default=None), user: dict = Depends(es_admin)):
+async def actualizar_anexo(empresa_id: str, doc_id: str, datos_json: Optional[str] = Form(default=None), user: dict = Depends(es_usuario)):
+    data_obj, _, _ = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=AnexosUpdate,
+        datos_modelo=None,
+        datos_json=datos_json,
+        archivos=None,
+    )
+
     repo = FirebaseRepository()
-    res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, datos_json)
-    
+    res = repo.actualizar_plantilla_anexos(empresa_id, doc_id, data_obj)
+
     if res and res.status_code == 200:
-        doc = repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
-        cat = doc.get("fields", {}).get("categoria", {}).get("stringValue")
-        if cat:
-                TemplateUseCase.asegurar_activacion_unica(repo, empresa_id, doc_id, cat, "plantillas_anexo")
-        return {"status": "actualizada", "id": doc_id}
-    
-    # Manejo de error por si falla la API de Google
+        return {"status": "Anexo actualizado", "id": doc_id}
+
     raise HTTPException(status_code=res.status_code, detail="No se pudo actualizar en Firestore")
 
 @router_anexo.delete("/Eliminar-anexo")
-def eliminar_anexo(empresa_id: str, doc_id: str, user: dict = Depends(es_admin)):
+def eliminar_anexo(empresa_id: str, doc_id: str, user: dict = Depends(es_usuario)):
     repo = FirebaseRepository()
     doc = repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
     if not doc: raise HTTPException(status_code=404, detail="No existe.")
@@ -2975,23 +2816,265 @@ def eliminar_anexo(empresa_id: str, doc_id: str, user: dict = Depends(es_admin))
     
     url = f"{repo.base_url}/empresas/{empresa_id}/plantillas_anexo/{doc_id}"
     requests.delete(url, headers=repo.headers, timeout=10)
-    return {"status": "eliminada", "id": doc_id}
+    return {"status": "Anexo eliminado", "id": doc_id}
 
 @router_anexo.post("/generar-documento-anexo")
 async def api_generar_subir_anexo_dinamico(payload: DocumentoDinamicoGeneracionSchema, db: Session = Depends(get_db),user: dict = Depends(es_usuario)):
     logger.info(
-        "[PDF_ANEXO] Endpoint /generar-anexo | empresa_id=%s | doc_id=%s",
+        "[PDF_ANEXO] Endpoint /generar-anexo | empresa_id=%s | id_plantilla=%s",
         payload.empresa_id,
-        payload.doc_id,
+        payload.id_plantilla,
     )
 
-    generador = GenerarPDFAnexo(FirebaseRepository())
-    return await generador.generar_por_doc_id(
+    generador = GenerarPDFDinamico(FirebaseRepository())
+    return await generador.generar_pdf_por_id_plantilla(
         empresa_id=payload.empresa_id.strip(),
-        doc_id=payload.doc_id.strip(),
+        id_plantilla=payload.id_plantilla.strip(),
         folio=(payload.folio or "").strip() or None,
+        coleccion="Anexos",
         db=db,
         subir_bucket=True,
     )
+
+#endregion
+
+#region CRUD Membrete de Hoja
+
+@router_membrete.get("/Listar-membretes")
+def listar_membretes(empresa_id: str, user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    docs = repo.listar_membretes(empresa_id)
+    resultado = []
+    for d in docs:
+        f = d.get("fields", {})
+        resultado.append({
+            "id": d["name"].split("/")[-1],
+            "nombre": f.get("nombre", {}).get("stringValue", ""),
+            "categoria": f.get("categoria", {}).get("stringValue", ""),
+            "ImagenMembretada": {
+                k: v.get("stringValue")
+                for k, v in f.get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+            "ImagenMembretada_meta": {
+                k: {
+                    meta_key: meta_val.get("stringValue")
+                    for meta_key, meta_val in info.get("mapValue", {}).get("fields", {}).items()
+                }
+                for k, info in f.get("ImagenMembretada_meta", {}).get("mapValue", {}).get("fields", {}).items()
+            },
+        })
+    return resultado
+
+@router_membrete.post("/Subir-membrete", status_code=201)
+async def subir_membrete(
+    empresa_id: str,
+    datos_json: Optional[str] = Form(default=None),
+    archivos: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(es_usuario),
+):
+    if not datos_json:
+        raise HTTPException(status_code=400, detail="Debes enviar datos_json con los datos del membrete.")
+    try:
+        data_obj = MembreteParaHoja(**json.loads(datos_json))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"datos_json inválido: {str(exc)}") from exc
+
+    imagen_map = {}
+    imagen_meta = {}
+    if archivos:
+        for f in archivos:
+            if f and f.filename:
+                contenido = await f.read()
+                imagen_map[f.filename] = base64.b64encode(contenido).decode("utf-8")
+                mime_type = f.content_type or mimetypes.guess_type(f.filename)[0] or "application/octet-stream"
+                imagen_meta[f.filename] = {
+                    "mime_type": mime_type,
+                    "tipo_visual": "image" if str(mime_type).startswith("image/") else "file",
+                }
+
+    repo = FirebaseRepository()
+    nombre_id = repo.generar_siguiente_id_membrete(empresa_id)
+    url = f"{repo.base_url}/empresas/{empresa_id}/membrete_hoja?documentId={nombre_id}"
+
+    payload = {
+        "fields": {
+            "id": {"stringValue": nombre_id},
+            "nombre": {"stringValue": data_obj.nombre},
+            "categoria": {"stringValue": data_obj.categoria},
+        }
+    }
+
+    if imagen_map:
+        payload["fields"]["ImagenMembretada"] = {
+            "mapValue": {"fields": {k: {"stringValue": v} for k, v in imagen_map.items()}}
+        }
+        payload["fields"]["ImagenMembretada_meta"] = {
+            "mapValue": {
+                "fields": {
+                    k: {
+                        "mapValue": {
+                            "fields": {
+                                "mime_type": {"stringValue": v["mime_type"]},
+                                "tipo_visual": {"stringValue": v["tipo_visual"]},
+                            }
+                        }
+                    }
+                    for k, v in imagen_meta.items()
+                }
+            }
+        }
+
+    r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"Error creando membrete: {r.text}")
+
+    return {"status": "Membrete creado", "id": nombre_id}
+
+@router_membrete.patch("/Actualizar-membrete")
+async def actualizar_membrete(
+    empresa_id: str,
+    doc_id: str,
+    datos_json: Optional[str] = Form(default=None),
+    archivos: Optional[List[UploadFile]] = File(None),
+    user: dict = Depends(es_usuario),
+):
+    # 1. Normalizar datos
+    data_obj, archivos_map, archivos_meta = await UtilsNotifications._normalizar_payload_y_archivos(
+        model_cls=MembreteParaHojaUpdate,
+        datos_modelo=None,
+        datos_json=datos_json,
+        archivos=archivos,
+    )
+
+    # 2. CONVERSIÓN CRÍTICA: Convertir objeto Pydantic a Diccionario
+    data = data_obj.model_dump(exclude_unset=True) if hasattr(data_obj, "model_dump") else data_obj.dict(exclude_unset=True)
+
+    repo = FirebaseRepository()
+
+    # 3. Actualizar datos principales
+    res = repo.actualizar_membrete(empresa_id, doc_id, data_obj)
+
+    # 4. Procesar archivos si existen
+    archivos_viejos = data.get("ImagenMembretada", {})
+    meta_vieja = data.get("ImagenMembretada_meta", {})
+
+    # Unimos (los nuevos sobreescriben si tienen el mismo nombre)
+    archivos_finales = {**archivos_viejos, **archivos_map}
+    meta_final = {**meta_vieja, **archivos_meta}
+
+    if archivos_finales:
+        url = f"{repo.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}"
+        payload_files = {
+            "fields": {
+                "ImagenMembretada": {
+                    "mapValue": {
+                        "fields": {k: {"stringValue": v} for k, v in archivos_finales.items()}
+                    }
+                },
+                "ImagenMembretada_meta": {
+                    "mapValue": {
+                        "fields": {
+                            k: {
+                                "mapValue": {
+                                    "fields": {
+                                        "mime_type": {"stringValue": v["mime_type"]},
+                                        "tipo_visual": {"stringValue": v["tipo_visual"]},
+                                    }
+                                }
+                            } for k, v in meta_final.items()
+                        }
+                    }
+                }
+            }
+        }
+        
+        # Corregimos la updateMask para incluir AMBOS campos
+        params = [
+            ("updateMask.fieldPaths", "ImagenMembretada"),
+            ("updateMask.fieldPaths", "ImagenMembretada_meta")
+        ]
+        
+        res_files = requests.patch(
+            url,
+            json=payload_files,
+            params=params,
+            headers=repo.headers,
+            timeout=10,
+        )
+        if res_files.status_code != 200:
+            raise HTTPException(status_code=res_files.status_code, detail=f"Error subiendo archivos: {res_files.text}")
+
+    return {"status": "Membrete actualizado", "id": doc_id}
+
+@router_membrete.delete("/Eliminar-membrete")
+def eliminar_membrete(empresa_id: str, doc_id: str, user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    doc = repo.obtener_membrete(empresa_id, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Membrete no encontrado.")
+    url = f"{repo.base_url}/empresas/{empresa_id}/membrete_hoja/{doc_id}"
+    requests.delete(url, headers=repo.headers, timeout=10)
+    return {"status": "Membrete eliminado", "id": doc_id}
+
+#endregion
+
+#region CRUD Firmantes de empresa
+
+@router_firmantes_empresa.get("/Listar-firmantes-empresa")
+def listar_firmantes_empresa(empresa_id: str, user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    docs = repo.listar_firmantes_empresa(empresa_id)
+    resultado = []
+    for d in docs:
+        f = d.get("fields", {})
+        resultado.append({
+            "id": d["name"].split("/")[-1],
+            "nombre": f.get("nombre", {}).get("stringValue", ""),
+            "puesto": f.get("puesto", {}).get("stringValue", ""),
+            "departamento": f.get("departamento", {}).get("stringValue", ""),
+            "email": f.get("email", {}).get("stringValue", ""),
+            "activo": f.get("activo", {}).get("booleanValue", False)
+        })
+    return resultado
+
+@router_firmantes_empresa.post("/Agregar-firmante-empresa", status_code=201)
+def agregar_firmante_empresa(empresa_id: str, datos_json: Optional[FirmantesEmpresaBase] = Body(default=None), user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    nombre_id = repo.generar_siguiente_id_firmantes_empresa(empresa_id)
+    url = f"{repo.base_url}/empresas/{empresa_id}/firmantes-empresa?documentId={nombre_id}"
+    
+    payload = {"fields": {
+        "id": {"stringValue": nombre_id},
+        "nombre": {"stringValue": datos_json.nombre},
+        "puesto": {"stringValue": datos_json.puesto},
+        "departamento": {"stringValue": datos_json.departamento},
+        "email": {"stringValue": datos_json.email},
+        "activo": {"booleanValue": False}
+        }
+    }
+    r = requests.post(url, json=payload, headers=repo.headers, timeout=10)
+    if r.status_code == 200 and datos_json:
+        return {"status": "Firmante agregado", "id": nombre_id}
+
+@router_firmantes_empresa.patch("/Actualizar-firmante-empresa")
+def actualizar_firmante_empresa(empresa_id: str, doc_id: str, datos_json: Optional[FirmantesEmpresaUpdate] = Body(default=None), user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    res = repo.actualizar_plantilla_firmantes_empresa(empresa_id, doc_id, datos_json)
+    
+    if res and res.status_code == 200:
+        return {"status": "Firmante actualizado", "id": doc_id}
+    
+    # Manejo de error por si falla la API de Google
+    raise HTTPException(status_code=res.status_code, detail="No se pudo actualizar en Firestore")
+
+@router_firmantes_empresa.delete("/Eliminar-firmante-empresa")
+def eliminar_firmante_empresa(empresa_id: str, doc_id: str, user: dict = Depends(es_usuario)):
+    repo = FirebaseRepository()
+    doc = repo.obtener_un_doc_completo_firmantes_empresa(empresa_id, doc_id)
+    if not doc: raise HTTPException(status_code=404, detail="No existe.")
+    
+    url = f"{repo.base_url}/empresas/{empresa_id}/firmantes-empresa/{doc_id}"
+    requests.delete(url, headers=repo.headers, timeout=10)
+    return {"status": "Firmante eliminado", "id": doc_id}
 
 #endregion 

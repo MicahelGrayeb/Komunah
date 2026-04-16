@@ -526,17 +526,28 @@ class IncidenciasResponse(BaseModel):
 class DocumentosDinamicosBase(BaseModel):
     nombre: str
     categoria: str
+    encabezado: Optional[str] = None
     html: str
+    footer: Optional[str] = None
     tamanoDocumento: str
     activo: bool = False
     tieneAnexos: Optional[bool] = False
     anexos: Optional[Union[Dict[str, str], List[str]]] = None
     tags: Optional[List[str]] = None
+    # htmlLibre: Optional[bool] = None
+    FirmantesEmpresa: Optional[bool] = None
+    FirmasCoopropietarios: Optional[bool] = None
+    FirmantesPersonalizados: Optional[List[str]] = None
+    HojaMembretadaProyecto: Optional[bool] = None
+    membrete_id: Optional[str] = None
+
 
 class DocumentosDinamicosUpdate(BaseModel):
     nombre: Optional[str] = None
     categoria: Optional[str] = None
+    encabezado: Optional[str] = None
     html: Optional[str] = None
+    footer: Optional[str] = None
     activo: Optional[bool] = None
     tieneAnexos: Optional[bool] = None
     anexos: Optional[Union[Dict[str, str], List[str]]] = None
@@ -544,36 +555,67 @@ class DocumentosDinamicosUpdate(BaseModel):
     tamanoDocumento: Optional[str] = None
     archivos_subidos: Optional[Dict[str, str]] = None
     archivos_subidos_meta: Optional[Dict[str, Any]] = None
+    # htmlLibre: Optional[bool] = None
+    FirmantesEmpresa: Optional[bool] = None
+    FirmasCoopropietarios: Optional[bool] = None
+    FirmantesPersonalizados: Optional[List[str]] = None
+    HojaMembretadaProyecto: Optional[bool] = None
+    membrete_id: Optional[str] = None
 
 class AnexosBase(BaseModel):
     nombre: str
-    # htmlLibre: Optional[bool] = None
-    # FirmastesEmpresa: Optional[bool] = None
-    # FirmasCoopropietarios: Optional[bool] = None
-    # HojaMebretadaProyecto: Optional[bool] = None
     categoria: str
     subcategorianexo: Optional[str] = None
-    # encabezado: Optional[str] = None
+    encabezado: Optional[str] = None
     contenido: str
-    # footer: Optional[str] = None
+    footer: Optional[str] = None
     tamanoDocumento: str
     tags: Optional[List[str]] = None
+    # htmlLibre: Optional[bool] = None
+    FirmantesEmpresa: Optional[bool] = None
+    FirmasCoopropietarios: Optional[bool] = None
+    FirmantesPersonalizados: Optional[List[str]] = None
+    HojaMembretadaProyecto: Optional[bool] = None
+    membrete_id: Optional[str] = None
 
 class AnexosUpdate(BaseModel):
     nombre: str
-    # htmlLibre: Optional[bool] = None
-    # FirmastesEmpresa: Optional[bool] = None
-    # FirmasCoopropietarios: Optional[bool] = None
-    # HojaMebretadaProyecto: Optional[bool] = None
     categoria: str
     subcategorianexo: Optional[str] = None
-    # encabezado: Optional[str] = None
+    encabezado: Optional[str] = None
     contenido: str
-    # footer: Optional[str] = None
+    footer: Optional[str] = None
     tamanoDocumento: Optional[str] = None
     tags: Optional[List[str]] = None
+    # htmlLibre: Optional[bool] = None
+    FirmantesEmpresa: Optional[bool] = None
+    FirmasCoopropietarios: Optional[bool] = None
+    FirmantesPersonalizados: Optional[List[str]] = None
+    HojaMembretadaProyecto: Optional[bool] = None
+    membrete_id: Optional[str] = None
 
+class FirmantesEmpresaBase(BaseModel):
+    nombre: str
+    puesto: str
+    departamento: Optional[str] = None
+    email: str
 
+class FirmantesEmpresaUpdate(BaseModel):
+    nombre: Optional[str] = None
+    puesto: Optional[str] = None
+    departamento: Optional[str] = None
+    email: Optional[str] = None
+    activo: Optional[bool] = None
+
+class MembreteParaHoja(BaseModel):
+    nombre: str
+    categoria: str
+
+class MembreteParaHojaUpdate(BaseModel):
+    nombre: Optional[str] = None
+    categoria: Optional[str] = None
+    ImagenMembretada: Optional[Dict[str, str]] = None
+    ImagenMembretada_meta: Optional[Dict[str, Any]] = None
 
 class ReporteExpedientesDetalladoResponse(BaseModel):
     folio: Any = Field(alias="FOLIO")
@@ -610,8 +652,9 @@ class DocumentosSchemaGeneracion(BaseModel):
 
 class DocumentoDinamicoGeneracionSchema(BaseModel):
     empresa_id: str
-    doc_id: str
+    id_plantilla: str
     folio: Optional[str] = None
+    coleccion: Optional[str] = None
 
 class DocumentosFiltroSchema(BaseModel):
     categoria: Optional[str] = None

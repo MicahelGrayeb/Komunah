@@ -7,6 +7,8 @@ from typing import List
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import logging
+import re
+from num2words import num2words
 from sqlalchemy import text, func
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,89 @@ def _normalizar_lista_entrada(valores: List[str]) -> List[str]:
             if limpio:
                 salida.append(limpio)
     return salida
+
+def aplicar_formato_etiqueta(tag: str, valor: any):
+    if valor in [None, "", "None", "NULL"]:
+        return ""
+    
+    tag_l = tag.lower()
+    val_str = str(valor).strip()
+
+    try:
+        # --- REGLAS DE TEXTO ---
+        if "nombre_del_cliente" in tag_l or "{cl.cliente}" in tag_l or "{f.nombre_cliente}" in tag_l:
+            return val_str.upper()
+
+        # --- REGLAS DE NÚMEROS (CORRECCIÓN: Se quita el split plano para usar lo ya procesado) ---
+        # No modificamos v.numero aquí, ya que Jurídico usa sus propias etiquetas f. procesadas con Regex.
+
+        # --- REGLAS DE FECHAS ---
+        if "formato_fechas" in tag_l or "{cl.fecha}" in tag_l or "{f.fecha_mensualidades}" in tag_l:
+            # Si es una lista de fechas (Jurídico), no aplicamos fecha_a_letra a todo el string
+            if "{f.fecha_mensualidades}" in tag_l: return val_str
+            return fecha_a_letra(val_str)
+
+        # --- REGLAS NUMÉRICAS ---
+        # Manejamos etiquetas que piden conversión a LETRAS (Jurídico)
+        if "_letra" in tag_l:
+            return monto_a_letra(val_str)
+
+        num_val = float(val_str)
+        
+        # Metros cuadrados
+        if "metros_cuadrados" in tag_l or "m2" in tag_l:
+            return f"{num_val:.2f}"
+            
+        # Moneda (Comas, puntos y signo $)
+        if any(x in tag_l for x in ["precio", "monto", "saldo", "importe", "enganche", "apartado", "pago_72", "pena"]):
+            if "letra" in tag_l:
+                return monto_a_letra(num_val)
+            return f"${num_val:,.2f}"
+
+    except (ValueError, TypeError):
+        pass
+        
+    return valor
+
+def fecha_a_letra(fecha_str):
+    """Convierte 2022-10-03 a 'tres de octubre de dos mil veintidos'"""
+    try:
+        dt = datetime.strptime(fecha_str, '%Y-%m-%d')
+        meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", 
+                "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        dia_letra = num2words(dt.day, lang='es')
+        mes_letra = meses[dt.month - 1]
+        anio_letra = num2words(dt.year, lang='es')
+        return f"{dia_letra} de {mes_letra} de {anio_letra}"
+    except:
+        return fecha_str
+
+def fecha_estilo_contrato(fecha_input):
+    """Convierte 2022-10-03 a '3 de octubre del 2022'"""
+    if not fecha_input: return ""
+    try:
+        if isinstance(fecha_input, str):
+            dt = datetime.strptime(fecha_input.split(" ")[0], '%Y-%m-%d')
+        else:
+            dt = fecha_input
+            
+        meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", 
+                    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+        
+        return f"{dt.day} de {meses[dt.month - 1]} del {dt.year}"
+    except:
+        return str(fecha_input)
+
+def monto_a_letra(monto):
+    """Convierte 664929.24 a formato legal MONEDA NACIONAL"""
+    try:
+        monto = float(monto)
+        entero = int(monto)
+        decimales = int(round((monto - entero) * 100))
+        letras = num2words(entero, lang='es').upper()
+        return f"({letras} PESOS {decimales:02d}/100 MONEDA NACIONAL)"
+    except:
+        return ""
 
 def get_komunah_data(folio_ref: str, db: Session):
     logger.info("[DATOS_KOMUNAH] Entrada get_komunah_data | folio=%s", folio_ref)
@@ -158,8 +243,8 @@ def get_komunah_data(folio_ref: str, db: Session):
         "{cl.cliente}": str(getattr(venta, 'cliente', "")),
         "{cl.num}": str(getattr(p_act, 'number', "")) if p_act else "",
         "{cl.fecha}": str(getattr(p_act, 'date', "")) if p_act else "",
-        "{cl.fecha_pago}": fecha_pago_humanizada,
-        "{cl.dias_para_pago}": dias_para_vencer,
+        "{cl.fecha_pago}": fecha_pago_humanizada if fecha_pago_humanizada else "N/A",
+        "{cl.dias_para_pago}": dias_para_vencer if dias_para_vencer is not None else "",
         "{cl.concepto}": str(getattr(p_act, 'concept', "")) if p_act else "",
         "{cl.proyecto}": str(getattr(venta, 'desarrollo', ""))
     })
@@ -317,6 +402,81 @@ def get_komunah_data(folio_ref: str, db: Session):
         "{ven.saldo_total_vencido}": f"${saldo_total_vencido:,.2f}",#
 
     })
+
+    # --- LÓGICA DE EXTRACCIÓN Y CÁLCULOS JURÍDICO ---
+    
+    # 1. Filtramos solo mensualidades de financiamiento ('financing')
+    finance_amts = [a for a in amortizaciones if a.concept == "financing"]
+    num_pagos_financiamiento = len(finance_amts)
+    
+    # 2. Fechas de financiamiento (Primera y Última)
+    f_inicio_finan = ""
+    f_fin_finan = ""
+    rango_texto = ""
+    rango_letra = ""
+    primer_enganche = "" 
+    monto_parcialidad = ""
+    
+    if finance_amts:
+        f_inicio_finan = str(finance_amts[0].date)
+        f_fin_finan = str(finance_amts[-1].date)
+        rango_texto = f"{f_inicio_finan} - {f_fin_finan}"
+        rango_letra = f"{fecha_estilo_contrato(f_inicio_finan)} al {fecha_estilo_contrato(f_fin_finan)}"
+        primer_enganche = next((str(a.date) for a in amortizaciones if a.concept == "down_payment"), "")
+        monto_parcialidad = next((str(a.total) for a in amortizaciones if a.concept == "financing"), "")  
+
+    # 3. Cálculo de Penas (Dinero basado en el monto de la mensualidad)
+    # Tomamos el monto de la primera mensualidad de financiamiento
+    monto_mensual = float(finance_amts[0].total) if finance_amts else 0.0
+    mitad_plazo = num_pagos_financiamiento // 2
+    pena_val = mitad_plazo * monto_mensual
+    pena_2_val = (mitad_plazo + 1) * monto_mensual
+
+    # 4. Procesamiento de Número y Comercial (Regex)
+    num_original = str(getattr(venta, 'numero', "")).strip()
+    num_comercial = num_original
+    num_registral = ""
+    if "-" in num_original or "–" in num_original:
+        partes = re.split(r'\s*[\-\–]\s*', num_original)
+        num_comercial = partes[0].strip()
+        if len(partes) > 1:
+            match_reg = re.search(r'(\d+)$', partes[1].strip())
+            num_registral = match_reg.group(1) if match_reg else ""
+
+    # 5. CAlculo de porcentaje
+    monto_apartado = sum(float(a.total or 0) for a in amortizaciones if a.concept == "initial_payment")
+    monto_enganche = sum(float(a.total or 0) for a in amortizaciones if a.concept == "down_payment")
+    total_enganche_a_pagar = monto_apartado + monto_enganche
+    precio_total_venta = float(getattr(venta, 'precio_final', 1) or 1)
+    porcentaje_calculado = (total_enganche_a_pagar / precio_total_venta) * 100
+
+    # 5. Actualización de data
+    data.update({
+        "{j.cliente}": getattr(venta, 'cliente', "").upper(),
+        "{j.coopropietario_1}": getattr(venta, 'cliente_2', "").upper(),
+        "{j.coopropietario_2}": getattr(venta, 'cliente_3', "").upper(),
+        "{j.coopropietario_3}": getattr(venta, 'cliente_4', "").upper(),
+        "{j.coopropietario_4}": getattr(venta, 'cliente_5', "").upper(),
+        "{j.coopropietario_5}": getattr(venta, 'cliente_6', "").upper(),
+        "{j.numero_comercial}": num_comercial,
+        "{j.numero_registral}": num_registral,
+        "{j.precio_final_letra}": float(getattr(venta, 'precio_final', 0) or 0),
+        "{j.apartado_letra}": float(getattr(venta, 'apartado', 0) or 0),
+        "{j.enganche_letra}": float(getattr(venta, 'total_enganche', 0) or 0),
+        "{j.monto_sin_interes_letra}": float(getattr(venta, 'monto_sin_interes', 0) or 0),
+        "{j.referencia_lote}": f"010100R{num_comercial}",
+        "{j.saldo_final}": (float(getattr(venta, 'precio_final', 0) or 0) - sum(float(a.total or 0) for a in amortizaciones[:-1])) if amortizaciones else 0,
+        "{j.saldo_final_letra}": float(getattr(venta, 'precio_final', 0) or 0) - sum(float(a.total or 0) for a in amortizaciones[:-1]) if amortizaciones else 0,
+        "{j.fecha_mensualidades}": rango_texto, 
+        "{j.numero_de_pagos}": num_pagos_financiamiento,
+        "{j.primera_mensualidad}": f_inicio_finan,
+        "{j.primer_enganche}": primer_enganche,
+        "{j.monto_parcialidad}": monto_parcialidad,
+        "{j.porcentaje}": f"{porcentaje_calculado:.2f}%",
+        "{j.pena}": pena_val,
+        "{j.pena_2}": pena_2_val,
+        "{j.fecha_hoy_escrita}": fecha_estilo_contrato(datetime.now(ZoneInfo("America/Mexico_City")))
+    })
     
     logger.info("[DATOS_KOMUNAH] Paso: salida get_komunah_data | folio=%s | tags=%s", folio_ref, len(data))
     return data
@@ -434,7 +594,7 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
     Si hay flat_data, FILTRA lo vacío y devuelve {tag, valor}.
     """
     logger.info("[DATOS_KOMUNAH] Entrada get_komunah_diccionario_maestro | con_data=%s", flat_data is not None)
-
+    
     # Helper para extraer tags de SQL y filtrar si no hay data
     def extraer_tags(modelo, prefijo):
         resultado = []
@@ -444,11 +604,12 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
                 valor = flat_data.get(tag)
                 # SOLO añadimos si el valor no es None ni vacío
                 if valor not in [None, "", "None", "NULL"]:
-                    resultado.append({"tag": tag, "valor": valor})
+                    valor_formateado = aplicar_formato_etiqueta(tag, valor)
+                    resultado.append({"tag": tag, "valor": valor_formateado})
             else:
                 resultado.append(tag)
         return resultado
-
+    
     # Helper para variables manuales
     def procesar_manual(lista_tags):
         resultado = []
@@ -456,11 +617,12 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
             if flat_data:
                 valor = flat_data.get(t)
                 if valor not in [None, "", "None", "NULL"]:
-                    resultado.append({"tag": t, "valor": valor})
+                    valor_formateado = aplicar_formato_etiqueta(t, valor)
+                    resultado.append({"tag": t, "valor": valor_formateado})
             else:
                 resultado.append(t)
         return resultado
-
+    
     catalogo = []
 
     # 1. Cálculos de Cobranza (ven.)
@@ -476,6 +638,7 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
         "{ven.cuota_mes_pendiente}",
         "{ven.dias_atraso}"
     ])
+
     if vars_ven: catalogo.append({"categoria": "Cálculos de Cobranza y Deuda (ven.)", "variables": vars_ven})
 
     # 2. Información de Venta (v.)
@@ -499,6 +662,7 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
         "{cl.concepto}", 
         "{cl.proyecto}"
     ])
+
     if vars_cl: catalogo.append({"categoria": "Datos Formateados para el Cliente (cl.)", "variables": vars_cl})
 
     # 5. Control (sys.)
@@ -517,7 +681,39 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
         if vars_gi:
             catalogo.append({"categoria": f"Switches y Gestión del Integrante {i} (g{i}.)", "variables": vars_gi})
 
+    # 8. Etiquetas Jurídico
+    vars_f = procesar_manual([
+        "{j.cliente}",
+        "{j.coopropietario_1}",
+        "{j.coopropietario_2}",
+        "{j.coopropietario_3}",
+        "{j.coopropietario_4}",
+        "{j.coopropietario_5}",
+        "{j.numero_comercial}",
+        "{j.numero_registral}",
+        "{j.precio_final_letra}",
+        "{j.apartado_letra}",
+        "{j.enganche_letra}",
+        "{j.monto_sin_interes_letra}",
+        "{j.referencia_lote}",
+        "{j.saldo_final}",
+        "{j.saldo_final_letra}",
+        "{j.fecha_mensualidades}",
+        "{j.fecha_hoy_escrita}",
+        "{j.primera_mensualidad}",
+        "{j.primer_enganche}",
+        "{j.monto_parcialidad}",
+        "{j.numero_de_pagos}",
+        "{j.porcentaje}",
+        "{j.pena}",
+        "{j.pena_2}"
+    ])
+
+    if vars_f: 
+        catalogo.append({"categoria": "Etiquetas Jurídico", "variables": vars_f })
+
     logger.info("[DATOS_KOMUNAH] Salida get_komunah_diccionario_maestro | categorias=%s", len(catalogo))
+
     return catalogo
 
 def set_email_komunah_marketing(client_id: str, estado: bool, db: Session):

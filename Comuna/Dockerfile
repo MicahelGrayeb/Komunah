@@ -5,8 +5,13 @@ ENV PYTHONUNBUFFERED=1
 ENV GOOGLE_APPLICATION_CREDENTIALS=/app/serviceAccountKeyVERTEXIA.json
 ENV STORAGE_CREDENTIALS_PATH=/app/serviceAccountKeySTORAGE.json
 WORKDIR /app
-COPY requirements.txt .
-RUN apt-get update && apt-get install -y gcc libffi-dev musl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libffi-dev \
+    fontconfig \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+RUN fc-cache -f -v
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install-deps chromium

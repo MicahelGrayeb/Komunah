@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/documentos", tags=["Documentos Google Cloud Storage (Bucket)"])
 BUCKET_NAME = "bucket-grupo-komunah-juridico"
-BASE_PREFIX_DOCUMENTOS = "Komunah/PlantillasWeb/Categorias/"
+BASE_PREFIX_DOCUMENTOS = "Komunah/"
 
 EMPRESAS_AUTORIZADAS = ["komunah", "empresa_test"]
 PROVIDERS = {
@@ -110,13 +110,27 @@ class GCSDocumentosService:
         }
 
     def _extract_categoria_cliente(self, blob_name: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Extrae la categoría y el cliente de forma dinámica.
+        Busca el cliente asumiendo que es la carpeta que contiene directamente al archivo.
+        """
         if not blob_name.startswith(self.base_prefix):
             return None, None
-        resto = blob_name[len(self.base_prefix):]
-        partes = resto.split("/")
+
+        # Ejemplo blob_name: "Komunah/Documentos/Completos/Comprobante de pago/Victor Manuel/archivo.pdf"
+        partes = blob_name.split("/")
+        
         if len(partes) < 3:
             return None, None
-        return partes[0], partes[1]
+
+        # El nombre del archivo es partes[-1]
+        # El nombre del cliente suele ser la carpeta inmediata superior: partes[-2]
+        # La categoría la podemos definir como la carpeta que está justo antes del cliente: partes[-3]
+        
+        cliente = partes[-2]
+        categoria = partes[-3] if len(partes) > 3 else "General"
+
+        return categoria, cliente
 
     def list_documents(
         self,
@@ -126,50 +140,47 @@ class GCSDocumentosService:
         fecha_fin: Optional[date] = None,
         clientes_permitidos: Optional[List[str]] = None,
     ) -> List[dict]:
-        logger.info(
-            "[DOCUMENTOS] list_documents | categoria=%s | cliente=%s | fecha_inicio=%s | fecha_fin=%s | clientes_permitidos=%s",
-            categoria,
-            cliente,
-            fecha_inicio,
-            fecha_fin,
-            len(clientes_permitidos or []),
-        )
-        if fecha_inicio and fecha_fin and fecha_inicio > fecha_fin:
-            raise HTTPException(status_code=400, detail="fecha_inicio no puede ser mayor que fecha_fin.")
-
-        categorias = [categoria] if categoria else self._list_categories()
+        # Log de inicio de búsqueda mas amplia
+        logger.info("[DOCUMENTOS] Buscando en TODA la ruta de Komunah/")
+        
+        # Eliminamos el bucle 'for cat in categorias' para buscar de forma global
         documentos = []
         clientes_set = {c.strip().lower() for c in clientes_permitidos} if clientes_permitidos else None
         cliente_normalizado = cliente.strip().lower() if cliente else None
 
-        for cat in categorias:
-            prefix_cat = f"{self.base_prefix}{cat}/"
-            for blob in self.bucket.list_blobs(prefix=prefix_cat):
-                if blob.name.endswith("/"):
+        # Listamos TODO bajo "Komunah/" de un solo golpe
+        for blob in self.bucket.list_blobs(prefix=self.base_prefix):
+            if blob.name.endswith("/"):
+                continue
+
+            cat_blob, cliente_blob = self._extract_categoria_cliente(blob.name)
+            if not cat_blob or not cliente_blob:
+                continue
+
+            cliente_blob_normalizado = cliente_blob.strip().lower()
+
+            # Filtro por cliente específico (si se pasa por query)
+            if cliente_normalizado and cliente_normalizado not in cliente_blob_normalizado:
+                continue
+
+            # Filtro por lista de clientes (si viene de un Folio)
+            if clientes_set and cliente_blob_normalizado not in clientes_set:
+                continue
+
+            # Filtro por categoría (si se pasa por query)
+            if categoria and categoria.lower() not in cat_blob.lower():
+                continue
+
+            # Filtro de fechas
+            if blob.time_created:
+                created_date = blob.time_created.date()
+                if fecha_inicio and created_date < fecha_inicio:
+                    continue
+                if fecha_fin and created_date > fecha_fin:
                     continue
 
-                cat_blob, cliente_blob = self._extract_categoria_cliente(blob.name)
-                if not cat_blob or not cliente_blob:
-                    continue
+            documentos.append(self._blob_to_payload(blob, cat_blob, cliente_blob))
 
-                cliente_blob_normalizado = cliente_blob.strip().lower()
-
-                if cliente_normalizado and cliente_blob_normalizado != cliente_normalizado:
-                    continue
-
-                if clientes_set and cliente_blob_normalizado not in clientes_set:
-                    continue
-
-                if blob.time_created:
-                    created_date = blob.time_created.date()
-                    if fecha_inicio and created_date < fecha_inicio:
-                        continue
-                    if fecha_fin and created_date > fecha_fin:
-                        continue
-
-                documentos.append(self._blob_to_payload(blob, cat_blob, cliente_blob))
-
-        logger.info("[DOCUMENTOS] list_documents completado | total=%s", len(documentos))
         return documentos
 
     def get_download_url(self, blob_path: str) -> dict:

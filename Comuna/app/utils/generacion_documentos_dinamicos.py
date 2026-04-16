@@ -6,6 +6,7 @@ import io
 from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from zoneinfo import ZoneInfo
+from pypdf import PdfWriter, PdfReader
 from sqlalchemy.orm import Session
 from ..utils.datos_proveedores import (
     get_komunah_data, set_wa_komunah_lote, set_email_komunah_lote, 
@@ -16,7 +17,7 @@ from ..utils.datos_proveedores import (
 from fastapi import HTTPException
 from google.cloud import storage
 from playwright.async_api import async_playwright
-from ..models import Amortizacion
+from ..models import Amortizacion, Venta
 
 logger = logging.getLogger(__name__)
 BUCKET_NAME = "bucket-grupo-komunah-juridico"
@@ -32,6 +33,8 @@ def _get_providers():
 class GenerarPDFUseCase:
     def __init__(self, repo):
         self.repo = repo
+
+#region Funciones auxiliares de normalización, formateo y construcción de HTML
 
     @staticmethod
     def _normalizar_fragmento(valor: Any, fallback: str = "N/A") -> str:
@@ -107,6 +110,56 @@ class GenerarPDFUseCase:
         return re.sub(regex_seguro, "", texto)
 
     @staticmethod
+    def _normalizar_template_header_footer(template_html: str) -> str:
+        """Normaliza HTML de Word para usarlo en header/footer de Playwright."""
+        if not template_html:
+            return ""
+
+        html = str(template_html)
+        # Remueve clases Mso* que dependen de estilos externos no disponibles en templates de PDF.
+        html = re.sub(r'\sclass="[^"]*\bMso[^"]*"', "", html, flags=re.IGNORECASE)
+        # Remueve propiedades mso-* inline para evitar render inconsistente.
+        html = re.sub(r"mso-[a-zA-Z\-]+\s*:\s*[^;\"']*;?", "", html, flags=re.IGNORECASE)
+        # Limpia estilos vacios y espacios sobrantes.
+        html = re.sub(r'\sstyle="\s*"', "", html)
+        return html.strip()
+
+    @staticmethod
+    def _envolver_template_header_footer(template_html: str, posicion: str) -> str:
+        contenido = GenerarPDFUseCase._normalizar_template_header_footer(template_html)
+        if not contenido:
+            return "<span></span>"
+
+        margen = "margin-top: 10px;" if posicion == "header" else "margin-bottom: 10px;"
+        estilo_base = "font-size: 12px; line-height: 1.3; width: 100%; text-align: center; color: black; padding: 0 10px;"
+        return f"<div style=\"{estilo_base} {margen}\">{contenido}</div>"
+
+    @staticmethod
+    def _construir_pdf_kwargs(tamano_documento: str, encabezado_final: str, footer_final: str) -> dict:
+        tiene_encabezado = bool(encabezado_final)
+        tiene_footer = bool(footer_final)
+
+        pdf_kwargs = {
+            "format": tamano_documento,
+            "print_background": True,
+            "prefer_css_page_size": True,
+            "scale": 1.0,
+            "margin": {
+                "top": "2cm" if tiene_encabezado else "0px",
+                "bottom": "2cm" if tiene_footer else "0px",
+                "left": "0px",
+                "right": "0px",
+            },
+        }
+
+        if tiene_encabezado or tiene_footer:
+            pdf_kwargs["display_header_footer"] = True
+            pdf_kwargs["header_template"] = GenerarPDFUseCase._envolver_template_header_footer(encabezado_final, "header")
+            pdf_kwargs["footer_template"] = GenerarPDFUseCase._envolver_template_header_footer(footer_final, "footer")
+
+        return pdf_kwargs
+
+    @staticmethod
     def _a_float(valor: Any) -> float:
         try:
             return float(valor)
@@ -169,6 +222,204 @@ class GenerarPDFUseCase:
         ids_unicos = list(dict.fromkeys(ids_anexos))
         logger.info("[PDF_GENERADOR] Salida _obtener_ids_anexos_desde_fields | total_ids=%s", len(ids_unicos))
         return ids_unicos
+
+    @staticmethod
+    def _es_booleano_activo(valor: Any) -> bool:
+        if isinstance(valor, bool):
+            return valor
+        if valor is None:
+            return False
+        return str(valor).strip().lower() in {"true", "1", "si", "yes"}
+
+    @staticmethod
+    def _normalizar_lista_nombres(nombres: List[Any]) -> List[str]:
+        resultado: List[str] = []
+        for nombre in nombres or []:
+            nombre_txt = str(nombre).strip() if nombre is not None else ""
+            if nombre_txt and nombre_txt.lower() not in {"none", "null", "n/a", "na"}:
+                resultado.append(nombre_txt)
+        return list(dict.fromkeys(resultado))
+
+    @staticmethod
+    def _inyectar_membretada_fondo(html: str, imagen_base64: str) -> str:
+        if not html or not imagen_base64:
+            return html
+
+        estilos_pdf = """
+        <style>
+            .kmh-watermark {
+                position: fixed;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                pointer-events: none;
+                z-index: 0;
+            }
+
+            .kmh-watermark img {
+                width: 100%;
+                max-width: 100%;
+                height: auto;
+                object-fit: contain;
+                opacity: 0.20;
+            }
+
+            body > *:not(.kmh-watermark) {
+                position: relative;
+                z-index: 1;
+            }
+
+            @media print {
+                html, body {
+                    -webkit-print-color-adjust: exact !important;
+                    print-color-adjust: exact !important;
+                }
+            }
+        </style>
+        """
+
+        capa_membrete = f'<div class="kmh-watermark"><img src="data:image/png;base64,{imagen_base64}" alt="membrete"></div>'
+
+        # Inserta estilos en head
+        match_head = re.search(r"<head[^>]*>", html, re.IGNORECASE)
+        if match_head:
+            pos = match_head.end()
+            html = html[:pos] + estilos_pdf + html[pos:]
+        else:
+            html = estilos_pdf + html
+
+        # Inserta watermark al inicio del body
+        match_body = re.search(r"<body[^>]*>", html, re.IGNORECASE)
+        if match_body:
+            pos = match_body.end()
+            html = html[:pos] + capa_membrete + html[pos:]
+        else:
+            html = f"<body>{capa_membrete}{html}</body>"
+
+        return html
+
+    def _construir_bloque_firmas_html(self, nombres: List[str], titulo: str) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _construir_bloque_firmas_html | titulo=%s | total_nombres=%s", titulo, len(nombres or []))
+        if not nombres:
+            logger.info("[PDF_FIRMAS] Salida _construir_bloque_firmas_html | resultado=bloque_vacio")
+            return ""
+
+        firmas = []
+        for nombre in nombres:
+            firmas.append(
+                f"""
+                <div style=\"break-inside: avoid; min-height: 90px;\">
+                    <div style=\"border-top: 1px solid #222; width: 100%; margin-top: 44px;\"></div>
+                    <div style=\"margin-top: 8px; font-size: 12px; text-align: center;\">{nombre}</div>
+                </div>
+                """
+            )
+
+        bloque = f"""
+        <section style=\"margin-top: 40px; page-break-inside: avoid;\">
+            <h3 style=\"margin: 0 0 20px 0; font-size: 14px;\">{titulo}</h3>
+            <div style=\"display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 34px 42px;\">
+                {''.join(firmas)}
+            </div>
+        </section>
+        """
+        logger.info("[PDF_FIRMAS] Salida _construir_bloque_firmas_html | resultado=bloque_generado | total_firmas=%s", len(firmas))
+        return bloque
+
+    @staticmethod
+    def _insertar_al_final_del_documento(html_raw: str, bloque_html: str) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _insertar_al_final_del_documento | html_len=%s | bloque_len=%s", len(html_raw or ""), len(bloque_html or ""))
+        if not bloque_html:
+            logger.info("[PDF_FIRMAS] Salida _insertar_al_final_del_documento | resultado=sin_cambios")
+            return html_raw
+
+        if "</body>" in html_raw:
+            resultado = html_raw.replace("</body>", f"{bloque_html}</body>", 1)
+            logger.info("[PDF_FIRMAS] Salida _insertar_al_final_del_documento | ancla=body")
+            return resultado
+
+        if "</html>" in html_raw:
+            resultado = html_raw.replace("</html>", f"{bloque_html}</html>", 1)
+            logger.info("[PDF_FIRMAS] Salida _insertar_al_final_del_documento | ancla=html")
+            return resultado
+
+        resultado = f"{html_raw}\n{bloque_html}"
+        logger.info("[PDF_FIRMAS] Salida _insertar_al_final_del_documento | ancla=append_final")
+        return resultado
+
+    def _construir_seccion_firmantes_empresa(self, html_raw: str, empresa_id: str, db: Session) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _construir_seccion_firmantes_empresa | empresa=%s", empresa_id)
+        del db  # Se mantiene por compatibilidad de firma con el flujo actual.
+        try:
+            logger.info("[PDF_FIRMAS] Paso: consultar coleccion firmantes-empresa")
+            docs = self.repo.listar_firmantes_empresa(empresa_id)
+            logger.info("[PDF_FIRMAS] Paso: documentos firmantes-empresa recibidos=%s", len(docs or []))
+
+            nombres = []
+            for doc in docs or []:
+                fields = doc.get("fields", {})
+                activo = fields.get("activo", {}).get("booleanValue")
+                if not self._es_booleano_activo(activo):
+                    continue
+                nombre = fields.get("nombre", {}).get("stringValue")
+                if nombre:
+                    nombres.append(nombre)
+
+            nombres = self._normalizar_lista_nombres(nombres)
+            logger.info("[PDF_FIRMAS] Paso: firmantes empresa activos normalizados=%s", len(nombres))
+            bloque = self._construir_bloque_firmas_html(nombres, "Firmantes de Empresa")
+            resultado = self._insertar_al_final_del_documento(html_raw, bloque)
+            logger.info("[PDF_FIRMAS] Salida _construir_seccion_firmantes_empresa | firmas_agregadas=%s", len(nombres))
+            return resultado
+        except Exception as e:
+            logger.exception("[PDF_FIRMAS] Error _construir_seccion_firmantes_empresa | empresa=%s | error=%s", empresa_id, str(e))
+            return html_raw
+
+    def _construir_seccion_firmantes_coopropietarios(self, html_raw: str, folio: str, db: Session) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _construir_seccion_firmantes_coopropietarios | folio=%s", folio)
+        try:
+            logger.info("[PDF_FIRMAS] Paso: consultar venta por folio para cliente y copropietarios")
+            venta = db.query(Venta).filter(Venta.folio == str(folio)).first()
+            if not venta:
+                logger.warning("[PDF_FIRMAS] Sin datos de venta para firmas de copropietarios | folio=%s", folio)
+                return html_raw
+
+            nombres = [
+                venta.cliente,
+                venta.cliente_2,
+                venta.cliente_3,
+                venta.cliente_4,
+                venta.cliente_5,
+                venta.cliente_6,
+            ]
+            nombres = self._normalizar_lista_nombres(nombres)
+            logger.info("[PDF_FIRMAS] Paso: firmantes cliente/copropietarios normalizados=%s", len(nombres))
+            bloque = self._construir_bloque_firmas_html(nombres, "Firmas de Cliente y Copropietarios")
+            resultado = self._insertar_al_final_del_documento(html_raw, bloque)
+            logger.info("[PDF_FIRMAS] Salida _construir_seccion_firmantes_coopropietarios | firmas_agregadas=%s", len(nombres))
+            return resultado
+        except Exception as e:
+            logger.exception("[PDF_FIRMAS] Error _construir_seccion_firmantes_coopropietarios | folio=%s | error=%s", folio, str(e))
+            return html_raw
+
+    def _construir_seccion_firmantes_personalizados(self, html_raw: str, fields: dict, db: Session) -> str:
+        logger.info("[PDF_FIRMAS] Entrada _construir_seccion_firmantes_personalizados")
+        del db  # Se mantiene por compatibilidad de firma con el flujo actual.
+        try:
+            logger.info("[PDF_FIRMAS] Paso: leer array FirmantesPersonalizados desde fields")
+            valores = fields.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])
+            logger.info("[PDF_FIRMAS] Paso: elementos crudos en FirmantesPersonalizados=%s", len(valores or []))
+            nombres = [item.get("stringValue") for item in valores if isinstance(item, dict)]
+            nombres = self._normalizar_lista_nombres(nombres)
+            logger.info("[PDF_FIRMAS] Paso: firmantes personalizados normalizados=%s", len(nombres))
+            bloque = self._construir_bloque_firmas_html(nombres, "Firmantes Personalizados")
+            resultado = self._insertar_al_final_del_documento(html_raw, bloque)
+            logger.info("[PDF_FIRMAS] Salida _construir_seccion_firmantes_personalizados | firmas_agregadas=%s", len(nombres))
+            return resultado
+        except Exception as e:
+            logger.exception("[PDF_FIRMAS] Error _construir_seccion_firmantes_personalizados | error=%s", str(e))
+            return html_raw
 
     def _construir_tabla_pagos_cotizaciones(self, html_raw: str, folio: str, db: Session):
         logger.info("[PDF_COTIZACIONES] Entrada _construir_tabla_pagos_cotizaciones | folio=%s", folio)
@@ -303,6 +554,10 @@ class GenerarPDFUseCase:
         )
         return html_con_filas, totales
 
+#endregion
+
+#region Funciones auxiliares de obtención de plantillas y manejo de bucket
+
     def _obtener_plantillas_por_categoria(self, empresa_id: str, categoria: str):
         logger.info(
             "[PDF_GENERADOR] Entrada _obtener_plantillas_por_categoria | empresa=%s | categoria=%s",
@@ -388,6 +643,10 @@ class GenerarPDFUseCase:
             )
             raise HTTPException(status_code=500, detail=f"Error al subir PDF al bucket: {str(e)}")
 
+#endregion
+
+#region Logica principal de generación de PDF
+
     async def generar_pdf_por_categoria(self, empresa_id: str, categoria: str, folio: str, db: Session, subir_bucket: bool = False):
         logger.info(
             "[PDF_GENERADOR] Entrada generar_pdf_por_categoria | empresa=%s | categoria=%s | folio=%s | subir_bucket=%s",
@@ -438,16 +697,34 @@ class GenerarPDFUseCase:
                 valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
                 variables_html[plazo_key] = valor_plazo
 
-            if categoria.strip().lower() == "cotizaciones":
+            if fields.get("categoria", {}).get("stringValue", "").strip().lower() == "cotizaciones":
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)
 
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas y generar PDF")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+            if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                if membrete_id:
+                    membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                    if membrete_doc:
+                        imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+
+            encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+            footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+            encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+            footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
             nombre_plantilla = fields.get("categoria", {}).get("stringValue", "documento")
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
             nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')} - {self._normalizar_fragmento(cliente, 'Cliente')}.pdf"
+
+            pdf_kwargs = self._construir_pdf_kwargs(tamanoDocumento, encabezado_final, footer_final)
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -456,7 +733,7 @@ class GenerarPDFUseCase:
                 await page.emulate_media(media="screen")
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(format=tamanoDocumento, print_background=True)
+                pdf_bytes = await page.pdf(**pdf_kwargs)
                 await browser.close()
 
             respuesta = {
@@ -531,9 +808,22 @@ class GenerarPDFUseCase:
                 archivos_subidos_adjuntos = self._obtener_archivos_subidos_desde_fields(fields)
 
             variables_html = dict(data_sql)
+
+            # 1. Formatear montos a Moneda ($X,XXX.XX)
+            claves_monto = ["{v.total_enganche}", "{v.precio_lista}", "{v.apartado}", "{v.flujo_enganche}", "{v.total_enganche_pagar}"]
+            for k in claves_monto:
+                if k in variables_html:
+                    variables_html[k] = self._formatear_moneda(variables_html[k])
+
+            # 2. Limpiar duplicados de "meses"
+            plazo_key = "{v.plazo_financiamiento}"
+            if plazo_key in variables_html:
+                valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
+                variables_html[plazo_key] = valor_plazo
+            
             categoria_plantilla = fields.get("categoria", {}).get("stringValue", "")
 
-            if categoria_plantilla.lower() == "cotizaciones":
+            if fields.get("categoria", {}).get("stringValue", "").strip().lower() == "cotizaciones":
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones desde ID")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)
@@ -541,9 +831,27 @@ class GenerarPDFUseCase:
             logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
+            if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                if membrete_id:
+                    membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                    if membrete_doc:
+                        imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+
+            encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+            footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+            encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+            footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
             nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
             nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')}.pdf"
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+            pdf_kwargs = self._construir_pdf_kwargs(tamanoDocumento, encabezado_final, footer_final)
+
             logger.info("[PDF_GENERADOR] Paso: render PDF con Playwright")
             async with async_playwright() as p:
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -552,7 +860,7 @@ class GenerarPDFUseCase:
                 await page.emulate_media(media="screen")
                 await page.wait_for_load_state("networkidle")
                 await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(format=tamanoDocumento, print_background=True)
+                pdf_bytes = await page.pdf(**pdf_kwargs)
                 await browser.close()
 
             respuesta = {
@@ -637,13 +945,49 @@ class GenerarPDFUseCase:
                 )
                 if not html_raw:
                     raise HTTPException(status_code=400, detail=f"El anexo {id_anexo} no tiene contenido HTML.")
+                
+                variables_html = dict(data_sql)
+
+                # 1. Formatear montos a Moneda ($X,XXX.XX)
+                claves_monto = ["{v.total_enganche}", "{v.precio_lista}", "{v.apartado}", "{v.flujo_enganche}", "{v.total_enganche_pagar}"]
+                for k in claves_monto:
+                    if k in variables_html:
+                        variables_html[k] = self._formatear_moneda(variables_html[k])
+
+                # 2. Limpiar duplicados de "meses"
+                plazo_key = "{v.plazo_financiamiento}"
+                if plazo_key in variables_html:
+                    valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
+                    variables_html[plazo_key] = valor_plazo
+
+                if fields.get("subcategorianexo", {}).get("stringValue", "").strip().lower() == "cotizaciones":
+                    logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
+                    html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
+                    variables_html.update(totales)
 
                 logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML para anexo")
-                html_final = self._reemplazar_etiquetas(html_raw, dict(data_sql))
+                html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+                if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                    membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                    if membrete_id:
+                        membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                        if membrete_doc:
+                            imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                            primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                            if primera_imagen_b64:
+                                html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
                 nombre_anexo = fields.get("nombre", {}).get("stringValue", "anexo")
                 nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, fallback='anexo')}.pdf"
                 tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+                encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+                footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+                encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+                footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
+                pdf_kwargs = self._construir_pdf_kwargs(tamano_documento, encabezado_final, footer_final)
 
                 logger.info("[PDF_GENERADOR] Paso: render PDF de anexo con Playwright")
                 async with async_playwright() as p:
@@ -653,7 +997,7 @@ class GenerarPDFUseCase:
                     await page.emulate_media(media="screen")
                     await page.wait_for_load_state("networkidle")
                     await page.wait_for_timeout(400)
-                    pdf_bytes = await page.pdf(format=tamano_documento, print_background=True)
+                    pdf_bytes = await page.pdf(**pdf_kwargs)
                     await browser.close()
 
                 respuesta = {
@@ -699,6 +1043,10 @@ class GenerarPDFUseCase:
                     str(e),
                 )
                 raise HTTPException(status_code=500, detail=f"Error generando anexo {id_anexo} para folio {folio}: {str(e)}")
+
+#endregion
+
+#region Llamadas principales
 
     async def generar_pdfs_desde_plantillas(self, empresa_id: str, ids_plantillas: Optional[List[str]], folio: str, db: Session, subir_bucket: bool = False):
         """Genera una lista de PDFs usando una lista de IDs de plantillas jurídicas."""
@@ -844,295 +1192,63 @@ class GenerarPDFUseCase:
                 )
                 raise HTTPException(status_code=500, detail=f"Error en generar_pdfs_desde_anexos (folio={folio}): {str(e)}")
 
+#endregion
+
 class GenerarPDFDinamico(GenerarPDFUseCase):
-    @staticmethod
-    def _extraer_contenido_body(html_fragmento: str) -> str:
-        contenido = str(html_fragmento or "")
-        if not contenido.strip():
-            return ""
-
-        match = re.search(r"<body[^>]*>(.*?)</body\s*>", contenido, flags=re.IGNORECASE | re.DOTALL)
-        if match:
-            return match.group(1).strip()
-
-        return contenido
-
-    @staticmethod
-    def _append_html_sections(html_base: str, sections: List[str]) -> str:
-        contenido = html_base or ""
-        secciones_validas = [s for s in (sections or []) if str(s).strip()]
-        if not secciones_validas:
-            return contenido
-
-        extras = "".join(
-            f"<div style=\"page-break-before: always;\"></div>{seccion}"
-            for seccion in secciones_validas
-        )
-
-        match = re.search(r"</body\s*>", contenido, flags=re.IGNORECASE)
-        if match:
-            idx = match.start()
-            return f"{contenido[:idx]}{extras}{contenido[idx:]}"
-
-        return f"{contenido}{extras}"
-
-    @staticmethod
-    def _es_imagen_adjunto(nombre_archivo: str, mime_type: str) -> bool:
-        if mime_type and str(mime_type).lower().startswith("image/"):
-            return True
-
-        nombre = str(nombre_archivo or "").lower()
-        extensiones = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
-        return nombre.endswith(extensiones)
-
-    @staticmethod
-    def _es_pdf_adjunto(nombre_archivo: str, mime_type: str) -> bool:
-        if mime_type and str(mime_type).lower() == "application/pdf":
-            return True
-        return str(nombre_archivo or "").lower().endswith(".pdf")
-
-    @staticmethod
-    def _normalizar_base64_contenido(content: str) -> str:
-        valor = str(content or "").strip()
-        if valor.startswith("data:") and "," in valor:
-            return valor.split(",", 1)[1]
-        return valor
-
-    @staticmethod
-    def _unir_pdfs(partes_pdf: List[bytes]) -> bytes:
-        try:
-            from pypdf import PdfReader, PdfWriter
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500,
-                detail="Se detectaron adjuntos PDF, pero falta la dependencia 'pypdf'.",
-            ) from exc
-
-        writer = PdfWriter()
-        for pdf_bytes in partes_pdf:
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            for page in reader.pages:
-                writer.add_page(page)
-
-        salida = io.BytesIO()
-        writer.write(salida)
-        return salida.getvalue()
-
-    async def generar_por_doc_id(self, empresa_id: str, doc_id: str, folio: Optional[str] = None, db: Optional[Session] = None, subir_bucket: bool = True):
+    async def generar_pdf_por_id_plantilla(self, empresa_id: str, id_plantilla: str, folio: str, coleccion: str, db: Session, subir_bucket: bool):
+        """Genera una lista de PDFs usando una lista de IDs de plantillas jurídicas."""
         logger.info(
-            "[PDF_DINAMICO] Entrada generar_por_doc_id | empresa=%s | doc_id=%s | subir_bucket=%s",
+            "[PDF_GENERADOR] Entrada generar_pdf_por_id_plantilla | empresa=%s | folio=%s | plantilla=%s | coleccion=%s | subir_bucket=%s",
             empresa_id,
-            doc_id,
+            folio,
+            id_plantilla,
+            coleccion,
             subir_bucket,
         )
         try:
-            logger.info("[PDF_GENERADOR] Paso: obtener plantilla documento dinámico por doc_id")
-            plantilla = self.repo.obtener_un_doc_completo_documentos(empresa_id, doc_id)
-            if not plantilla:
-                raise HTTPException(status_code=404, detail=f"No existe plantilla jurídica con id '{doc_id}'.")
-            
-            logger.info("[PDF_GENERADOR] Paso: obtener proveedor de datos")
-            pack_empresa = _get_providers().get(empresa_id, {})
-            extraer_datos = pack_empresa.get("get")
-            if not extraer_datos:
-                raise HTTPException(status_code=400, detail="Empresa no configurada.")
+            logger.info("[PDF_GENERADOR] Paso: generar PDF para colección | colección=%s", coleccion)
+            resultado = []
+            pdf = await self.generar_pdfs(empresa_id=empresa_id, id_plantilla=id_plantilla, folio=folio, coleccion=coleccion, db=db, subir_bucket=subir_bucket)
+            resultado.append(pdf)
 
-            logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio")
-            data_sql = extraer_datos(folio, db)
-            if not data_sql:
-                raise HTTPException(status_code=404, detail="Folio no encontrado.")
-
-            cliente = (
-                    data_sql.get("{c1.client_name}")
-                    or data_sql.get("{cliente}")
-                    or data_sql.get("{cl.cliente}")
-                    or data_sql.get("{v.cliente}")
-                    or "Cliente"
-                )
-            
-            fields = plantilla.get("fields", {})
-            html_raw = fields.get("html", {}).get("stringValue", "")
-            if not html_raw:
-                raise HTTPException(status_code=400, detail="La plantilla no tiene HTML en el campo 'html'.")
-
-            categoria = fields.get("categoria", {}).get("stringValue", "general")
-            nombre_plantilla = fields.get("nombre", {}).get("stringValue", doc_id)
-            tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
-
-            variables_html = dict(data_sql)
-
-            # 1. Formatear montos a Moneda ($X,XXX.XX)
-            claves_monto = ["{v.total_enganche}", "{v.precio_lista}", "{v.apartado}", "{v.flujo_enganche}", "{v.total_enganche_pagar}"]
-            for k in claves_monto:
-                if k in variables_html:
-                    variables_html[k] = self._formatear_moneda(variables_html[k])
-
-            # 2. Limpiar duplicados de "meses"
-            plazo_key = "{v.plazo_financiamiento}"
-            if plazo_key in variables_html:
-                valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
-                variables_html[plazo_key] = valor_plazo
-
-            html_base = self._reemplazar_etiquetas(html_raw, variables_html)
-
-            secciones_anexo: List[str] = []
-            tiene_anexos = fields.get("tieneAnexos", {}).get("booleanValue", False)
-            if tiene_anexos:
-                ids_anexos = self._obtener_ids_anexos_desde_fields(fields)
-                for anexo_id in ids_anexos:
-                    anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_id, anexo_id)
-                    if not anexo_doc:
-                        logger.warning("[PDF_DINAMICO] Anexo no encontrado | empresa=%s | anexo_id=%s", empresa_id, anexo_id)
-                        continue
-                    anexo_fields = anexo_doc.get("fields", {})
-                    contenido_anexo = (
-                        anexo_fields.get("contenido", {}).get("stringValue")
-                        or anexo_fields.get("html", {}).get("stringValue", "")
-                    )
-                    if contenido_anexo:
-                        contenido_anexo = self._extraer_contenido_body(contenido_anexo)
-                        subcategoria_anexo = anexo_fields.get("subcategorianexo", {}).get("stringValue", "")
-                        variables_anexo = variables_html
-
-                        if subcategoria_anexo.strip().lower() == "cotizaciones":
-                            if folio and db is not None:
-                                logger.info(
-                                    "[PDF_DINAMICO] Paso: construir tabla de pagos para anexo cotizaciones | anexo_id=%s | folio=%s",
-                                    anexo_id,
-                                    folio,
-                                )
-                                contenido_anexo, totales = self._construir_tabla_pagos_cotizaciones(contenido_anexo, folio, db)
-                                variables_anexo.update(totales)
-                            else:
-                                logger.warning(
-                                    "[PDF_DINAMICO] Anexo cotizaciones sin folio/db, se omite tabla | anexo_id=%s",
-                                    anexo_id,
-                                )
-
-                        secciones_anexo.append(self._reemplazar_etiquetas(contenido_anexo, variables_anexo))
-
-            archivos_subidos = self._obtener_archivos_subidos_desde_fields(fields)
-            meta_archivos = fields.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {})
-            secciones_imagenes: List[str] = []
-            pdfs_adjuntos: List[bytes] = []
-            for adjunto in archivos_subidos:
-                nombre_archivo = str(adjunto.get("filename", "")).strip()
-                content_b64 = self._normalizar_base64_contenido(adjunto.get("content", ""))
-                meta = meta_archivos.get(nombre_archivo, {}).get("mapValue", {}).get("fields", {})
-                mime_type = meta.get("mime_type", {}).get("stringValue", "")
-
-                if not content_b64:
-                    continue
-
-                if self._es_pdf_adjunto(nombre_archivo, mime_type):
-                    try:
-                        pdfs_adjuntos.append(base64.b64decode(content_b64))
-                    except Exception:
-                        logger.warning("[PDF_DINAMICO] PDF adjunto invalido, se omite | archivo=%s", nombre_archivo)
-                    continue
-
-                if not self._es_imagen_adjunto(nombre_archivo, mime_type):
-                    continue
-
-                mime_final = mime_type if mime_type and mime_type.startswith("image/") else "image/png"
-                secciones_imagenes.append(
-                    """
-                    <div style="page-break-before: always; width: 100%; min-height: 100vh; display: flex; align-items: center; justify-content: center;">
-                        <img src="data:{mime};base64,{content}" style="max-width: 100%; max-height: 100vh; object-fit: contain;" />
-                    </div>
-                    """.format(mime=mime_final, content=content_b64)
-                )
-
-            html_final = self._append_html_sections(html_base, secciones_anexo + secciones_imagenes)
-
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
-                page = await browser.new_page()
-                await page.set_content(html_final, wait_until="networkidle")
-                await page.emulate_media(media="print")
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(
-                    format=tamano_documento,
-                    print_background=True,
-                    prefer_css_page_size=True,
-                )
-                await browser.close()
-
-            if pdfs_adjuntos:
-                pdf_bytes = self._unir_pdfs([pdf_bytes, *pdfs_adjuntos])
-
-            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, 'documento')}.pdf"
-
-            tiene_contenido_extra = bool(secciones_anexo or secciones_imagenes or pdfs_adjuntos)
-            if tiene_contenido_extra:
-                ruta = f"Komunah/Documentos/Completos/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
-            else:
-                ruta = f"Komunah/PlantillasWeb/Categorias/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
-
-            respuesta = {
-                "empresa_id": empresa_id,
-                "doc_id": doc_id,
-                "filename": nombre_pdf,
-                "ruta": ruta,
-                "incluye_anexos": bool(secciones_anexo),
-                "incluye_imagenes": bool(secciones_imagenes),
-                "incluye_pdfs": bool(pdfs_adjuntos),
-            }
-
-            if subir_bucket:
-                url_descarga = self._subir_pdf_a_bucket(pdf_bytes, ruta, nombre_pdf)
-                respuesta["url_descarga"] = url_descarga
-                respuesta["blob_path"] = f"{ruta}/{nombre_pdf}"
-
-            logger.info(
-                "[PDF_DINAMICO] Salida generar_por_doc_id | doc_id=%s | anexos=%s | imagenes=%s | pdfs=%s",
-                doc_id,
-                len(secciones_anexo),
-                len(secciones_imagenes),
-                len(pdfs_adjuntos),
-            )
-            return respuesta
+            logger.info("[PDF_GENERADOR] Salida generar_pdf_por_id_plantilla | coleccion=%s | total_documentos=%s", coleccion, len(resultado))
+            return resultado
         except HTTPException:
             logger.exception(
-                "[PDF_DINAMICO] Error HTTP en generar_por_doc_id | empresa=%s | doc_id=%s",
+                "[PDF_GENERADOR] Error HTTP en generar_pdf_por_id_plantilla | empresa=%s | folio=%s | plantilla=%s | coleccion=%s",
                 empresa_id,
-                doc_id,
+                folio,
+                id_plantilla,
+                coleccion,
             )
             raise
         except Exception as e:
             logger.exception(
-                "[PDF_DINAMICO] Error inesperado en generar_por_doc_id | empresa=%s | doc_id=%s | error=%s",
+                "[PDF_GENERADOR] Error inesperado en generar_pdf_por_id_plantilla | empresa=%s | folio=%s | plantilla=%s | coleccion=%s | error=%s",
                 empresa_id,
-                doc_id,
+                folio,
+                id_plantilla,
+                coleccion,
                 str(e),
             )
-            raise HTTPException(status_code=500, detail=f"Error al generar PDF dinámico por doc_id: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error en generar_pdf_por_id_plantilla (folio={folio}): {str(e)}")
 
-class GenerarPDFAnexo(GenerarPDFUseCase):
-    async def generar_por_doc_id(self, empresa_id: str, doc_id: str, folio: Optional[str] = None, db: Optional[Session] = None,subir_bucket: bool = True):
-        logger.info(
-            "[PDF_ANEXO] Entrada generar_por_doc_id | empresa=%s | doc_id=%s | subir_bucket=%s",
-            empresa_id,
-            doc_id,
-            subir_bucket,
-        )
+    async def generar_pdfs(self, empresa_id: str, id_plantilla: str, folio: str, coleccion: str, db: Session, subir_bucket: bool):
+        """Genera un PDF unificado (Principal + Anexos) desde un documento dinamico."""
+        logger.info("[PDF_GENERADOR] Entrada generar_pdfs | empresa=%s | plantilla=%s | folio=%s", empresa_id, id_plantilla, folio)
         try:
-            logger.info("[PDF_GENERADOR] Paso: obtener plantilla de anexo por doc_id")
-            anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_id, doc_id)
-            if not anexo_doc:
-                raise HTTPException(status_code=404, detail=f"No existe plantilla de anexo con id '{doc_id}'.")
-            
-            logger.info("[PDF_GENERADOR] Paso: obtener proveedor de datos")
+            # --- 1. OBTENCIÓN DE PLANTILLA Y DATOS (Tu lógica original) ---
+            if coleccion == "DocumentosDinamicos":
+                plantilla = self.repo.obtener_un_doc_completo_documentos(empresa_id, id_plantilla)
+            else:
+                plantilla = self.repo.obtener_un_doc_completo_anexos(empresa_id, id_plantilla)
+
+            if not plantilla:
+                raise HTTPException(status_code=404, detail=f"No existe la plantilla: {id_plantilla}")
+
             pack_empresa = _get_providers().get(empresa_id, {})
             extraer_datos = pack_empresa.get("get")
-            if not extraer_datos:
-                raise HTTPException(status_code=400, detail="Empresa no configurada.")
-
-            logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio")
             data_sql = extraer_datos(folio, db)
-            if not data_sql:
-                raise HTTPException(status_code=404, detail="Folio no encontrado.")
 
             cliente = (
                     data_sql.get("{c1.client_name}")
@@ -1141,19 +1257,185 @@ class GenerarPDFAnexo(GenerarPDFUseCase):
                     or data_sql.get("{v.cliente}")
                     or "Cliente"
                 )
-            
-            fields = anexo_doc.get("fields", {})
-            html_raw = (
-                fields.get("contenido", {}).get("stringValue")
-                or fields.get("html", {}).get("stringValue", "")
-            )
-            if not html_raw:
-                raise HTTPException(status_code=400, detail="La plantilla de anexo no tiene contenido HTML.")
 
-            categoria = fields.get("categoria", {}).get("stringValue", "general")
-            subcategorianexo = fields.get("subcategorianexo", {}).get("stringValue", "")
-            nombre_anexo = fields.get("nombre", {}).get("stringValue", doc_id)
-            tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+            fields = plantilla.get("fields", {})
+            html_raw = fields.get("html", {}).get("stringValue", "") if coleccion == "DocumentosDinamicos" else fields.get("contenido", {}).get("stringValue", "")
+
+            # --- 2. PROCESAMIENTO DE VARIABLES Y RENDERIZADO PRINCIPAL ---
+            variables_html = dict(data_sql)
+
+            claves_monto = ["{v.total_enganche}", "{v.precio_lista}", "{v.apartado}", "{v.flujo_enganche}", "{v.total_enganche_pagar}"]
+            for k in claves_monto:
+                if k in variables_html: variables_html[k] = self._formatear_moneda(variables_html[k])
+
+            plazo_key = "{v.plazo_financiamiento}"
+            if plazo_key in variables_html:
+                variables_html[plazo_key] = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
+
+            if fields.get("categoria", {}).get("stringValue", "").strip().lower() == "cotizaciones" or (fields.get("subcategorianexo", {}).get("stringValue", "").strip().lower() == "cotizaciones"):
+                html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
+                variables_html.update(totales)
+
+            if fields.get("FirmantesEmpresa", {}).get("booleanValue", False) == True:
+                html_raw = self._construir_seccion_firmantes_empresa(html_raw, empresa_id, db)
+            elif fields.get("FirmasCoopropietarios", {}).get("booleanValue", False) == True:
+                html_raw = self._construir_seccion_firmantes_coopropietarios(html_raw, folio, db)
+            elif bool(fields.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])) and fields.get("FirmantesEmpresa", {}).get("booleanValue", False) == False:
+                html_raw = self._construir_seccion_firmantes_personalizados(html_raw, fields, db)
+            else:
+                pass
+
+            html_final = self._reemplazar_etiquetas(html_raw, variables_html)
+
+            if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                if membrete_id:
+                    membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                    if membrete_doc:
+                        imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+
+            encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+            footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+            encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+            footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+
+            tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+            pdf_kwargs_principal = self._construir_pdf_kwargs(tamanoDocumento, encabezado_final, footer_final)
+
+            # Iniciamos Playwright una sola vez para ser eficientes
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
+                page = await browser.new_page()
+                await page.emulate_media(media="screen")
+
+                # Render Principal
+                await page.set_content(html_final, wait_until="networkidle")
+
+                pdf_bytes_principal = await page.pdf(**pdf_kwargs_principal)
+
+                merger = PdfWriter()
+                merger.append(io.BytesIO(pdf_bytes_principal))
+
+                # --- 3. UNIFICACIÓN CON ANEXOS JURÍDICOS ---
+                ids_anexos = []
+                if coleccion == "DocumentosDinamicos" and fields.get("tieneAnexos", {}).get("booleanValue", False):
+                    ids_anexos = self._obtener_ids_anexos_desde_fields(fields)
+                    for id_anexo in ids_anexos:
+                        res_anexo = await self.generar_pdfs_anexos(empresa_id, id_anexo, folio, db, subir_bucket=False)
+                        merger.append(io.BytesIO(base64.b64decode(res_anexo["content"])))
+
+                # --- 4. NUEVO: PROCESAMIENTO DE IMÁGENES (archivos_subidos) ---
+                if coleccion == "DocumentosDinamicos":
+                    archivos_map = fields.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {})
+                    archivos_meta = fields.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {})
+
+                    for nombre_archivo, nodo_b64 in archivos_map.items():
+                        base64_data = nodo_b64.get("stringValue")
+                        if not base64_data: continue
+
+                        # Obtener mime_type del meta (ej: image/png)
+                        meta_data = archivos_meta.get(nombre_archivo, {}).get("mapValue", {}).get("fields", {})
+                        mime_type = meta_data.get("mime_type", {}).get("stringValue", "image/jpeg")
+
+                        logger.info("[PDF_GENERADOR] Agregando imagen como página PDF: %s", nombre_archivo)
+
+                        # HTML simple para centrar la imagen en la página
+                        html_imagen = f"""
+                        <html>
+                            <body style="margin:0; padding:0; display:flex; justify-content:center; align-items:center; height:100vh;">
+                                <img src="data:{mime_type};base64,{base64_data}" style="max-width:100%; max-height:100%; object-fit:contain;">
+                            </body>
+                        </html>
+                        """
+                        await page.set_content(html_imagen, wait_until="networkidle")
+                        pdf_bytes_img = await page.pdf(
+                            format=tamanoDocumento, 
+                            print_background=True, 
+                            prefer_css_page_size=True, 
+                            scale=1.0, 
+                            margin={"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"}
+                        )
+                        merger.append(io.BytesIO(pdf_bytes_img))
+
+                await browser.close()
+
+            # --- 5. EXPORTACIÓN Y RESPUESTA ---
+            output_stream = io.BytesIO()
+            merger.write(output_stream)
+            pdf_final_bytes = output_stream.getvalue()
+            merger.close()
+
+            # --- 4. RESPUESTA FINAL (Subida a bucket del archivo unificado) ---
+            nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla)}.pdf"
+
+            respuesta = {
+                "id_plantilla": id_plantilla,
+                "filename": nombre_pdf,
+                "content": base64.b64encode(pdf_final_bytes).decode("utf-8"),
+                "content_type": "application/pdf",
+                "anexos_ids": ids_anexos
+            }
+
+            if subir_bucket:
+                categoria = fields.get("categoria", {}).get("stringValue", "general")
+                subcategorianexo = fields.get("subcategorianexo", {}).get("stringValue", "general")
+
+                if coleccion == "DocumentosDinamicos":
+                    if fields.get("tieneAnexos", {}).get("booleanValue", False) == True:
+                        ruta = f"Komunah/Documentos/Completos/{self._normalizar_fragmento(categoria)}/{self._normalizar_fragmento(cliente)}"
+                    else:
+                        ruta = f"Komunah/Documentos/UnoSolo/{self._normalizar_fragmento(categoria)}/{self._normalizar_fragmento(cliente)}"
+                else:
+                    ruta = f"Komunah/Documentos/Anexos/{self._normalizar_fragmento(subcategorianexo)}/{self._normalizar_fragmento(cliente)}"
+
+                respuesta["url_descarga"] = self._subir_pdf_a_bucket(pdf_final_bytes, ruta, nombre_pdf)
+            respuesta.pop("content", None)
+            return respuesta
+
+        except Exception as e:
+            logger.exception("[PDF_GENERADOR] Error en generar_pdfs: %s", str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def generar_pdfs_anexos(self, empresa_id: str, id_anexo: str, folio: str, db: Session, subir_bucket: bool):
+        logger.info(
+                "[PDF_GENERADOR] Entrada generar_pdfs_anexos | empresa=%s | anexo=%s | folio=%s | subir_bucket=%s",
+                empresa_id,
+                id_anexo,
+                folio,
+                subir_bucket,
+            )
+        try:
+            logger.info("[PDF_GENERADOR] Paso: obtener plantilla anexo por id")
+            anexo_doc = self.repo.obtener_un_doc_completo_anexos(empresa_id, id_anexo)
+            if not anexo_doc:
+                raise HTTPException(status_code=404, detail=f"No existe la plantilla de anexo: {id_anexo}.")
+
+            pack_empresa = _get_providers().get(empresa_id, {})
+            extraer_datos = pack_empresa.get("get")
+            if not extraer_datos:
+                raise HTTPException(status_code=400, detail="Empresa no configurada.")
+
+            logger.info("[PDF_GENERADOR] Paso: extraer datos SQL por folio para anexo")
+            data_sql = extraer_datos(folio, db)
+            if not data_sql:
+                raise HTTPException(status_code=404, detail="Folio no encontrado.")
+            
+            cliente = (
+                    data_sql.get("{c1.client_name}")
+                    or data_sql.get("{cliente}")
+                    or data_sql.get("{cl.cliente}")
+                    or data_sql.get("{v.cliente}")
+                    or "Cliente"
+                )
+
+            fields = anexo_doc.get("fields", {})
+            html_raw = fields.get("contenido", {}).get("stringValue")
+            if not html_raw:
+                raise HTTPException(status_code=400, detail=f"El anexo {id_anexo} no tiene contenido HTML.")
 
             variables_html = dict(data_sql)
 
@@ -1169,58 +1451,88 @@ class GenerarPDFAnexo(GenerarPDFUseCase):
                 valor_plazo = str(variables_html[plazo_key]).lower().replace("meses", "").strip()
                 variables_html[plazo_key] = valor_plazo
 
-
-            if subcategorianexo.strip().lower() == "cotizaciones":
+            if fields.get("subcategorianexo", {}).get("stringValue", "").strip().lower() == "cotizaciones":
                 logger.info("[PDF_GENERADOR] Paso: construir tabla de pagos para Cotizaciones")
                 html_raw, totales = self._construir_tabla_pagos_cotizaciones(html_raw, folio, db)
                 variables_html.update(totales)
 
-            logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas y generar PDF")
+            if fields.get("FirmantesEmpresa", {}).get("booleanValue", False) == True:
+                html_raw = self._construir_seccion_firmantes_empresa(html_raw, empresa_id, db)
+            elif fields.get("FirmasCoopropietarios", {}).get("booleanValue", False) == True:
+                html_raw = self._construir_seccion_firmantes_coopropietarios(html_raw, folio, db)
+            elif bool(fields.get("FirmantesPersonalizados", {}).get("arrayValue", {}).get("values", [])) and fields.get("FirmantesEmpresa", {}).get("booleanValue", False) == False:
+                html_raw = self._construir_seccion_firmantes_personalizados(html_raw, fields, db)
+            else:
+                pass
+
+            logger.info("[PDF_GENERADOR] Paso: reemplazar etiquetas HTML para anexo")
             html_final = self._reemplazar_etiquetas(html_raw, variables_html)
 
+            if fields.get("HojaMembretadaProyecto", {}).get("booleanValue", False):
+                membrete_id = fields.get("membrete_id", {}).get("stringValue", "")
+                if membrete_id:
+                    membrete_doc = self.repo.obtener_membrete(empresa_id, membrete_id)
+                    if membrete_doc:
+                        imagen_map = membrete_doc.get("fields", {}).get("ImagenMembretada", {}).get("mapValue", {}).get("fields", {})
+                        primera_imagen_b64 = next(iter(imagen_map.values()), {}).get("stringValue", "") if imagen_map else ""
+                        if primera_imagen_b64:
+                            html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
+
+            nombre_anexo = fields.get("nombre", {}).get("stringValue", "anexo")
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, fallback='anexo')}.pdf"
+            tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
+
+            encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
+            footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
+            encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
+            footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
+            pdf_kwargs_anexo = self._construir_pdf_kwargs(tamano_documento, encabezado_final, footer_final)
+
+            logger.info("[PDF_GENERADOR] Paso: render PDF de anexo con Playwright")
             async with async_playwright() as p:
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
                 page = await browser.new_page()
-                await page.set_content(html_final, wait_until="networkidle")
                 await page.emulate_media(media="screen")
-                await page.wait_for_load_state("networkidle")
-                await page.wait_for_timeout(400)
-                pdf_bytes = await page.pdf(format=tamano_documento, print_background=True)
+                await page.set_content(html_final, wait_until="networkidle")
+                pdf_bytes = await page.pdf(**pdf_kwargs_anexo)
                 await browser.close()
 
-            nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, 'anexo')}.pdf"
-            ruta = f"Komunah/Documentos/Anexos/{self._normalizar_fragmento(categoria, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
-
             respuesta = {
-                "empresa_id": empresa_id,
-                "doc_id": doc_id,
-                "filename": nombre_pdf,
-                "ruta": ruta,
-            }
+                    "id_anexo": id_anexo,
+                    "filename": nombre_pdf,
+                    "content": base64.b64encode(pdf_bytes).decode("utf-8"),
+                    "content_type": "application/pdf",
+                    "tamanoDocumento": tamano_documento,
+                }
 
             if subir_bucket:
-                url_descarga = self._subir_pdf_a_bucket(pdf_bytes, ruta, nombre_pdf)
-                respuesta["url_descarga"] = url_descarga
-                respuesta["blob_path"] = f"{ruta}/{nombre_pdf}"
+                
+                categoria_anexo = fields.get("categoria", {}).get("stringValue", "general")
+                ruta = f"Komunah/Documentos/Anexos/{self._normalizar_fragmento(categoria_anexo, 'general')}/{self._normalizar_fragmento(cliente, 'Cliente')}"
+                respuesta["url_descarga"] = self._subir_pdf_a_bucket(pdf_bytes, ruta, nombre_pdf)
+
+                respuesta.pop("content", None)
 
             logger.info(
-                "[PDF_ANEXO] Salida generar_por_doc_id | doc_id=%s | filename=%s",
-                doc_id,
-                nombre_pdf,
-            )
+                    "[PDF_GENERADOR] Salida generar_pdfs_anexos | anexo=%s | filename=%s",
+                    id_anexo,
+                    nombre_pdf,
+                )
             return respuesta
         except HTTPException:
             logger.exception(
-                "[PDF_ANEXO] Error HTTP en generar_por_doc_id | empresa=%s | doc_id=%s",
-                empresa_id,
-                doc_id,
-            )
+                    "[PDF_GENERADOR] Error HTTP en generar_pdfs_anexos | empresa=%s | anexo=%s | folio=%s",
+                    empresa_id,
+                    id_anexo,
+                    folio,
+                )
             raise
         except Exception as e:
             logger.exception(
-                "[PDF_ANEXO] Error inesperado en generar_por_doc_id | empresa=%s | doc_id=%s | error=%s",
-                empresa_id,
-                doc_id,
-                str(e),
-            )
-            raise HTTPException(status_code=500, detail=f"Error al generar PDF de anexo por doc_id: {str(e)}")
+                    "[PDF_GENERADOR] Error inesperado en generar_pdfs_anexos | empresa=%s | anexo=%s | folio=%s | error=%s",
+                    empresa_id,
+                    id_anexo,
+                    folio,
+                    str(e),
+                )
+            raise HTTPException(status_code=500, detail=f"Error generando anexo {id_anexo} para folio {folio}: {str(e)}")
