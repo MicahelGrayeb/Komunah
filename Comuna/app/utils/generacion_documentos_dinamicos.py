@@ -110,6 +110,56 @@ class GenerarPDFUseCase:
         return re.sub(regex_seguro, "", texto)
 
     @staticmethod
+    def _normalizar_template_header_footer(template_html: str) -> str:
+        """Normaliza HTML de Word para usarlo en header/footer de Playwright."""
+        if not template_html:
+            return ""
+
+        html = str(template_html)
+        # Remueve clases Mso* que dependen de estilos externos no disponibles en templates de PDF.
+        html = re.sub(r'\sclass="[^"]*\bMso[^"]*"', "", html, flags=re.IGNORECASE)
+        # Remueve propiedades mso-* inline para evitar render inconsistente.
+        html = re.sub(r"mso-[a-zA-Z\-]+\s*:\s*[^;\"']*;?", "", html, flags=re.IGNORECASE)
+        # Limpia estilos vacios y espacios sobrantes.
+        html = re.sub(r'\sstyle="\s*"', "", html)
+        return html.strip()
+
+    @staticmethod
+    def _envolver_template_header_footer(template_html: str, posicion: str) -> str:
+        contenido = GenerarPDFUseCase._normalizar_template_header_footer(template_html)
+        if not contenido:
+            return "<span></span>"
+
+        margen = "margin-top: 10px;" if posicion == "header" else "margin-bottom: 10px;"
+        estilo_base = "font-size: 12px; line-height: 1.3; width: 100%; text-align: center; color: black; padding: 0 10px;"
+        return f"<div style=\"{estilo_base} {margen}\">{contenido}</div>"
+
+    @staticmethod
+    def _construir_pdf_kwargs(tamano_documento: str, encabezado_final: str, footer_final: str) -> dict:
+        tiene_encabezado = bool(encabezado_final)
+        tiene_footer = bool(footer_final)
+
+        pdf_kwargs = {
+            "format": tamano_documento,
+            "print_background": True,
+            "prefer_css_page_size": True,
+            "scale": 1.0,
+            "margin": {
+                "top": "2cm" if tiene_encabezado else "0px",
+                "bottom": "2cm" if tiene_footer else "0px",
+                "left": "0px",
+                "right": "0px",
+            },
+        }
+
+        if tiene_encabezado or tiene_footer:
+            pdf_kwargs["display_header_footer"] = True
+            pdf_kwargs["header_template"] = GenerarPDFUseCase._envolver_template_header_footer(encabezado_final, "header")
+            pdf_kwargs["footer_template"] = GenerarPDFUseCase._envolver_template_header_footer(footer_final, "footer")
+
+        return pdf_kwargs
+
+    @staticmethod
     def _a_float(valor: Any) -> float:
         try:
             return float(valor)
@@ -192,21 +242,62 @@ class GenerarPDFUseCase:
 
     @staticmethod
     def _inyectar_membretada_fondo(html: str, imagen_base64: str) -> str:
-        """Inyecta una imagen como fondo fijo con opacidad 40% en el HTML."""
         if not html or not imagen_base64:
             return html
 
-        # Crear div de fondo con la imagen en base64
-        fondo_html = f"""<div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background-image: url('data:image/png;base64,{imagen_base64}'); background-size: cover; background-attachment: fixed; opacity: 0.4; z-index: -1; pointer-events: none;"></div>"""
+        estilos_pdf = """
+        <style>
+            .kmh-watermark {
+                position: fixed;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                pointer-events: none;
+                z-index: 0;
+            }
 
-        # Buscar el tag <body y insertar el div inmediatamente después
-        match = re.search(r"<body[^>]*>", html, re.IGNORECASE)
-        if match:
-            pos = match.end()
-            return html[:pos] + fondo_html + html[pos:]
+            .kmh-watermark img {
+                width: 100%;
+                max-width: 100%;
+                height: auto;
+                object-fit: contain;
+                opacity: 0.20;
+            }
 
-        # Si no hay <body>, inserta al inicio del HTML
-        return fondo_html + html
+            body > *:not(.kmh-watermark) {
+                position: relative;
+                z-index: 1;
+            }
+
+            @media print {
+                html, body {
+                    -webkit-print-color-adjust: exact !important;
+                    print-color-adjust: exact !important;
+                }
+            }
+        </style>
+        """
+
+        capa_membrete = f'<div class="kmh-watermark"><img src="data:image/png;base64,{imagen_base64}" alt="membrete"></div>'
+
+        # Inserta estilos en head
+        match_head = re.search(r"<head[^>]*>", html, re.IGNORECASE)
+        if match_head:
+            pos = match_head.end()
+            html = html[:pos] + estilos_pdf + html[pos:]
+        else:
+            html = estilos_pdf + html
+
+        # Inserta watermark al inicio del body
+        match_body = re.search(r"<body[^>]*>", html, re.IGNORECASE)
+        if match_body:
+            pos = match_body.end()
+            html = html[:pos] + capa_membrete + html[pos:]
+        else:
+            html = f"<body>{capa_membrete}{html}</body>"
+
+        return html
 
     def _construir_bloque_firmas_html(self, nombres: List[str], titulo: str) -> str:
         logger.info("[PDF_FIRMAS] Entrada _construir_bloque_firmas_html | titulo=%s | total_nombres=%s", titulo, len(nombres or []))
@@ -633,17 +724,7 @@ class GenerarPDFUseCase:
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
             nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')} - {self._normalizar_fragmento(cliente, 'Cliente')}.pdf"
 
-            pdf_kwargs = {
-                "format": tamanoDocumento,
-                "print_background": True,
-                "prefer_css_page_size": True,
-                "scale": 1.0,
-                "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
-            }
-            if encabezado_final or footer_final:
-                pdf_kwargs["display_header_footer"] = True
-                pdf_kwargs["header_template"] = encabezado_final or "<span></span>"
-                pdf_kwargs["footer_template"] = footer_final or "<span></span>"
+            pdf_kwargs = self._construir_pdf_kwargs(tamanoDocumento, encabezado_final, footer_final)
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(args=["--no-sandbox", "--disable-setuid-sandbox"])
@@ -769,17 +850,7 @@ class GenerarPDFUseCase:
             nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')}.pdf"
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
 
-            pdf_kwargs = {
-                "format": tamanoDocumento,
-                "print_background": True,
-                "prefer_css_page_size": True,
-                "scale": 1.0,
-                "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
-            }
-            if encabezado_final or footer_final:
-                pdf_kwargs["display_header_footer"] = True
-                pdf_kwargs["header_template"] = encabezado_final or "<span></span>"
-                pdf_kwargs["footer_template"] = footer_final or "<span></span>"
+            pdf_kwargs = self._construir_pdf_kwargs(tamanoDocumento, encabezado_final, footer_final)
 
             logger.info("[PDF_GENERADOR] Paso: render PDF con Playwright")
             async with async_playwright() as p:
@@ -916,17 +987,7 @@ class GenerarPDFUseCase:
                 encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
                 footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
 
-                pdf_kwargs = {
-                    "format": tamano_documento,
-                    "print_background": True,
-                    "prefer_css_page_size": True,
-                    "scale": 1.0,
-                    "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
-                }
-                if encabezado_final or footer_final:
-                    pdf_kwargs["display_header_footer"] = True
-                    pdf_kwargs["header_template"] = encabezado_final or "<span></span>"
-                    pdf_kwargs["footer_template"] = footer_final or "<span></span>"
+                pdf_kwargs = self._construir_pdf_kwargs(tamano_documento, encabezado_final, footer_final)
 
                 logger.info("[PDF_GENERADOR] Paso: render PDF de anexo con Playwright")
                 async with async_playwright() as p:
@@ -1242,18 +1303,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
             footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
 
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
-
-            pdf_kwargs_principal = {
-                "format": tamanoDocumento,
-                "print_background": True,
-                "prefer_css_page_size": True,
-                "scale": 1.0,
-                "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
-            }
-            if encabezado_final or footer_final:
-                pdf_kwargs_principal["display_header_footer"] = True
-                pdf_kwargs_principal["header_template"] = encabezado_final or "<span></span>"
-                pdf_kwargs_principal["footer_template"] = footer_final or "<span></span>"
+            pdf_kwargs_principal = self._construir_pdf_kwargs(tamanoDocumento, encabezado_final, footer_final)
 
             # Iniciamos Playwright una sola vez para ser eficientes
             async with async_playwright() as p:
@@ -1436,18 +1486,7 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
             footer_raw = fields.get("footer", {}).get("stringValue", "") or ""
             encabezado_final = self._reemplazar_etiquetas(encabezado_raw, variables_html) if encabezado_raw else ""
             footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
-
-            pdf_kwargs_anexo = {
-                "format": tamano_documento,
-                "print_background": True,
-                "prefer_css_page_size": True,
-                "scale": 1.0,
-                "margin": {"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"},
-            }
-            if encabezado_final or footer_final:
-                pdf_kwargs_anexo["display_header_footer"] = True
-                pdf_kwargs_anexo["header_template"] = encabezado_final or "<span></span>"
-                pdf_kwargs_anexo["footer_template"] = footer_final or "<span></span>"
+            pdf_kwargs_anexo = self._construir_pdf_kwargs(tamano_documento, encabezado_final, footer_final)
 
             logger.info("[PDF_GENERADOR] Paso: render PDF de anexo con Playwright")
             async with async_playwright() as p:

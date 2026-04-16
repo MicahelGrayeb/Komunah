@@ -243,8 +243,8 @@ def get_komunah_data(folio_ref: str, db: Session):
         "{cl.cliente}": str(getattr(venta, 'cliente', "")),
         "{cl.num}": str(getattr(p_act, 'number', "")) if p_act else "",
         "{cl.fecha}": str(getattr(p_act, 'date', "")) if p_act else "",
-        "{cl.fecha_pago}": fecha_pago_humanizada,
-        "{cl.dias_para_pago}": dias_para_vencer,
+        "{cl.fecha_pago}": fecha_pago_humanizada if fecha_pago_humanizada else "N/A",
+        "{cl.dias_para_pago}": dias_para_vencer if dias_para_vencer is not None else "",
         "{cl.concepto}": str(getattr(p_act, 'concept', "")) if p_act else "",
         "{cl.proyecto}": str(getattr(venta, 'desarrollo', ""))
     })
@@ -414,6 +414,8 @@ def get_komunah_data(folio_ref: str, db: Session):
     f_fin_finan = ""
     rango_texto = ""
     rango_letra = ""
+    primer_enganche = "" 
+    monto_parcialidad = ""
     
     if finance_amts:
         f_inicio_finan = str(finance_amts[0].date)
@@ -450,23 +452,30 @@ def get_komunah_data(folio_ref: str, db: Session):
 
     # 5. Actualización de data
     data.update({
-        "{f.numero_comercial}": num_comercial,
-        "{f.numero_registral}": num_registral,
-        "{f.precio_final_letra}": float(getattr(venta, 'precio_final', 0) or 0),
-        "{f.apartado_letra}": float(getattr(venta, 'apartado', 0) or 0),
-        "{f.enganche_letra}": float(getattr(venta, 'total_enganche', 0) or 0),
-        "{f.monto_sin_interes_letra}": float(getattr(venta, 'monto_sin_interes', 0) or 0),
-        "{f.referencia_lote}": f"010100R{num_comercial}",
-        "{f.pago_72}": (float(getattr(venta, 'precio_final', 0) or 0) - sum(float(a.total or 0) for a in amortizaciones[:-1])) if amortizaciones else 0,
-        "{f.fecha_mensualidades}": rango_texto, 
-        "{f.numero_de_pagos}": num_pagos_financiamiento,
-        "{f.primera_mensualidad}": f_inicio_finan,
-        "{f.primer_enganche}": primer_enganche,
-        "{f.monto_parcialidad}": monto_parcialidad,
-        "{f.porcentaje}": f"{porcentaje_calculado:.2f}%",
-        "{f.pena}": pena_val,
-        "{f.pena_2}": pena_2_val,
-        "{f.fecha_hoy_escrita}": fecha_estilo_contrato(datetime.now(ZoneInfo("America/Mexico_City")))
+        "{j.cliente}": getattr(venta, 'cliente', "").upper(),
+        "{j.coopropietario_1}": getattr(venta, 'cliente_2', "").upper(),
+        "{j.coopropietario_2}": getattr(venta, 'cliente_3', "").upper(),
+        "{j.coopropietario_3}": getattr(venta, 'cliente_4', "").upper(),
+        "{j.coopropietario_4}": getattr(venta, 'cliente_5', "").upper(),
+        "{j.coopropietario_5}": getattr(venta, 'cliente_6', "").upper(),
+        "{j.numero_comercial}": num_comercial,
+        "{j.numero_registral}": num_registral,
+        "{j.precio_final_letra}": float(getattr(venta, 'precio_final', 0) or 0),
+        "{j.apartado_letra}": float(getattr(venta, 'apartado', 0) or 0),
+        "{j.enganche_letra}": float(getattr(venta, 'total_enganche', 0) or 0),
+        "{j.monto_sin_interes_letra}": float(getattr(venta, 'monto_sin_interes', 0) or 0),
+        "{j.referencia_lote}": f"010100R{num_comercial}",
+        "{j.saldo_final}": (float(getattr(venta, 'precio_final', 0) or 0) - sum(float(a.total or 0) for a in amortizaciones[:-1])) if amortizaciones else 0,
+        "{j.saldo_final_letra}": float(getattr(venta, 'precio_final', 0) or 0) - sum(float(a.total or 0) for a in amortizaciones[:-1]) if amortizaciones else 0,
+        "{j.fecha_mensualidades}": rango_texto, 
+        "{j.numero_de_pagos}": num_pagos_financiamiento,
+        "{j.primera_mensualidad}": f_inicio_finan,
+        "{j.primer_enganche}": primer_enganche,
+        "{j.monto_parcialidad}": monto_parcialidad,
+        "{j.porcentaje}": f"{porcentaje_calculado:.2f}%",
+        "{j.pena}": pena_val,
+        "{j.pena_2}": pena_2_val,
+        "{j.fecha_hoy_escrita}": fecha_estilo_contrato(datetime.now(ZoneInfo("America/Mexico_City")))
     })
     
     logger.info("[DATOS_KOMUNAH] Paso: salida get_komunah_data | folio=%s | tags=%s", folio_ref, len(data))
@@ -674,23 +683,30 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
 
     # 8. Etiquetas Jurídico
     vars_f = procesar_manual([
-        "{f.numero_comercial}",
-        "{f.numero_registral}",
-        "{f.precio_final_letra}",
-        "{f.apartado_letra}",
-        "{f.enganche_letra}",
-        "{f.monto_sin_interes_letra}",
-        "{f.referencia_lote}",
-        "{f.pago_72}",
-        "{f.fecha_mensualidades}",
-        "{f.fecha_hoy_escrita}",
-        "{f.primera_mensualidad}",
-        "{f.primer_enganche}",
-        "{f.monto_parcialidad}",
-        "{f.numero_de_pagos}",
-        "{f.porcentaje}",
-        "{f.pena}",
-        "{f.pena_2}"
+        "{j.cliente}",
+        "{j.coopropietario_1}",
+        "{j.coopropietario_2}",
+        "{j.coopropietario_3}",
+        "{j.coopropietario_4}",
+        "{j.coopropietario_5}",
+        "{j.numero_comercial}",
+        "{j.numero_registral}",
+        "{j.precio_final_letra}",
+        "{j.apartado_letra}",
+        "{j.enganche_letra}",
+        "{j.monto_sin_interes_letra}",
+        "{j.referencia_lote}",
+        "{j.saldo_final}",
+        "{j.saldo_final_letra}",
+        "{j.fecha_mensualidades}",
+        "{j.fecha_hoy_escrita}",
+        "{j.primera_mensualidad}",
+        "{j.primer_enganche}",
+        "{j.monto_parcialidad}",
+        "{j.numero_de_pagos}",
+        "{j.porcentaje}",
+        "{j.pena}",
+        "{j.pena_2}"
     ])
 
     if vars_f: 
