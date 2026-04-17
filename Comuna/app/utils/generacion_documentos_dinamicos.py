@@ -257,6 +257,13 @@ class GenerarPDFUseCase:
         - Es una aproximación heurística; templates con CSS inusual pueden requerir ajuste.
         - Asume layout estándar del wrapper usado en _envolver_template_header_footer.
         """
+        # Heurística calibrada para wrapper base (12px, line-height 1.3, ancho útil A4).
+        ESTIMATED_CHARACTERS_PER_LINE = 95
+        PIXELS_PER_LINE = 16
+        PADDING_BUFFER_PX = 28
+        MIN_HEADER_FOOTER_HEIGHT_PX = 48
+        MAX_HEADER_FOOTER_HEIGHT_PX = 320
+
         contenido = GenerarPDFUseCase._normalizar_template_header_footer(template_html)
         if not contenido:
             return 0
@@ -266,19 +273,12 @@ class GenerarPDFUseCase:
         parser.close()
         texto = parser.obtener_texto().strip()
         if not texto:
-            return 48
+            return MIN_HEADER_FOOTER_HEIGHT_PX
 
         lineas = [re.sub(r"\s+", " ", linea).strip() for linea in texto.splitlines()]
         lineas = [linea for linea in lineas if linea]
         if not lineas:
-            return 48
-
-        # Heurística calibrada para wrapper base (12px, line-height 1.3, ancho útil A4).
-        ESTIMATED_CHARACTERS_PER_LINE = 95
-        PIXELS_PER_LINE = 16
-        PADDING_BUFFER_PX = 28
-        MIN_HEADER_FOOTER_HEIGHT_PX = 48
-        MAX_HEADER_FOOTER_HEIGHT_PX = 320
+            return MIN_HEADER_FOOTER_HEIGHT_PX
 
         lineas_envueltas = sum(
             max(1, (len(linea) + ESTIMATED_CHARACTERS_PER_LINE - 1) // ESTIMATED_CHARACTERS_PER_LINE)
