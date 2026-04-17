@@ -257,7 +257,8 @@ class GenerarPDFUseCase:
         - Es una aproximación heurística; templates con CSS inusual pueden requerir ajuste.
         - Asume layout estándar del wrapper usado en _envolver_template_header_footer.
         """
-        # Heurística calibrada para wrapper base (12px, line-height 1.3, ancho útil A4).
+        # Heurística calibrada para wrapper base (12px, line-height 1.3, ancho útil A4):
+        # ~95 caracteres por línea considerando padding horizontal y ancho promedio de carácter.
         ESTIMATED_CHARACTERS_PER_LINE = 95
         PIXELS_PER_LINE = 16
         PADDING_BUFFER_PX = 28
