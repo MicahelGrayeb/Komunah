@@ -4,6 +4,7 @@ import base64
 import logging
 import io
 import mimetypes
+from html.parser import HTMLParser
 from urllib.parse import urlparse
 from urllib.request import urlopen
 from datetime import datetime, timedelta
@@ -32,6 +33,28 @@ def _get_utils_notifications():
 def _get_providers():
     from ..routers.notificacionesMS import PROVIDERS
     return PROVIDERS
+
+class _TextoPlanoHTMLParser(HTMLParser):
+    _BLOQUES_CON_SALTO = {"p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._partes: List[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "br":
+            self._partes.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag.lower() in self._BLOQUES_CON_SALTO:
+            self._partes.append("\n")
+
+    def handle_data(self, data):
+        if data:
+            self._partes.append(data)
+
+    def obtener_texto(self) -> str:
+        return "".join(self._partes)
 
 class GenerarPDFUseCase:
     def __init__(self, repo):
@@ -221,26 +244,27 @@ class GenerarPDFUseCase:
 
     @staticmethod
     def _estimar_altura_template_header_footer_px(template_html: str) -> int:
-        """Estima altura en px para reservar margen de header/footer en Playwright."""
+        """
+        Estima altura en px para reservar margen de header/footer en Playwright.
+
+        Método:
+        1) Convierte el HTML a texto plano preservando saltos de línea de bloques comunes.
+        2) Calcula líneas envueltas con un ancho aproximado de caracteres por línea.
+        3) Traduce líneas a px con base en tipografía de 12px y line-height ~1.3.
+        4) Aplica un buffer y límites mínimo/máximo para evitar traslapes extremos.
+
+        Limitaciones:
+        - Es una aproximación heurística; templates con CSS inusual pueden requerir ajuste.
+        - Asume layout estándar del wrapper usado en _envolver_template_header_footer.
+        """
         contenido = GenerarPDFUseCase._normalizar_template_header_footer(template_html)
         if not contenido:
             return 0
 
-        # Convierte cortes comunes de bloque en saltos de línea para aproximar alto visual.
-        contenido = re.sub(
-            r"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>|</h[1-6]>",
-            "\n",
-            contenido,
-        )
-        # Limpieza de tags restantes y entidades básicas.
-        texto = re.sub(r"<[^>]+>", "", contenido)
-        texto = (
-            texto.replace("&nbsp;", " ")
-            .replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .strip()
-        )
+        parser = _TextoPlanoHTMLParser()
+        parser.feed(contenido)
+        parser.close()
+        texto = parser.obtener_texto().strip()
         if not texto:
             return 48
 
@@ -249,12 +273,20 @@ class GenerarPDFUseCase:
         if not lineas:
             return 48
 
-        caracteres_por_linea = 95
-        lineas_envueltas = sum(max(1, (len(linea) + caracteres_por_linea - 1) // caracteres_por_linea) for linea in lineas)
+        # Heurística calibrada para wrapper base (12px, line-height 1.3, ancho útil A4).
+        ESTIMATED_CHARACTERS_PER_LINE = 95
+        PIXELS_PER_LINE = 16
+        PADDING_BUFFER_PX = 28
+        MIN_HEADER_FOOTER_HEIGHT_PX = 48
+        MAX_HEADER_FOOTER_HEIGHT_PX = 320
 
-        # 12px * 1.3 ≈ 16px por línea + colchón para evitar traslapes.
-        altura_estimada = (lineas_envueltas * 16) + 28
-        return max(48, min(altura_estimada, 320))
+        lineas_envueltas = sum(
+            max(1, (len(linea) + ESTIMATED_CHARACTERS_PER_LINE - 1) // ESTIMATED_CHARACTERS_PER_LINE)
+            for linea in lineas
+        )
+
+        altura_estimada = (lineas_envueltas * PIXELS_PER_LINE) + PADDING_BUFFER_PX
+        return max(MIN_HEADER_FOOTER_HEIGHT_PX, min(altura_estimada, MAX_HEADER_FOOTER_HEIGHT_PX))
 
     @staticmethod
     def _construir_pdf_kwargs(tamano_documento: str, encabezado_final: str, footer_final: str) -> dict:
