@@ -475,7 +475,24 @@ def get_komunah_data(folio_ref: str, db: Session):
         "{j.porcentaje}": f"{porcentaje_calculado:.2f}%",
         "{j.pena}": pena_val,
         "{j.pena_2}": pena_2_val,
-        "{j.fecha_hoy_escrita}": fecha_estilo_contrato(datetime.now(ZoneInfo("America/Mexico_City")))
+        "{j.fecha_hoy_escrita}": fecha_estilo_contrato(datetime.now(ZoneInfo("America/Mexico_City"))),
+        "{j.fecha_hoy_escrita_Mayusculas}": fecha_estilo_contrato(datetime.now(ZoneInfo("America/Mexico_City"))).upper(),
+        "{j.paginacion}": "",
+        "{j.total_paginas}": ""
+    })
+
+    #-- ETIQQUETAS PARA TABLA DE AMORTIZACIONES ---
+
+    data.update({
+        "{pagos.numero}": "",
+        "{pagos.fecha}": "",
+        "{pagos.capital}": "",
+        "{pagos.enganche}": "",
+        "{pagos.total}": "",
+        "{pagos.saldo_capital}": "",
+        "{totales.suma_capital}": "",
+        "{totales.saldo_enganche}": "",
+        "{totales.suma_total}": "",
     })
     
     logger.info("[DATOS_KOMUNAH] Paso: salida get_komunah_data | folio=%s | tags=%s", folio_ref, len(data))
@@ -682,7 +699,7 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
             catalogo.append({"categoria": f"Switches y Gestión del Integrante {i} (g{i}.)", "variables": vars_gi})
 
     # 8. Etiquetas Jurídico
-    vars_f = procesar_manual([
+    etiquetas_juridico = [
         "{j.cliente}",
         "{j.coopropietario_1}",
         "{j.coopropietario_2}",
@@ -700,17 +717,61 @@ def get_komunah_diccionario_maestro(flat_data: dict = None):
         "{j.saldo_final_letra}",
         "{j.fecha_mensualidades}",
         "{j.fecha_hoy_escrita}",
+        "{j.fecha_hoy_escrita_Mayusculas}",
         "{j.primera_mensualidad}",
         "{j.primer_enganche}",
         "{j.monto_parcialidad}",
         "{j.numero_de_pagos}",
         "{j.porcentaje}",
         "{j.pena}",
-        "{j.pena_2}"
-    ])
+        "{j.pena_2}",
+        "{j.paginacion}",
+        "{j.total_paginas}"
+    ]
+
+    if flat_data:
+        # Estas etiquetas pueden llegar vacias y aun asi deben verse en el diccionario.
+        etiquetas_juridico_siempre_visibles = {"{j.paginacion}", "{j.total_paginas}"}
+        vars_f = []
+        for tag in etiquetas_juridico:
+            valor = flat_data.get(tag)
+            if tag in etiquetas_juridico_siempre_visibles:
+                vars_f.append({"tag": tag, "valor": "" if valor in [None, "None", "NULL"] else valor})
+                continue
+
+            if valor not in [None, "", "None", "NULL"]:
+                valor_formateado = aplicar_formato_etiqueta(tag, valor)
+                vars_f.append({"tag": tag, "valor": valor_formateado})
+    else:
+        vars_f = etiquetas_juridico
 
     if vars_f: 
         catalogo.append({"categoria": "Etiquetas Jurídico", "variables": vars_f })
+
+    etiquetas_tabla_amortizaciones = [
+        "{pagos.numero}",
+        "{pagos.fecha}",
+        "{pagos.capital}",
+        "{pagos.enganche}",
+        "{pagos.total}",
+        "{pagos.saldo_capital}",
+        "{totales.suma_capital}",
+        "{totales.saldo_enganche}",
+        "{totales.suma_total}",
+    ]
+
+    if flat_data:
+        # Estas etiquetas se calculan durante la generacion de documentos; en diccionario deben verse aunque esten vacias.
+        vars_TA = [
+            {"tag": tag, "valor": flat_data.get(tag, "")}
+            for tag in etiquetas_tabla_amortizaciones
+        ]
+    else:
+        vars_TA = etiquetas_tabla_amortizaciones
+
+    if vars_TA:
+        catalogo.append({"categoria": "Etiquetas para Tabla de amortizaciónes", "variables": vars_TA})
+
 
     logger.info("[DATOS_KOMUNAH] Salida get_komunah_diccionario_maestro | categorias=%s", len(catalogo))
 

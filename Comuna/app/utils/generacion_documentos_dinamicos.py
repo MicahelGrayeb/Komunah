@@ -3,6 +3,9 @@ import re
 import base64
 import logging
 import io
+import mimetypes
+from urllib.parse import urlparse
+from urllib.request import urlopen
 from datetime import datetime, timedelta
 from typing import Any, List, Optional
 from zoneinfo import ZoneInfo
@@ -98,6 +101,14 @@ class GenerarPDFUseCase:
             # Limpiamos el tag (quitamos todas las { y }) para buscar en el dict
             tag_limpio = tag.replace("{", "").replace("}", "").strip()
 
+            # Aliases de paginacion para footer de Playwright.
+            if tag_limpio.lower() in {"documento.pagination", "j.paginacion"}:
+                texto = texto.replace(tag, '<span class="pageNumber"></span>')
+                continue
+            if tag_limpio.lower() in {"documento.total_paginas", "j.total_paginas"}:
+                texto = texto.replace(tag, '<span class="totalPages"></span>')
+                continue
+
             # Buscamos la variable (probablemente guardada con formato {nombre} en tu dict)
             valor = vars_html.get(f"{{{tag_limpio}}}")
             if valor is None:
@@ -122,7 +133,54 @@ class GenerarPDFUseCase:
         html = re.sub(r"mso-[a-zA-Z\-]+\s*:\s*[^;\"']*;?", "", html, flags=re.IGNORECASE)
         # Limpia estilos vacios y espacios sobrantes.
         html = re.sub(r'\sstyle="\s*"', "", html)
+        # Header/Footer de Playwright no siempre esperan recursos remotos: embebe imagenes URL en Data URI.
+        html = GenerarPDFUseCase._embeber_imagenes_remotas_en_data_uri(html)
         return html.strip()
+
+    @staticmethod
+    def _obtener_data_uri_desde_url_imagen(url: str) -> str:
+        if not url:
+            return ""
+
+        try:
+            with urlopen(url, timeout=8) as response:
+                contenido = response.read()
+                tipo = response.headers.get_content_type() if response.headers else None
+
+            if not tipo or tipo == "application/octet-stream":
+                extension = os.path.splitext(urlparse(url).path)[1].lower()
+                tipo = mimetypes.types_map.get(extension, "image/png")
+
+            contenido_b64 = base64.b64encode(contenido).decode("ascii")
+            return f"data:{tipo};base64,{contenido_b64}"
+        except Exception as e:
+            logger.warning("[PDF_GENERADOR] No se pudo embeber imagen remota en header/footer | url=%s | error=%s", url, e)
+            return ""
+
+    @staticmethod
+    def _embeber_imagenes_remotas_en_data_uri(html: str) -> str:
+        if not html:
+            return html
+
+        cache_data_uri = {}
+        patron_img_http = re.compile(
+            r"(<img[^>]*\ssrc\s*=\s*)([\"'])(https?://[^\"']+)(\2)([^>]*>)",
+            flags=re.IGNORECASE,
+        )
+
+        def _reemplazo(match: re.Match) -> str:
+            prefijo, quote_inicio, url, quote_fin, sufijo = match.groups()
+            data_uri = cache_data_uri.get(url)
+            if data_uri is None:
+                data_uri = GenerarPDFUseCase._obtener_data_uri_desde_url_imagen(url)
+                cache_data_uri[url] = data_uri
+
+            if not data_uri:
+                return match.group(0)
+
+            return f"{prefijo}{quote_inicio}{data_uri}{quote_fin}{sufijo}"
+
+        return patron_img_http.sub(_reemplazo, html)
 
     @staticmethod
     def _envolver_template_header_footer(template_html: str, posicion: str) -> str:
@@ -130,8 +188,35 @@ class GenerarPDFUseCase:
         if not contenido:
             return "<span></span>"
 
+        if posicion == "footer":
+            # Permite placeholders personalizados para paginacion en footer.
+            contenido = re.sub(
+                r"\{\{?\s*documento\.pagination\s*\}?\}",
+                '<span class="pageNumber"></span>',
+                contenido,
+                flags=re.IGNORECASE,
+            )
+            contenido = re.sub(
+                r"\{\{?\s*j\.paginacion\s*\}?\}",
+                '<span class="pageNumber"></span>',
+                contenido,
+                flags=re.IGNORECASE,
+            )
+            contenido = re.sub(
+                r"\{\{?\s*documento\.total_paginas\s*\}?\}",
+                '<span class="totalPages"></span>',
+                contenido,
+                flags=re.IGNORECASE,
+            )
+            contenido = re.sub(
+                r"\{\{?\s*j\.total_paginas\s*\}?\}",
+                '<span class="totalPages"></span>',
+                contenido,
+                flags=re.IGNORECASE,
+            )
+
         margen = "margin-top: 10px;" if posicion == "header" else "margin-bottom: 10px;"
-        estilo_base = "font-size: 12px; line-height: 1.3; width: 100%; text-align: center; color: black; padding: 0 10px;"
+        estilo_base = "font-size: 12px; line-height: 1.3; width: 100%; text-align: center; color: black; padding: 0 10px; -webkit-print-color-adjust: exact; print-color-adjust: exact;"
         return f"<div style=\"{estilo_base} {margen}\">{contenido}</div>"
 
     @staticmethod
@@ -721,8 +806,9 @@ class GenerarPDFUseCase:
             footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
 
             nombre_plantilla = fields.get("categoria", {}).get("stringValue", "documento")
+            nombre_plantilla_limpio = self._reemplazar_etiquetas(nombre_plantilla, variables_html)
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
-            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')} - {self._normalizar_fragmento(cliente, 'Cliente')}.pdf"
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla_limpio, fallback='documento')} - {self._normalizar_fragmento(cliente, 'Cliente')}.pdf"
 
             pdf_kwargs = self._construir_pdf_kwargs(tamanoDocumento, encabezado_final, footer_final)
 
@@ -847,7 +933,8 @@ class GenerarPDFUseCase:
             footer_final = self._reemplazar_etiquetas(footer_raw, variables_html) if footer_raw else ""
 
             nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
-            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla, fallback='documento')}.pdf"
+            nombre_plantilla_limpio = self._reemplazar_etiquetas(nombre_plantilla, variables_html)
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla_limpio, fallback='documento')}.pdf"
             tamanoDocumento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
 
             pdf_kwargs = self._construir_pdf_kwargs(tamanoDocumento, encabezado_final, footer_final)
@@ -979,7 +1066,8 @@ class GenerarPDFUseCase:
                                 html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
                 nombre_anexo = fields.get("nombre", {}).get("stringValue", "anexo")
-                nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, fallback='anexo')}.pdf"
+                nombre_anexo_limpio = self._reemplazar_etiquetas(nombre_anexo, variables_html)
+                nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo_limpio, fallback='anexo')}.pdf"
                 tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
 
                 encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
@@ -1370,7 +1458,8 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
 
             # --- 4. RESPUESTA FINAL (Subida a bucket del archivo unificado) ---
             nombre_plantilla = fields.get("nombre", {}).get("stringValue", "documento")
-            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla)}.pdf"
+            nombre_plantilla_limpio = self._reemplazar_etiquetas(nombre_plantilla, variables_html)
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_plantilla_limpio)}.pdf"
 
             respuesta = {
                 "id_plantilla": id_plantilla,
@@ -1479,7 +1568,8 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                             html_final = self._inyectar_membretada_fondo(html_final, primera_imagen_b64)
 
             nombre_anexo = fields.get("nombre", {}).get("stringValue", "anexo")
-            nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo, fallback='anexo')}.pdf"
+            nombre_anexo_limpio = self._reemplazar_etiquetas(nombre_anexo, variables_html)
+            nombre_pdf = f"{self._normalizar_fragmento(nombre_anexo_limpio, fallback='anexo')}.pdf"
             tamano_documento = fields.get("tamanoDocumento", {}).get("stringValue", "A4")
 
             encabezado_raw = fields.get("encabezado", {}).get("stringValue", "") or ""
