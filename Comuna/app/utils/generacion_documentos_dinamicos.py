@@ -215,7 +215,7 @@ class GenerarPDFUseCase:
                 flags=re.IGNORECASE,
             )
 
-        margen = "margin-top: 10px;" if posicion == "header" else "margin-bottom: 10px;"
+        margen = "margin-bottom: 10px;" if posicion == "header" else "margin-top: 10px;"
         estilo_base = "font-size: 12px; line-height: 1.3; width: 100%; text-align: center; color: black; padding: 0 10px; -webkit-print-color-adjust: exact; print-color-adjust: exact;"
         return f"<div style=\"{estilo_base} {margen}\">{contenido}</div>"
 
