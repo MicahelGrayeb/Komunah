@@ -220,9 +220,48 @@ class GenerarPDFUseCase:
         return f"<div style=\"{estilo_base} {margen}\">{contenido}</div>"
 
     @staticmethod
+    def _estimar_altura_template_header_footer_px(template_html: str) -> int:
+        """Estima altura en px para reservar margen de header/footer en Playwright."""
+        contenido = GenerarPDFUseCase._normalizar_template_header_footer(template_html)
+        if not contenido:
+            return 0
+
+        # Convierte cortes comunes de bloque en saltos de línea para aproximar alto visual.
+        contenido = re.sub(
+            r"(?i)<br\s*/?>|</p>|</div>|</li>|</tr>|</h[1-6]>",
+            "\n",
+            contenido,
+        )
+        # Limpieza de tags restantes y entidades básicas.
+        texto = re.sub(r"<[^>]+>", "", contenido)
+        texto = (
+            texto.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .strip()
+        )
+        if not texto:
+            return 48
+
+        lineas = [re.sub(r"\s+", " ", linea).strip() for linea in texto.splitlines()]
+        lineas = [linea for linea in lineas if linea]
+        if not lineas:
+            return 48
+
+        caracteres_por_linea = 95
+        lineas_envueltas = sum(max(1, (len(linea) + caracteres_por_linea - 1) // caracteres_por_linea) for linea in lineas)
+
+        # 12px * 1.3 ≈ 16px por línea + colchón para evitar traslapes.
+        altura_estimada = (lineas_envueltas * 16) + 28
+        return max(48, min(altura_estimada, 320))
+
+    @staticmethod
     def _construir_pdf_kwargs(tamano_documento: str, encabezado_final: str, footer_final: str) -> dict:
         tiene_encabezado = bool(encabezado_final)
         tiene_footer = bool(footer_final)
+        alto_encabezado_px = GenerarPDFUseCase._estimar_altura_template_header_footer_px(encabezado_final) if tiene_encabezado else 0
+        alto_footer_px = GenerarPDFUseCase._estimar_altura_template_header_footer_px(footer_final) if tiene_footer else 0
 
         pdf_kwargs = {
             "format": tamano_documento,
@@ -230,8 +269,8 @@ class GenerarPDFUseCase:
             "prefer_css_page_size": True,
             "scale": 1.0,
             "margin": {
-                "top": "2cm" if tiene_encabezado else "0px",
-                "bottom": "2cm" if tiene_footer else "0px",
+                "top": f"{alto_encabezado_px}px" if tiene_encabezado else "0px",
+                "bottom": f"{alto_footer_px}px" if tiene_footer else "0px",
                 "left": "0px",
                 "right": "0px",
             },
