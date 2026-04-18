@@ -189,22 +189,9 @@ class GenerarPDFUseCase:
             return "<span></span>"
 
         if posicion == "footer":
-            # Permite placeholders personalizados para paginacion en footer.
-            contenido = re.sub(
-                r"\{\{?\s*documento\.pagination\s*\}?\}",
-                '<span class="pageNumber"></span>',
-                contenido,
-                flags=re.IGNORECASE,
-            )
             contenido = re.sub(
                 r"\{\{?\s*j\.paginacion\s*\}?\}",
                 '<span class="pageNumber"></span>',
-                contenido,
-                flags=re.IGNORECASE,
-            )
-            contenido = re.sub(
-                r"\{\{?\s*documento\.total_paginas\s*\}?\}",
-                '<span class="totalPages"></span>',
                 contenido,
                 flags=re.IGNORECASE,
             )
@@ -215,26 +202,25 @@ class GenerarPDFUseCase:
                 flags=re.IGNORECASE,
             )
 
-        margen = "margin-top: 10px;" if posicion == "header" else "margin-bottom: 10px;"
-        estilo_base = "font-size: 12px; line-height: 1.3; width: 100%; text-align: center; color: black; padding: 0 10px; -webkit-print-color-adjust: exact; print-color-adjust: exact;"
-        return f"<div style=\"{estilo_base} {margen}\">{contenido}</div>"
+        if posicion == "header":
+            espaciado = "padding-left: 1cm; padding-right: 1cm; padding-bottom: 0cm; padding-top: 0.5cm; box-sizing: border-box;"
+        else:
+            espaciado = "padding-left: 1cm; padding-right: 1cm; padding-bottom: 0cm; padding-top: 2cm; box-sizing: border-box;"
+
+        estilo_base = "font-size: 12px; line-height: 1.3; width: 100%; text-align: center; color: black; -webkit-print-color-adjust: exact; print-color-adjust: exact;"
+        
+        return f"<div style=\"{estilo_base} {espaciado}\">{contenido}</div>"
 
     @staticmethod
     def _construir_pdf_kwargs(tamano_documento: str, encabezado_final: str, footer_final: str) -> dict:
         tiene_encabezado = bool(encabezado_final)
         tiene_footer = bool(footer_final)
 
+        # Mantenemos tu configuración original intacta
         pdf_kwargs = {
             "format": tamano_documento,
             "print_background": True,
-            "prefer_css_page_size": True,
-            "scale": 1.0,
-            "margin": {
-                "top": "2cm" if tiene_encabezado else "0px",
-                "bottom": "2cm" if tiene_footer else "0px",
-                "left": "0px",
-                "right": "0px",
-            },
+            "prefer_css_page_size": True 
         }
 
         if tiene_encabezado or tiene_footer:
