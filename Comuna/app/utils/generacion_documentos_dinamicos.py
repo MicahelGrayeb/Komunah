@@ -203,9 +203,9 @@ class GenerarPDFUseCase:
             )
 
         if posicion == "header":
-            espaciado = "padding-left: 1cm; padding-right: 1cm; padding-bottom: 0cm; padding-top: 0.5cm; box-sizing: border-box;"
+            espaciado = "padding-left: 1.5cm; padding-right: 1.5cm; padding-bottom: 0cm; padding-top: 0.5cm; box-sizing: border-box;"
         else:
-            espaciado = "padding-left: 1cm; padding-right: 1cm; padding-bottom: 0cm; padding-top: 2cm; box-sizing: border-box;"
+            espaciado = "padding-left: 1.5cm; padding-right: 1.5cm; padding-bottom: 0cm; padding-top: 2cm; box-sizing: border-box;"
 
         estilo_base = "font-size: 12px; line-height: 1.3; width: 100%; text-align: center; color: black; -webkit-print-color-adjust: exact; print-color-adjust: exact;"
         
@@ -266,6 +266,65 @@ class GenerarPDFUseCase:
                 adjuntos.append({"content": contenido, "filename": nombre})
 
         logger.info("[PDF_GENERADOR] Salida _obtener_archivos_subidos_desde_fields | adjuntos=%s", len(adjuntos))
+        return adjuntos
+
+    @staticmethod
+    def _obtener_archivos_subidos_con_meta_desde_fields(fields: dict) -> List[dict]:
+        """Obtiene adjuntos de archivos_subidos con mime_type para fusionarlos al PDF final."""
+        logger.info("[PDF_GENERADOR] Entrada _obtener_archivos_subidos_con_meta_desde_fields")
+        adjuntos: List[dict] = []
+
+        archivos_meta = fields.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {})
+
+        # Formato clásico: mapValue { "archivo.pdf": {"stringValue": "...base64..."} }
+        archivos_map = fields.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {})
+        logger.info("[PDF_GENERADOR] Paso: leer archivos_subidos mapValue para fusionar | total=%s", len(archivos_map))
+        for nombre_archivo, nodo in archivos_map.items():
+            contenido_b64 = nodo.get("stringValue")
+            if not contenido_b64:
+                continue
+
+            meta_data = archivos_meta.get(nombre_archivo, {}).get("mapValue", {}).get("fields", {})
+            mime_type = meta_data.get("mime_type", {}).get("stringValue")
+            if not mime_type:
+                mime_type = mimetypes.guess_type(nombre_archivo)[0] or "application/octet-stream"
+
+            adjuntos.append(
+                {
+                    "filename": nombre_archivo,
+                    "content": contenido_b64,
+                    "mime_type": mime_type,
+                }
+            )
+
+        # Formato nuevo: arrayValue [{ mapValue: { fields: { filename, content, mime_type, ... } } }]
+        archivos_array = fields.get("archivos_subidos", {}).get("arrayValue", {}).get("values", [])
+        logger.info("[PDF_GENERADOR] Paso: leer archivos_subidos arrayValue para fusionar | total=%s", len(archivos_array))
+        for item in archivos_array:
+            data = item.get("mapValue", {}).get("fields", {})
+            nombre = data.get("filename", {}).get("stringValue")
+            contenido_b64 = data.get("content", {}).get("stringValue")
+            mime_type = data.get("mime_type", {}).get("stringValue")
+
+            if not (nombre and contenido_b64):
+                continue
+
+            if not mime_type:
+                meta_data = archivos_meta.get(nombre, {}).get("mapValue", {}).get("fields", {})
+                mime_type = meta_data.get("mime_type", {}).get("stringValue")
+
+            if not mime_type:
+                mime_type = mimetypes.guess_type(nombre)[0] or "application/octet-stream"
+
+            adjuntos.append(
+                {
+                    "filename": nombre,
+                    "content": contenido_b64,
+                    "mime_type": mime_type,
+                }
+            )
+
+        logger.info("[PDF_GENERADOR] Salida _obtener_archivos_subidos_con_meta_desde_fields | adjuntos=%s", len(adjuntos))
         return adjuntos
 
     @staticmethod
@@ -1401,38 +1460,57 @@ class GenerarPDFDinamico(GenerarPDFUseCase):
                         res_anexo = await self.generar_pdfs_anexos(empresa_id, id_anexo, folio, db, subir_bucket=False)
                         merger.append(io.BytesIO(base64.b64decode(res_anexo["content"])))
 
-                # --- 4. NUEVO: PROCESAMIENTO DE IMÁGENES (archivos_subidos) ---
+                # --- 4. PROCESAMIENTO DE ARCHIVOS SUBIDOS (imagenes y PDF) ---
                 if coleccion == "DocumentosDinamicos":
-                    archivos_map = fields.get("archivos_subidos", {}).get("mapValue", {}).get("fields", {})
-                    archivos_meta = fields.get("archivos_subidos_meta", {}).get("mapValue", {}).get("fields", {})
+                    adjuntos = self._obtener_archivos_subidos_con_meta_desde_fields(fields)
 
-                    for nombre_archivo, nodo_b64 in archivos_map.items():
-                        base64_data = nodo_b64.get("stringValue")
-                        if not base64_data: continue
+                    for adjunto in adjuntos:
+                        nombre_archivo = str(adjunto.get("filename") or "adjunto")
+                        base64_data = adjunto.get("content")
+                        mime_type = str(adjunto.get("mime_type") or "application/octet-stream").lower()
 
-                        # Obtener mime_type del meta (ej: image/png)
-                        meta_data = archivos_meta.get(nombre_archivo, {}).get("mapValue", {}).get("fields", {})
-                        mime_type = meta_data.get("mime_type", {}).get("stringValue", "image/jpeg")
+                        if not base64_data:
+                            continue
 
-                        logger.info("[PDF_GENERADOR] Agregando imagen como página PDF: %s", nombre_archivo)
+                        if mime_type == "application/pdf" or nombre_archivo.lower().endswith(".pdf"):
+                            try:
+                                logger.info("[PDF_GENERADOR] Agregando PDF adjunto al documento final: %s", nombre_archivo)
+                                pdf_bytes_adjunto = base64.b64decode(base64_data)
+                                merger.append(io.BytesIO(pdf_bytes_adjunto))
+                            except Exception as e:
+                                logger.warning(
+                                    "[PDF_GENERADOR] No se pudo fusionar PDF adjunto | archivo=%s | error=%s",
+                                    nombre_archivo,
+                                    str(e),
+                                )
+                            continue
 
-                        # HTML simple para centrar la imagen en la página
-                        html_imagen = f"""
-                        <html>
-                            <body style="margin:0; padding:0; display:flex; justify-content:center; align-items:center; height:100vh;">
-                                <img src="data:{mime_type};base64,{base64_data}" style="max-width:100%; max-height:100%; object-fit:contain;">
-                            </body>
-                        </html>
-                        """
-                        await page.set_content(html_imagen, wait_until="networkidle")
-                        pdf_bytes_img = await page.pdf(
-                            format=tamanoDocumento, 
-                            print_background=True, 
-                            prefer_css_page_size=True, 
-                            scale=1.0, 
-                            margin={"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"}
+                        if mime_type.startswith("image/"):
+                            logger.info("[PDF_GENERADOR] Agregando imagen como página PDF: %s", nombre_archivo)
+
+                            html_imagen = f"""
+                            <html>
+                                <body style="margin:0; padding:0; display:flex; justify-content:center; align-items:center; height:100vh;">
+                                    <img src="data:{mime_type};base64,{base64_data}" style="max-width:100%; max-height:100%; object-fit:contain;">
+                                </body>
+                            </html>
+                            """
+                            await page.set_content(html_imagen, wait_until="networkidle")
+                            pdf_bytes_img = await page.pdf(
+                                format=tamanoDocumento,
+                                print_background=True,
+                                prefer_css_page_size=True,
+                                scale=1.0,
+                                margin={"top": "0px", "bottom": "0px", "left": "0px", "right": "0px"}
+                            )
+                            merger.append(io.BytesIO(pdf_bytes_img))
+                            continue
+
+                        logger.info(
+                            "[PDF_GENERADOR] Archivo subido omitido por tipo no soportado para fusionar | archivo=%s | mime=%s",
+                            nombre_archivo,
+                            mime_type,
                         )
-                        merger.append(io.BytesIO(pdf_bytes_img))
 
                 await browser.close()
 

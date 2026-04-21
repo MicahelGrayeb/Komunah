@@ -450,6 +450,8 @@ def get_komunah_data(folio_ref: str, db: Session):
     precio_total_venta = float(getattr(venta, 'precio_final', 1) or 1)
     porcentaje_calculado = (total_enganche_a_pagar / precio_total_venta) * 100
 
+    saldo_final_val = (float(getattr(venta, 'precio_final', 0) or 0) - sum(float(a.total or 0) for a in amortizaciones[:-1])) if amortizaciones else 0
+
     # 5. Actualización de data
     data.update({
         "{j.cliente}": getattr(venta, 'cliente', "").upper(),
@@ -460,13 +462,13 @@ def get_komunah_data(folio_ref: str, db: Session):
         "{j.coopropietario_5}": getattr(venta, 'cliente_6', "").upper(),
         "{j.numero_comercial}": num_comercial,
         "{j.numero_registral}": num_registral,
-        "{j.precio_final_letra}": float(getattr(venta, 'precio_final', 0) or 0),
-        "{j.apartado_letra}": float(getattr(venta, 'apartado', 0) or 0),
-        "{j.enganche_letra}": float(getattr(venta, 'total_enganche', 0) or 0),
-        "{j.monto_sin_interes_letra}": float(getattr(venta, 'monto_sin_interes', 0) or 0),
+        "{j.precio_final_letra}": monto_a_letra(float(getattr(venta, 'precio_final', 0) or 0)),
+        "{j.apartado_letra}": monto_a_letra(float(getattr(venta, 'apartado', 0) or 0)),
+        "{j.enganche_letra}": monto_a_letra(float(getattr(venta, 'total_enganche', 0) or 0)),
+        "{j.monto_sin_interes_letra}": monto_a_letra(float(getattr(venta, 'monto_sin_interes', 0) or 0)),
         "{j.referencia_lote}": f"010100R{num_comercial}",
-        "{j.saldo_final}": (float(getattr(venta, 'precio_final', 0) or 0) - sum(float(a.total or 0) for a in amortizaciones[:-1])) if amortizaciones else 0,
-        "{j.saldo_final_letra}": float(getattr(venta, 'precio_final', 0) or 0) - sum(float(a.total or 0) for a in amortizaciones[:-1]) if amortizaciones else 0,
+        "{j.saldo_final}": saldo_final_val,
+        "{j.saldo_final_letra}": monto_a_letra(saldo_final_val),
         "{j.fecha_mensualidades}": rango_texto, 
         "{j.numero_de_pagos}": num_pagos_financiamiento,
         "{j.primera_mensualidad}": f_inicio_finan,

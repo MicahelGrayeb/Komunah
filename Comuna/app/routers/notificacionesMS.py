@@ -1309,7 +1309,7 @@ class UtilsNotifications:
         pendientes = set(re.findall(regex_etiquetas, texto))
         conocidas_no_resueltas = [
             t for t in pendientes
-            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|c[1-6]\.|g[1-6]\.).+\}$", t)
+            if re.match(r"^\{(cliente|email_cliente|telefono_cliente|ven\.|v\.|p\.|cl\.|sys\.|j\.|c[1-6]\.|g[1-6]\.).+\}$", t)
         ]
 
         if conocidas_no_resueltas:
