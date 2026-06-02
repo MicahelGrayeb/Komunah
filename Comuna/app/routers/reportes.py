@@ -45,6 +45,7 @@ def _traducir_concepto_amortizacion(concepto: Any) -> str:
 def get_bitacora_pagos(
     anio: Optional[int] = None,
     folio: Optional[str] = None,
+    proyecto: Optional[str] = None, # <-- NUEVO PARÁMETRO DE PROYECTO
     db: Session = Depends(get_db),
     user: dict = Depends(es_usuario)
 ):
@@ -75,6 +76,12 @@ def get_bitacora_pagos(
 
     if folio:
         stmt_pagos = stmt_pagos.filter(Pago.folio_venta == folio)
+
+    # <-- NUEVO FILTRO DE PROYECTO PARA LA SUBCONSULTA DE PAGOS -->
+    if proyecto and proyecto.lower() != "todos":
+        stmt_pagos = stmt_pagos.join(
+            Venta, Pago.folio_venta == Venta.folio
+        ).filter(Venta.desarrollo == proyecto)
 
     subq_pagos = stmt_pagos.group_by(
         Pago.folio_venta, 
@@ -122,12 +129,20 @@ def get_bitacora_pagos(
 
     try:
         # A) TOTALES GLOBALES
-        totales = db.query(
+        totales_query = db.query(
             func.sum(monto_prog).label("total_general"),
             func.sum(monto_pagado).label("total_pagado"),
             func.sum(es_vencido).label("total_vencido"),
             func.sum(es_por_pagar).label("total_por_pagar")
-        ).outerjoin(subq_pagos, join_condicion).filter(*filtros_base).first()
+        ).outerjoin(subq_pagos, join_condicion)
+
+        # <-- NUEVO FILTRO DE PROYECTO PARA LOS TOTALES -->
+        if proyecto and proyecto.lower() != "todos":
+            totales_query = totales_query.join(
+                Venta, Amortizacion.folder_id == Venta.folio
+            ).filter(Venta.desarrollo == proyecto)
+
+        totales = totales_query.filter(*filtros_base).first()
 
         t_general = float(totales.total_general or 0)
         t_pagado = float(totales.total_pagado or 0)
@@ -135,14 +150,22 @@ def get_bitacora_pagos(
         t_por_pagar = float(totales.total_por_pagar or 0)
 
         # B) DESGLOSE MENSUAL
-        desglose = db.query(
+        desglose_query = db.query(
             func.year(fecha_amort).label("anio"),
             func.month(fecha_amort).label("mes"),
             func.sum(monto_prog).label("mensual_general"),
             func.sum(monto_pagado).label("mensual_pagado"),
             func.sum(es_vencido).label("mensual_vencido"),
             func.sum(es_por_pagar).label("mensual_por_pagar")
-        ).outerjoin(subq_pagos, join_condicion).filter(*filtros_base).group_by(
+        ).outerjoin(subq_pagos, join_condicion)
+
+        # <-- NUEVO FILTRO DE PROYECTO PARA EL DESGLOSE MENSUAL -->
+        if proyecto and proyecto.lower() != "todos":
+            desglose_query = desglose_query.join(
+                Venta, Amortizacion.folder_id == Venta.folio
+            ).filter(Venta.desarrollo == proyecto)
+
+        desglose = desglose_query.filter(*filtros_base).group_by(
             func.year(fecha_amort),
             func.month(fecha_amort)
         ).all()
@@ -173,13 +196,12 @@ def get_bitacora_pagos(
                 anios_dict_raw[y][nombre_mes] += val_general
                 anios_dict_raw[y]["TOTAL"] += val_general
 
-            # LÓGICA CORREGIDA: Capturamos la distribución de TODO el año actual, no solo junio
+            # Lógica año actual
             if y == anio_actual_num:
                 if nombre_mes:
                     distribucion_mes_actual_raw[nombre_mes] += val_general
                     distribucion_mes_actual_raw["TOTAL"] += val_general
                 
-                # Los KPIs superiores sí corresponden estrictamente al mes corriente (Junio)
                 if m_num == mes_actual_num:
                     kpi_mes_actual_raw["general"] += float(row.mensual_general or 0)
                     kpi_mes_actual_raw["pagado"] += float(row.mensual_pagado or 0)
