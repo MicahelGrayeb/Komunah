@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import text, and_, func
+from sqlalchemy import text, and_, func, cast, Numeric, case, String
+from datetime import datetime, date
 from typing import List, Optional
 from collections import defaultdict
 import re
@@ -39,6 +40,191 @@ def _traducir_concepto_amortizacion(concepto: Any) -> str:
     c = str(concepto or "").strip().lower()
     # Buscamos en el dict, si no está, devolvemos el original
     return traducciones.get(c, c).strip().lower()
+
+@router.get("/bitacora-pagos", response_model=schemas.BitacoraPagosResponse)
+def get_bitacora_pagos(
+    anio: Optional[int] = None,
+    folio: Optional[str] = None,
+    db: Session = Depends(get_db),
+    user: dict = Depends(es_usuario)
+):
+    print("\n========== [DEBUG BITÁCORA] INICIO ENDPOINT SDK MONEDA TOTAL ==========")
+    
+    def fmt(valor):
+        return f"${float(valor or 0):,.2f}"
+
+    anio_inicio = int(anio) if anio else int(datetime.now().year)
+    anio_fin = int(anio) if anio else int(datetime.now().year + 8)
+    
+    hoy = date.today()
+    mes_actual_num = hoy.month
+    anio_actual_num = hoy.year
+
+    # 1. SUBQUERY PAGOS 
+    monto_pago_real = case(
+        (Pago.metodo_pago == 'Nota de Crédito', func.coalesce(Pago.monto_pagado, 0) * -1),
+        else_=func.coalesce(Pago.monto_pagado, 0)
+    )
+    
+    stmt_pagos = db.query(
+        cast(Pago.folio_venta, String).label("folio"),
+        Pago.numero_pago.label("num_pago"),
+        func.lower(Pago.concepto_pago).label("concepto_pago"),
+        func.sum(monto_pago_real).label("total_pagado")
+    ).filter(Pago.estatus == 'active')
+
+    if folio:
+        stmt_pagos = stmt_pagos.filter(Pago.folio_venta == folio)
+
+    subq_pagos = stmt_pagos.group_by(
+        Pago.folio_venta, 
+        Pago.numero_pago, 
+        func.lower(Pago.concepto_pago)
+    ).subquery()
+
+    # 2. VARIABLES DE AMORTIZACIÓN
+    fecha_amort = func.coalesce(
+        func.str_to_date(Amortizacion.date, '%Y-%m-%d'),
+        func.str_to_date(Amortizacion.date, '%d/%m/%Y')
+    )
+
+    concepto_norm = func.lower(
+        case(
+            (func.lower(Amortizacion.concept) == 'financing', 'parcialidad'),
+            (func.lower(Amortizacion.concept) == 'down_payment', 'enganche'),
+            (func.lower(Amortizacion.concept) == 'initial_payment', 'apartado'),
+            (func.lower(Amortizacion.concept) == 'last_payment', 'último pago'),
+            else_=func.coalesce(Amortizacion.concept, '')
+        )
+    )
+
+    monto_prog = func.coalesce(cast(Amortizacion.total, Numeric(20, 4)), 0)
+    monto_pagado = func.coalesce(subq_pagos.c.total_pagado, 0)
+    monto_restante = func.greatest(monto_prog - monto_pagado, 0)
+
+    es_vencido = case((fecha_amort < func.curdate(), monto_restante), else_=0)
+    es_por_pagar = case((fecha_amort >= func.curdate(), monto_restante), else_=0)
+
+    filtros_base = [
+        Amortizacion.date.isnot(None),
+        Amortizacion.date != '',
+        Amortizacion.date != 'NULL',
+        func.year(fecha_amort).between(anio_inicio, anio_fin)
+    ]
+    if folio:
+        filtros_base.append(Amortizacion.folder_id == folio)
+
+    join_condicion = and_(
+        Amortizacion.folder_id == subq_pagos.c.folio,
+        Amortizacion.number == subq_pagos.c.num_pago,
+        concepto_norm == subq_pagos.c.concepto_pago
+    )
+
+    try:
+        # A) TOTALES GLOBALES
+        totales = db.query(
+            func.sum(monto_prog).label("total_general"),
+            func.sum(monto_pagado).label("total_pagado"),
+            func.sum(es_vencido).label("total_vencido"),
+            func.sum(es_por_pagar).label("total_por_pagar")
+        ).outerjoin(subq_pagos, join_condicion).filter(*filtros_base).first()
+
+        t_general = float(totales.total_general or 0)
+        t_pagado = float(totales.total_pagado or 0)
+        t_vencido = float(totales.total_vencido or 0)
+        t_por_pagar = float(totales.total_por_pagar or 0)
+
+        # B) DESGLOSE MENSUAL
+        desglose = db.query(
+            func.year(fecha_amort).label("anio"),
+            func.month(fecha_amort).label("mes"),
+            func.sum(monto_prog).label("mensual_general"),
+            func.sum(monto_pagado).label("mensual_pagado"),
+            func.sum(es_vencido).label("mensual_vencido"),
+            func.sum(es_por_pagar).label("mensual_por_pagar")
+        ).outerjoin(subq_pagos, join_condicion).filter(*filtros_base).group_by(
+            func.year(fecha_amort),
+            func.month(fecha_amort)
+        ).all()
+
+        # 3. PIVOTEO Y REDISTRIBUCIÓN
+        meses_mapeo = {
+            1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
+            7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
+        }
+
+        anios_dict_raw = {}
+        kpi_mes_actual_raw = {"general": 0.0, "pagado": 0.0, "vencido": 0.0, "por_pagar": 0.0}
+        distribucion_mes_actual_raw = {m: 0.0 for m in meses_mapeo.values()}
+        distribucion_mes_actual_raw["TOTAL"] = 0.0
+
+        for row in desglose:
+            y = row.anio
+            m_num = row.mes
+            nombre_mes = meses_mapeo.get(m_num)
+            val_general = float(row.mensual_general or 0)
+            
+            # Inicialización estructural del año
+            if y not in anios_dict_raw:
+                anios_dict_raw[y] = {m: 0.0 for m in meses_mapeo.values()}
+                anios_dict_raw[y]["TOTAL"] = 0.0
+            
+            if nombre_mes:
+                anios_dict_raw[y][nombre_mes] += val_general
+                anios_dict_raw[y]["TOTAL"] += val_general
+
+            # LÓGICA CORREGIDA: Capturamos la distribución de TODO el año actual, no solo junio
+            if y == anio_actual_num:
+                if nombre_mes:
+                    distribucion_mes_actual_raw[nombre_mes] += val_general
+                    distribucion_mes_actual_raw["TOTAL"] += val_general
+                
+                # Los KPIs superiores sí corresponden estrictamente al mes corriente (Junio)
+                if m_num == mes_actual_num:
+                    kpi_mes_actual_raw["general"] += float(row.mensual_general or 0)
+                    kpi_mes_actual_raw["pagado"] += float(row.mensual_pagado or 0)
+                    kpi_mes_actual_raw["vencido"] += float(row.mensual_vencido or 0)
+                    kpi_mes_actual_raw["por_pagar"] += float(row.mensual_por_pagar or 0)
+
+        # 4. FORMATEO COMPLETO A STRING DE MONEDA
+        lista_meses_formateada = []
+        for year in sorted(anios_dict_raw.keys()):
+            raw_data = anios_dict_raw[year]
+            mes_obj = {"ANIO": year}
+            for mes_nombre in meses_mapeo.values():
+                mes_obj[mes_nombre] = fmt(raw_data[mes_nombre])
+            mes_obj["TOTAL"] = fmt(raw_data["TOTAL"])
+            lista_meses_formateada.append(mes_obj)
+
+        mes_actual_formateado = {}
+        for mes_nombre in meses_mapeo.values():
+            mes_actual_formateado[mes_nombre] = fmt(distribucion_mes_actual_raw[mes_nombre])
+        mes_actual_formateado["TOTAL"] = fmt(distribucion_mes_actual_raw["TOTAL"])
+
+        json_anio_actual = [
+            {
+                "total_general": fmt(kpi_mes_actual_raw["general"]),
+                "total_pagado": fmt(kpi_mes_actual_raw["pagado"]),
+                "total_vencido": fmt(kpi_mes_actual_raw["vencido"]),
+                "total_por_pagar": fmt(kpi_mes_actual_raw["por_pagar"]),
+                "mes": [mes_actual_formateado]
+            }
+        ]
+
+        print("========== [DEBUG BITÁCORA] FIN ENDPOINT CON ÉXITO ==========\n")
+        
+        return {
+            "total_general": fmt(t_general),
+            "total_pagado": fmt(t_pagado),
+            "total_vencido": fmt(t_vencido),
+            "total_por_pagar": fmt(t_por_pagar),
+            "meses": lista_meses_formateada,
+            "anio_actual": json_anio_actual
+        }
+
+    except Exception as e:
+        print(f"!!! [ERROR CRÍTICO EN SDK]: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error en bitacora de pagos: {str(e)}")
 
 @router.get("/pagos-historico", response_model=List[schemas.ConciliacionClienteResponse])
 def get_conciliacion_clientes(anio: Optional[int] = None, folio: Optional[str] = None, db: Session = Depends(get_db), user: dict = Depends(es_usuario)):

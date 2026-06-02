@@ -228,6 +228,51 @@ class ConciliacionClienteResponse(BaseModel):
         from_attributes = True
         populate_by_name = True
 
+class MesesBase(BaseModel):
+    enero: str = "$0.00"
+    febrero: str = "$0.00"
+    marzo: str = "$0.00"
+    abril: str = "$0.00"
+    mayo: str = "$0.00"
+    junio: str = "$0.00"
+    julio: str = "$0.00"
+    agosto: str = "$0.00"
+    septiembre: str = "$0.00"
+    octubre: str = "$0.00"
+    noviembre: str = "$0.00"
+    diciembre: str = "$0.00"
+    total: str = Field(alias="TOTAL", default="$0.00")
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+
+class BitacoraPagosAnio(MesesBase):
+    anio: int = Field(alias="ANIO")
+
+class AnioActualDetalle(BaseModel):
+    total_general: str = "$0.00"
+    total_pagado: str = "$0.00"
+    total_vencido: str = "$0.00"
+    total_por_pagar: str = "$0.00"
+    mes: List[MesesBase] = []
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+
+class BitacoraPagosResponse(BaseModel):
+    total_general: str = "$0.00"
+    total_pagado: str = "$0.00"
+    total_vencido: str = "$0.00"
+    total_por_pagar: str = "$0.00"
+    meses: List[BitacoraPagosAnio] = []
+    anio_actual: List[AnioActualDetalle] = []
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+
 class ComplementoPago(BaseModel):
     cliente: str
     pagador: Optional[str] = None
