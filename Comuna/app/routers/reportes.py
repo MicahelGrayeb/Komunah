@@ -45,7 +45,7 @@ def _traducir_concepto_amortizacion(concepto: Any) -> str:
 def get_bitacora_pagos(
     anio: Optional[int] = None,
     folio: Optional[str] = None,
-    proyecto: Optional[str] = None, # <-- NUEVO PARÁMETRO DE PROYECTO
+    proyecto: Optional[str] = None, 
     db: Session = Depends(get_db),
     user: dict = Depends(es_usuario)
 ):
@@ -77,11 +77,9 @@ def get_bitacora_pagos(
     if folio:
         stmt_pagos = stmt_pagos.filter(Pago.folio_venta == folio)
 
-    # <-- NUEVO FILTRO DE PROYECTO PARA LA SUBCONSULTA DE PAGOS -->
     if proyecto and proyecto.lower() != "todos":
-        stmt_pagos = stmt_pagos.join(
-            Venta, Pago.folio_venta == Venta.folio
-        ).filter(Venta.desarrollo == proyecto)
+        subq_filtro_venta = db.query(Venta.folio).filter(Venta.desarrollo == proyecto).subquery()
+        stmt_pagos = stmt_pagos.filter(cast(Pago.folio_venta, String).in_(subq_filtro_venta))
 
     subq_pagos = stmt_pagos.group_by(
         Pago.folio_venta, 
@@ -121,6 +119,10 @@ def get_bitacora_pagos(
     if folio:
         filtros_base.append(Amortizacion.folder_id == folio)
 
+    if proyecto and proyecto.lower() != "todos":
+        subq_filtro_amort = db.query(Venta.folio).filter(Venta.desarrollo == proyecto).subquery()
+        filtros_base.append(Amortizacion.folder_id.in_(subq_filtro_amort))
+
     join_condicion = and_(
         Amortizacion.folder_id == subq_pagos.c.folio,
         Amortizacion.number == subq_pagos.c.num_pago,
@@ -128,47 +130,54 @@ def get_bitacora_pagos(
     )
 
     try:
-        # A) TOTALES GLOBALES
-        totales_query = db.query(
+        # A) TOTALES GLOBALES (Con outerjoin para evitar producto cartesiano)
+        totales = db.query(
             func.sum(monto_prog).label("total_general"),
-            func.sum(monto_pagado).label("total_pagado"),
             func.sum(es_vencido).label("total_vencido"),
             func.sum(es_por_pagar).label("total_por_pagar")
-        ).outerjoin(subq_pagos, join_condicion)
-
-        # <-- NUEVO FILTRO DE PROYECTO PARA LOS TOTALES -->
-        if proyecto and proyecto.lower() != "todos":
-            totales_query = totales_query.join(
-                Venta, Amortizacion.folder_id == Venta.folio
-            ).filter(Venta.desarrollo == proyecto)
-
-        totales = totales_query.filter(*filtros_base).first()
+        ).outerjoin(subq_pagos, join_condicion).filter(*filtros_base).first()
 
         t_general = float(totales.total_general or 0)
-        t_pagado = float(totales.total_pagado or 0)
         t_vencido = float(totales.total_vencido or 0)
         t_por_pagar = float(totales.total_por_pagar or 0)
 
-        # B) DESGLOSE MENSUAL
-        desglose_query = db.query(
+        # B) TOTALES MENSUALES DEL MES ACTUAL DE AMORTIZACIONES
+        kpi_mes = db.query(
+            func.sum(monto_prog).label("general"),
+            func.sum(es_vencido).label("vencido"),
+            func.sum(es_por_pagar).label("por_pagar")
+        ).outerjoin(subq_pagos, join_condicion).filter(
+            *filtros_base,
+            func.year(fecha_amort) == anio_actual_num,
+            func.month(fecha_amort) == mes_actual_num
+        ).first()
+
+        # C) DESGLOSES MENSUALES INDEPENDIENTES
+        desglose_prog = db.query(
             func.year(fecha_amort).label("anio"),
             func.month(fecha_amort).label("mes"),
-            func.sum(monto_prog).label("mensual_general"),
-            func.sum(monto_pagado).label("mensual_pagado"),
-            func.sum(es_vencido).label("mensual_vencido"),
-            func.sum(es_por_pagar).label("mensual_por_pagar")
-        ).outerjoin(subq_pagos, join_condicion)
+            func.sum(monto_prog).label("total")
+        ).filter(*filtros_base).group_by(func.year(fecha_amort), func.month(fecha_amort)).all()
 
-        # <-- NUEVO FILTRO DE PROYECTO PARA EL DESGLOSE MENSUAL -->
+        fecha_pago_real = func.coalesce(
+            func.str_to_date(Pago.fecha_comprobante, '%Y-%m-%d'),
+            func.str_to_date(Pago.fecha_comprobante, '%d/%m/%Y')
+        )
+        año_pago = func.ifnull(func.year(fecha_pago_real), anio_inicio)
+        mes_pago = func.ifnull(func.month(fecha_pago_real), 1)
+
+        filtros_pagos = [Pago.estatus == 'active', año_pago.between(anio_inicio, anio_fin)]
+        if folio:
+            filtros_pagos.append(Pago.folio_venta == folio)
         if proyecto and proyecto.lower() != "todos":
-            desglose_query = desglose_query.join(
-                Venta, Amortizacion.folder_id == Venta.folio
-            ).filter(Venta.desarrollo == proyecto)
+            subq_filtro_venta_p = db.query(Venta.folio).filter(Venta.desarrollo == proyecto).subquery()
+            filtros_pagos.append(cast(Pago.folio_venta, String).in_(subq_filtro_venta_p))
 
-        desglose = desglose_query.filter(*filtros_base).group_by(
-            func.year(fecha_amort),
-            func.month(fecha_amort)
-        ).all()
+        desglose_pag = db.query(
+            año_pago.label("anio"),
+            mes_pago.label("mes"),
+            func.sum(monto_pago_real).label("total")
+        ).filter(*filtros_pagos).group_by(año_pago, mes_pago).all()
 
         # 3. PIVOTEO Y REDISTRIBUCIÓN
         meses_mapeo = {
@@ -176,72 +185,99 @@ def get_bitacora_pagos(
             7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
         }
 
-        anios_dict_raw = {}
-        kpi_mes_actual_raw = {"general": 0.0, "pagado": 0.0, "vencido": 0.0, "por_pagar": 0.0}
+        anios_dict_pagado = {}
+        anios_dict_esperado = {}
         distribucion_mes_actual_raw = {m: 0.0 for m in meses_mapeo.values()}
         distribucion_mes_actual_raw["TOTAL"] = 0.0
 
-        for row in desglose:
-            y = row.anio
-            m_num = row.mes
-            nombre_mes = meses_mapeo.get(m_num)
-            val_general = float(row.mensual_general or 0)
-            
-            # Inicialización estructural del año
-            if y not in anios_dict_raw:
-                anios_dict_raw[y] = {m: 0.0 for m in meses_mapeo.values()}
-                anios_dict_raw[y]["TOTAL"] = 0.0
-            
-            if nombre_mes:
-                anios_dict_raw[y][nombre_mes] += val_general
-                anios_dict_raw[y]["TOTAL"] += val_general
+        for y in range(anio_inicio, anio_fin + 1):
+            anios_dict_pagado[y] = {m: 0.0 for m in meses_mapeo.values()}
+            anios_dict_pagado[y]["TOTAL"] = 0.0
+            anios_dict_esperado[y] = {m: 0.0 for m in meses_mapeo.values()}
+            anios_dict_esperado[y]["TOTAL"] = 0.0
 
-            # Lógica año actual
-            if y == anio_actual_num:
+        for row in desglose_prog:
+            if row.anio in anios_dict_esperado:
+                nombre_mes = meses_mapeo.get(row.mes)
                 if nombre_mes:
-                    distribucion_mes_actual_raw[nombre_mes] += val_general
-                    distribucion_mes_actual_raw["TOTAL"] += val_general
-                
-                if m_num == mes_actual_num:
-                    kpi_mes_actual_raw["general"] += float(row.mensual_general or 0)
-                    kpi_mes_actual_raw["pagado"] += float(row.mensual_pagado or 0)
-                    kpi_mes_actual_raw["vencido"] += float(row.mensual_vencido or 0)
-                    kpi_mes_actual_raw["por_pagar"] += float(row.mensual_por_pagar or 0)
+                    anios_dict_esperado[row.anio][nombre_mes] += float(row.total or 0)
+                    anios_dict_esperado[row.anio]["TOTAL"] += float(row.total or 0)
+
+        t_pagado_real_acumulado = 0.0
+        for row in desglose_pag:
+            if row.anio in anios_dict_pagado:
+                nombre_mes = meses_mapeo.get(row.mes)
+                val_pago = float(row.total or 0)
+                if nombre_mes:
+                    anios_dict_pagado[row.anio][nombre_mes] += val_pago
+                    anios_dict_pagado[row.anio]["TOTAL"] += val_pago
+                    t_pagado_real_acumulado += val_pago 
+
+                if row.anio == anio_actual_num and nombre_mes:
+                    distribucion_mes_actual_raw[nombre_mes] += val_pago
+                    distribucion_mes_actual_raw["TOTAL"] += val_pago
 
         # 4. FORMATEO COMPLETO A STRING DE MONEDA
         lista_meses_formateada = []
-        for year in sorted(anios_dict_raw.keys()):
-            raw_data = anios_dict_raw[year]
+        for year in sorted(anios_dict_pagado.keys()):
+            raw_data = anios_dict_pagado[year]
             mes_obj = {"ANIO": year}
             for mes_nombre in meses_mapeo.values():
                 mes_obj[mes_nombre] = fmt(raw_data[mes_nombre])
             mes_obj["TOTAL"] = fmt(raw_data["TOTAL"])
             lista_meses_formateada.append(mes_obj)
 
+        lista_esperado_formateada = []
+        for year in sorted(anios_dict_esperado.keys()):
+            raw_data = anios_dict_esperado[year]
+            mes_obj = {"ANIO": year}
+            for mes_nombre in meses_mapeo.values():
+                mes_obj[mes_nombre] = fmt(raw_data[mes_nombre])
+            mes_obj["TOTAL"] = fmt(raw_data["TOTAL"])
+            lista_esperado_formateada.append(mes_obj)
+
         mes_actual_formateado = {}
         for mes_nombre in meses_mapeo.values():
             mes_actual_formateado[mes_nombre] = fmt(distribucion_mes_actual_raw[mes_nombre])
         mes_actual_formateado["TOTAL"] = fmt(distribucion_mes_actual_raw["TOTAL"])
 
+        # Sincronización matemática de la tarjeta del mes corriente con los cobros reales
+        palabra_mes_actual = meses_mapeo.get(mes_actual_num)
+        monto_mes_actual_pagado_real = distribucion_mes_actual_raw.get(palabra_mes_actual, 0.0)
+
         json_anio_actual = [
             {
-                "total_general": fmt(kpi_mes_actual_raw["general"]),
-                "total_pagado": fmt(kpi_mes_actual_raw["pagado"]),
-                "total_vencido": fmt(kpi_mes_actual_raw["vencido"]),
-                "total_por_pagar": fmt(kpi_mes_actual_raw["por_pagar"]),
+                "total_general": fmt(kpi_mes.general),
+                "total_pagado": fmt(monto_mes_actual_pagado_real), 
+                "total_vencido": fmt(kpi_mes.vencido),
+                "total_por_pagar": fmt(max(float(kpi_mes.general or 0) - monto_mes_actual_pagado_real - float(kpi_mes.vencido or 0), 0.0)),
                 "mes": [mes_actual_formateado]
             }
         ]
 
         print("========== [DEBUG BITÁCORA] FIN ENDPOINT CON ÉXITO ==========\n")
         
+        # 5. RETORNO DE LA NUEVA ESTRUCTURA SOLICITADA EXACTA
         return {
-            "total_general": fmt(t_general),
-            "total_pagado": fmt(t_pagado),
-            "total_vencido": fmt(t_vencido),
-            "total_por_pagar": fmt(t_por_pagar),
-            "meses": lista_meses_formateada,
-            "anio_actual": json_anio_actual
+            "anio_actual": json_anio_actual,
+            "lo_pagado": [
+                {
+                    "total_general": fmt(t_pagado_real_acumulado),  # Total en base a lo cobrado real
+                    "total_pagado": fmt(t_pagado_real_acumulado),   # Total cobrado real
+                    "total_vencido": fmt(t_vencido),                # Cartera vencida calculada del sistema
+                    "total_por_pagar": fmt(t_por_pagar),            # Saldo por cobrar restante del sistema
+                    "anios": lista_meses_formateada 
+                }
+            ],
+            "lo_esperado": [
+                {
+                    "total_general_esperado": fmt(t_general),
+                    "total_pagado_esperado": fmt(t_pagado_real_acumulado),
+                    "total_vencido_esperado": fmt(t_vencido),
+                    "total_por_pagar_esperado": fmt(t_por_pagar),
+                    "anios": lista_esperado_formateada
+                }
+            ]
         }
 
     except Exception as e:

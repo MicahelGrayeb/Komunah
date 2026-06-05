@@ -261,13 +261,32 @@ class AnioActualDetalle(BaseModel):
         from_attributes = True
         populate_by_name = True
 
-class BitacoraPagosResponse(BaseModel):
+class LoPagadoDetalle(BaseModel):
     total_general: str = "$0.00"
     total_pagado: str = "$0.00"
     total_vencido: str = "$0.00"
     total_por_pagar: str = "$0.00"
-    meses: List[BitacoraPagosAnio] = []
+    anios: List[BitacoraPagosAnio] = []
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+
+class LoEsperadoDetalle(BaseModel):
+    total_general_esperado: str = "$0.00"
+    total_pagado_esperado: str = "$0.00"
+    total_vencido_esperado: str = "$0.00"
+    total_por_pagar_esperado: str = "$0.00"
+    anios: List[BitacoraPagosAnio] = []
+
+    class Config:
+        from_attributes = True
+        populate_by_name = True
+
+class BitacoraPagosResponse(BaseModel):
     anio_actual: List[AnioActualDetalle] = []
+    lo_pagado: List[LoPagadoDetalle] = []
+    lo_esperado: List[LoEsperadoDetalle] = []
 
     class Config:
         from_attributes = True
