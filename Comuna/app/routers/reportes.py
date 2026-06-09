@@ -10,7 +10,7 @@ from .. import schemas
 from datetime import datetime
 from typing import Any, Dict 
 from ..services.security import get_current_user, es_admin, es_usuario
-from ..models import Venta, Pago, Amortizacion
+from ..models import Venta, Pago, Amortizacion, FlujoCaja
 
 router = APIRouter(prefix="/reportes", tags=["Reportes Financieros"])
 
@@ -43,25 +43,34 @@ def _traducir_concepto_amortizacion(concepto: Any) -> str:
 
 @router.get("/bitacora-pagos", response_model=schemas.BitacoraPagosResponse)
 def get_bitacora_pagos(
-    anio: Optional[int] = None,
+    anio_inicio: Optional[int] = None,
+    anio_fin: Optional[int] = None,
     folio: Optional[str] = None,
     proyecto: Optional[str] = None, 
     db: Session = Depends(get_db),
     user: dict = Depends(es_usuario)
 ):
-    print("\n========== [DEBUG BITÁCORA] INICIO ENDPOINT SDK MONEDA TOTAL ==========")
+    print("\n========== [DEBUG BITÁCORA] INICIO ENDPOINT ULTRA-OPTIMIZADO ==========")
     
     def fmt(valor):
         return f"${float(valor or 0):,.2f}"
 
-    anio_inicio = int(anio) if anio else int(datetime.now().year)
-    anio_fin = int(anio) if anio else int(datetime.now().year + 8)
-    
+    nombre_proyecto = proyecto if proyecto else "Todos"
+    anio_inicio = int(anio_inicio) if anio_inicio else int(datetime.now().year)
+    anio_fin = int(anio_fin) if anio_fin else int(datetime.now().year + 8)
+
     hoy = date.today()
     mes_actual_num = hoy.month
     anio_actual_num = hoy.year
 
-    # 1. SUBQUERY PAGOS 
+    # STEP 1: Obtener folios del proyecto por adelantado
+    folios_proyecto = None
+    if proyecto and proyecto.lower() != "todos":
+        folios_proyecto = [row[0] for row in db.query(Venta.folio).filter(Venta.desarrollo == proyecto).all()]
+        if not folios_proyecto:
+            folios_proyecto = ["__SIN_FOLIOS__"] 
+
+    # 2. SUBQUERY PAGOS 
     monto_pago_real = case(
         (Pago.metodo_pago == 'Nota de Crédito', func.coalesce(Pago.monto_pagado, 0) * -1),
         else_=func.coalesce(Pago.monto_pagado, 0)
@@ -76,10 +85,8 @@ def get_bitacora_pagos(
 
     if folio:
         stmt_pagos = stmt_pagos.filter(Pago.folio_venta == folio)
-
-    if proyecto and proyecto.lower() != "todos":
-        subq_filtro_venta = db.query(Venta.folio).filter(Venta.desarrollo == proyecto).subquery()
-        stmt_pagos = stmt_pagos.filter(cast(Pago.folio_venta, String).in_(subq_filtro_venta))
+    elif folios_proyecto:
+        stmt_pagos = stmt_pagos.filter(Pago.folio_venta.in_(folios_proyecto))
 
     subq_pagos = stmt_pagos.group_by(
         Pago.folio_venta, 
@@ -87,7 +94,7 @@ def get_bitacora_pagos(
         func.lower(Pago.concepto_pago)
     ).subquery()
 
-    # 2. VARIABLES DE AMORTIZACIÓN
+    # 3. VARIABLES DE AMORTIZACIÓN
     fecha_amort = func.coalesce(
         func.str_to_date(Amortizacion.date, '%Y-%m-%d'),
         func.str_to_date(Amortizacion.date, '%d/%m/%Y')
@@ -104,8 +111,12 @@ def get_bitacora_pagos(
     )
 
     monto_prog = func.coalesce(cast(Amortizacion.total, Numeric(20, 4)), 0)
-    monto_pagado = func.coalesce(subq_pagos.c.total_pagado, 0)
-    monto_restante = func.greatest(monto_prog - monto_pagado, 0)
+    monto_multa_prog = func.coalesce(cast(Amortizacion.penalized_amount, Numeric(20, 4)), 0)
+    
+    monto_pagado_sub = func.coalesce(subq_pagos.c.total_pagado, 0)
+
+    monto_capital_pagado = func.greatest(monto_pagado_sub - monto_multa_prog, 0)
+    monto_restante = func.greatest(monto_prog - monto_capital_pagado, 0)
 
     es_vencido = case((fecha_amort < func.curdate(), monto_restante), else_=0)
     es_por_pagar = case((fecha_amort >= func.curdate(), monto_restante), else_=0)
@@ -118,10 +129,8 @@ def get_bitacora_pagos(
     ]
     if folio:
         filtros_base.append(Amortizacion.folder_id == folio)
-
-    if proyecto and proyecto.lower() != "todos":
-        subq_filtro_amort = db.query(Venta.folio).filter(Venta.desarrollo == proyecto).subquery()
-        filtros_base.append(Amortizacion.folder_id.in_(subq_filtro_amort))
+    elif folios_proyecto:
+        filtros_base.append(Amortizacion.folder_id.in_(folios_proyecto))
 
     join_condicion = and_(
         Amortizacion.folder_id == subq_pagos.c.folio,
@@ -130,56 +139,59 @@ def get_bitacora_pagos(
     )
 
     try:
-        # A) TOTALES GLOBALES (Con outerjoin para evitar producto cartesiano)
-        totales = db.query(
-            func.sum(monto_prog).label("total_general"),
-            func.sum(es_vencido).label("total_vencido"),
-            func.sum(es_por_pagar).label("total_por_pagar")
-        ).outerjoin(subq_pagos, join_condicion).filter(*filtros_base).first()
-
-        t_general = float(totales.total_general or 0)
-        t_vencido = float(totales.total_vencido or 0)
-        t_por_pagar = float(totales.total_por_pagar or 0)
-
-        # B) TOTALES MENSUALES DEL MES ACTUAL DE AMORTIZACIONES
-        kpi_mes = db.query(
-            func.sum(monto_prog).label("general"),
-            func.sum(es_vencido).label("vencido"),
-            func.sum(es_por_pagar).label("por_pagar")
-        ).outerjoin(subq_pagos, join_condicion).filter(
-            *filtros_base,
-            func.year(fecha_amort) == anio_actual_num,
-            func.month(fecha_amort) == mes_actual_num
-        ).first()
-
-        # C) DESGLOSES MENSUALES INDEPENDIENTES
+        # CONSOLIDACIÓN CRUCIAL: Amortizaciones esperadas
         desglose_prog = db.query(
             func.year(fecha_amort).label("anio"),
             func.month(fecha_amort).label("mes"),
-            func.sum(monto_prog).label("total")
-        ).filter(*filtros_base).group_by(func.year(fecha_amort), func.month(fecha_amort)).all()
+            func.sum(monto_prog).label("total_general"),
+            func.sum(es_vencido).label("total_vencido"),
+            func.sum(es_por_pagar).label("total_por_pagar")
+        ).outerjoin(subq_pagos, join_condicion).filter(*filtros_base).group_by(
+            func.year(fecha_amort), 
+            func.month(fecha_amort)
+        ).all()
 
-        fecha_pago_real = func.coalesce(
-            func.str_to_date(Pago.fecha_comprobante, '%Y-%m-%d'),
-            func.str_to_date(Pago.fecha_comprobante, '%d/%m/%Y')
+        # =====================================================================
+        # D) FLUJO DE COBROS REALES INDEPENDIENTES (CONECTADO A FLUJO_CAJA)
+        # =====================================================================
+        # Agrupamos por 'id_flujo' para consolidar las transacciones bancarias únicas
+        stmt_flujo_unico = db.query(
+            FlujoCaja.folio_venta.label("folio_venta"),
+            FlujoCaja.fecha.label("fecha_raw"),
+            FlujoCaja.monto_pagado.label("monto_real")
+        ).group_by(
+            FlujoCaja.id_flujo,
+            FlujoCaja.folio_venta,
+            FlujoCaja.fecha,
+            FlujoCaja.monto_pagado
+        ).subquery()
+
+        # Corregimos matemáticamente el Timezone Shift sumando 1 día para emparejar con la UI
+        fecha_pago_real = func.date_add(
+            func.str_to_date(stmt_flujo_unico.c.fecha_raw, '%Y-%m-%d'),
+            text("INTERVAL 1 DAY")
         )
         año_pago = func.ifnull(func.year(fecha_pago_real), anio_inicio)
         mes_pago = func.ifnull(func.month(fecha_pago_real), 1)
 
-        filtros_pagos = [Pago.estatus == 'active', año_pago.between(anio_inicio, anio_fin)]
+        filtros_pagos = [
+            stmt_flujo_unico.c.fecha_raw.isnot(None),
+            stmt_flujo_unico.c.fecha_raw != '',
+            año_pago.between(anio_inicio, anio_fin)
+        ]
         if folio:
-            filtros_pagos.append(Pago.folio_venta == folio)
-        if proyecto and proyecto.lower() != "todos":
-            subq_filtro_venta_p = db.query(Venta.folio).filter(Venta.desarrollo == proyecto).subquery()
-            filtros_pagos.append(cast(Pago.folio_venta, String).in_(subq_filtro_venta_p))
+            filtros_pagos.append(stmt_flujo_unico.c.folio_venta == folio)
+        elif folios_proyecto:
+            filtros_pagos.append(stmt_flujo_unico.c.folio_venta.in_(folios_proyecto))
 
         desglose_pag = db.query(
             año_pago.label("anio"),
             mes_pago.label("mes"),
-            func.sum(monto_pago_real).label("total")
+            func.sum(stmt_flujo_unico.c.monto_real).label("total")
         ).filter(*filtros_pagos).group_by(año_pago, mes_pago).all()
+        # =====================================================================
 
-        # 3. PIVOTEO Y REDISTRIBUCIÓN
+        # 4. PIVOTEO Y PROCESAMIENTO EN MEMORIA
         meses_mapeo = {
             1: "enero", 2: "febrero", 3: "marzo", 4: "abril", 5: "mayo", 6: "junio",
             7: "julio", 8: "agosto", 9: "septiembre", 10: "octubre", 11: "noviembre", 12: "diciembre"
@@ -196,12 +208,29 @@ def get_bitacora_pagos(
             anios_dict_esperado[y] = {m: 0.0 for m in meses_mapeo.values()}
             anios_dict_esperado[y]["TOTAL"] = 0.0
 
+        t_general, t_vencido, t_por_pagar = 0.0, 0.0, 0.0
+        kpi_mes_general, kpi_mes_vencido, kpi_mes_por_pagar = 0.0, 0.0, 0.0
+
         for row in desglose_prog:
-            if row.anio in anios_dict_esperado:
-                nombre_mes = meses_mapeo.get(row.mes)
+            y, m = row.anio, row.mes
+            val_gen = float(row.total_general or 0)
+            val_ven = float(row.total_vencido or 0)
+            val_pxp = float(row.total_por_pagar or 0)
+
+            t_general += val_gen
+            t_vencido += val_ven
+            t_por_pagar += val_pxp
+
+            if y == anio_actual_num and m == mes_actual_num:
+                kpi_mes_general = val_gen
+                kpi_mes_vencido = val_ven
+                kpi_mes_por_pagar = val_pxp
+
+            if y in anios_dict_esperado:
+                nombre_mes = meses_mapeo.get(m)
                 if nombre_mes:
-                    anios_dict_esperado[row.anio][nombre_mes] += float(row.total or 0)
-                    anios_dict_esperado[row.anio]["TOTAL"] += float(row.total or 0)
+                    anios_dict_esperado[y][nombre_mes] += val_gen
+                    anios_dict_esperado[y]["TOTAL"] += val_gen
 
         t_pagado_real_acumulado = 0.0
         for row in desglose_pag:
@@ -217,7 +246,7 @@ def get_bitacora_pagos(
                     distribucion_mes_actual_raw[nombre_mes] += val_pago
                     distribucion_mes_actual_raw["TOTAL"] += val_pago
 
-        # 4. FORMATEO COMPLETO A STRING DE MONEDA
+        # 5. FORMATEO COMPLETO A STRING DE MONEDA
         lista_meses_formateada = []
         for year in sorted(anios_dict_pagado.keys()):
             raw_data = anios_dict_pagado[year]
@@ -236,48 +265,29 @@ def get_bitacora_pagos(
             mes_obj["TOTAL"] = fmt(raw_data["TOTAL"])
             lista_esperado_formateada.append(mes_obj)
 
-        mes_actual_formateado = {}
-        for mes_nombre in meses_mapeo.values():
-            mes_actual_formateado[mes_nombre] = fmt(distribucion_mes_actual_raw[mes_nombre])
-        mes_actual_formateado["TOTAL"] = fmt(distribucion_mes_actual_raw["TOTAL"])
-
-        # Sincronización matemática de la tarjeta del mes corriente con los cobros reales
         palabra_mes_actual = meses_mapeo.get(mes_actual_num)
         monto_mes_actual_pagado_real = distribucion_mes_actual_raw.get(palabra_mes_actual, 0.0)
 
-        json_anio_actual = [
+        json_mes_actual = [
             {
-                "total_general": fmt(kpi_mes.general),
+                "total_general": fmt(kpi_mes_general),
                 "total_pagado": fmt(monto_mes_actual_pagado_real), 
-                "total_vencido": fmt(kpi_mes.vencido),
-                "total_por_pagar": fmt(max(float(kpi_mes.general or 0) - monto_mes_actual_pagado_real - float(kpi_mes.vencido or 0), 0.0)),
-                "mes": [mes_actual_formateado]
+                "total_vencido": fmt(kpi_mes_vencido),
+                "total_por_pagar": fmt(max(kpi_mes_general - monto_mes_actual_pagado_real - kpi_mes_vencido, 0.0))
             }
         ]
 
         print("========== [DEBUG BITÁCORA] FIN ENDPOINT CON ÉXITO ==========\n")
         
-        # 5. RETORNO DE LA NUEVA ESTRUCTURA SOLICITADA EXACTA
         return {
-            "anio_actual": json_anio_actual,
-            "lo_pagado": [
-                {
-                    "total_general": fmt(t_pagado_real_acumulado),  # Total en base a lo cobrado real
-                    "total_pagado": fmt(t_pagado_real_acumulado),   # Total cobrado real
-                    "total_vencido": fmt(t_vencido),                # Cartera vencida calculada del sistema
-                    "total_por_pagar": fmt(t_por_pagar),            # Saldo por cobrar restante del sistema
-                    "anios": lista_meses_formateada 
-                }
-            ],
-            "lo_esperado": [
-                {
-                    "total_general_esperado": fmt(t_general),
-                    "total_pagado_esperado": fmt(t_pagado_real_acumulado),
-                    "total_vencido_esperado": fmt(t_vencido),
-                    "total_por_pagar_esperado": fmt(t_por_pagar),
-                    "anios": lista_esperado_formateada
-                }
-            ]
+            "Proyecto": nombre_proyecto,
+            "Total_general": fmt(t_general),
+            "Total_pagado": fmt(t_pagado_real_acumulado),
+            "Total_vencido": fmt(t_vencido),
+            "Total_por_pagar": fmt(t_por_pagar),
+            "mes_actual": json_mes_actual,
+            "lo_pagado": [{"anios": lista_meses_formateada}],
+            "lo_esperado": [{"anios": lista_esperado_formateada}]
         }
 
     except Exception as e:

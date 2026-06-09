@@ -250,22 +250,17 @@ class MesesBase(BaseModel):
 class BitacoraPagosAnio(MesesBase):
     anio: int = Field(alias="ANIO")
 
-class AnioActualDetalle(BaseModel):
+class MesActualDetalle(BaseModel):
     total_general: str = "$0.00"
     total_pagado: str = "$0.00"
     total_vencido: str = "$0.00"
     total_por_pagar: str = "$0.00"
-    mes: List[MesesBase] = []
 
     class Config:
         from_attributes = True
         populate_by_name = True
 
 class LoPagadoDetalle(BaseModel):
-    total_general: str = "$0.00"
-    total_pagado: str = "$0.00"
-    total_vencido: str = "$0.00"
-    total_por_pagar: str = "$0.00"
     anios: List[BitacoraPagosAnio] = []
 
     class Config:
@@ -273,10 +268,6 @@ class LoPagadoDetalle(BaseModel):
         populate_by_name = True
 
 class LoEsperadoDetalle(BaseModel):
-    total_general_esperado: str = "$0.00"
-    total_pagado_esperado: str = "$0.00"
-    total_vencido_esperado: str = "$0.00"
-    total_por_pagar_esperado: str = "$0.00"
     anios: List[BitacoraPagosAnio] = []
 
     class Config:
@@ -284,7 +275,12 @@ class LoEsperadoDetalle(BaseModel):
         populate_by_name = True
 
 class BitacoraPagosResponse(BaseModel):
-    anio_actual: List[AnioActualDetalle] = []
+    Proyecto: str = "Todos"
+    Total_general: str = "$0.00"
+    Total_pagado: str = "$0.00"
+    Total_vencido: str = "$0.00"
+    Total_por_pagar: str = "$0.00"
+    mes_actual: List[MesActualDetalle] = []
     lo_pagado: List[LoPagadoDetalle] = []
     lo_esperado: List[LoEsperadoDetalle] = []
 
